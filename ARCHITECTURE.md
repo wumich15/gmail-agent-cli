@@ -185,40 +185,50 @@ they live only in the OS credential store, addressed via
 
 ## AI status in this build
 
-Per an explicit product decision, the real OpenAI-backed classifier is
-**not implemented**. `work.ts` currently wires in
-`src/ai/random-classifier.ts`, a `Classifier` implementation that returns
-a uniformly random (but correctly-shaped) assessment for every message —
-no network call, no API key. It exists purely to exercise the full
-pipeline (trash/star/archive/Calendar creation) end to end before a real
-filter exists. **It makes meaningless decisions and should never be run
-against a real mailbox** — `work.ts` prints a loud warning every run.
+The real OpenAI-backed classifier is implemented:
+`src/ai/openai-classifier.ts`'s `OpenAiClassifier` makes one stateless
+call to OpenAI's Responses API per unresolved message (`store: false`, no
+tools, no `previous_response_id`), parsing the model's answer through the
+strict Zod schema in `src/ai/schema.ts` via `zodTextFormat`. It never
+receives Gmail/Calendar credentials or the ability to call anything — it
+returns a typed assessment, and `core/policy.ts` is the only thing that
+turns that into an action. `src/ai/prompt.ts` holds the prompt-injection-
+hardened developer instructions and builds the untrusted user/input block
+from the normalized message; it deliberately excludes raw
+`List-Unsubscribe`/`Authentication-Results` header values (only derived
+booleans), and currently sends Gmail's short snippet rather than the full
+body, since nothing in the live pipeline fetches `format=FULL` yet (see
+"Known deviations" below).
 
-An earlier, more conservative placeholder,
-`src/ai/not-configured-classifier.ts`, always returns
-`{ ok: false, unavailable: { reason: "not_configured" } }` and is kept
-around as the safe default for when random decisions aren't wanted:
-`policy.ts` treats "assessment unavailable" the same way it treats a
-refusal or schema failure — no AI-derived mutation, the message is
-flagged for Review, and deterministic read-archiving still proceeds.
+`src/ai/resolve-classifier.ts` decides which classifier a run actually
+uses: if a usable API key is found (the OS credential store first, under
+`CREDENTIAL_KEYS.aiApiKey(accountHash)`, then the `OPENAI_API_KEY`
+environment variable — the same one the OpenAI SDK itself defaults to),
+`work.ts` uses `OpenAiClassifier`; otherwise it falls back to
+`src/ai/not-configured-classifier.ts`, which always returns
+`{ ok: false, unavailable: { reason: "not_configured" } }`. `policy.ts`
+treats that identically to a refusal or schema failure — no AI-derived
+mutation, the message is flagged for Review, and deterministic
+read-archiving still proceeds. Presence of a usable key is currently both
+necessary and sufficient to opt in; `config.aiEnabled` is not consulted
+(there's no exposed command to toggle it yet, so gating on it would just
+add a confusing extra step with no way to satisfy it).
 
-The Zod Structured Outputs schema (`src/ai/schema.ts`) and the
-`Classifier` interface are in place so a real implementation can be
-dropped in — implement `Classifier`, e.g. in a new
-`src/ai/openai-classifier.ts`, and swap the `new RandomClassifier()`
-construction in `commands/work.ts` for it — without touching
-`core/policy.ts` or `core/orchestrator.ts` at all.
+`src/ai/random-classifier.ts` — a uniformly random (but correctly-shaped)
+`Classifier`, used earlier in this project to exercise the full pipeline
+without any API key — still exists but is no longer wired into `work.ts`.
+It remains useful for testing the trash/star/archive/Calendar-creation
+paths without spending API calls; **never point it at a real mailbox**.
 
-### Pluggable provider (config surface only, not yet wired)
+### Pluggable provider
 
-`config/schema.ts` already models `aiProvider` (`"openai"` or
-`"openai-compatible"`) and `aiBaseUrl`, so a user is not required to hold
-an OpenAI API key specifically once a real classifier exists: pointing
-`aiBaseUrl` at any endpoint that implements the same Responses API +
-Structured Outputs shape (e.g. a self-hosted model server) would work
-without touching `core/policy.ts` or `core/orchestrator.ts` — only the
-`Classifier` implementation `work.ts` constructs would change. Both
-fields are currently inert; no classifier reads them yet.
+`config/schema.ts` models `aiProvider` (`"openai"` or
+`"openai-compatible"`) and `aiBaseUrl`. `resolve-classifier.ts` reads
+both: with `aiProvider: "openai-compatible"` and `aiBaseUrl` set,
+`OpenAiClassifier` is constructed with that `baseURL` instead of
+OpenAI's endpoint, so a self-hosted or alternate provider implementing
+the same Responses API + Structured Outputs shape works without an
+OpenAI-specific key or any code change.
 
 ## Command surface
 
@@ -263,8 +273,18 @@ sign-in flow, so that logic isn't duplicated.
   does a full snapshot every run (correct, just not optimized).
 - No interactive sender/message pickers — `gmail add` requires an
   explicit category argument.
-- The AI classifier is a random placeholder, not a real filter (see
-  "AI status in this build" above) — do not run this against real mail.
+- The AI classifier only ever sees Gmail's short snippet, not the full
+  message body — `core/orchestrator.ts` fetches `format=metadata`, never
+  `format=full`. Fetching the full body for every unresolved message
+  would improve classification but meaningfully increase Gmail API quota
+  usage; this hasn't been made conditional/selective yet.
+- No response caching by content+model+prompt+schema+policy hash, so a
+  message unchanged since the last run is still re-classified (and
+  re-billed) from scratch every time — `messages` table has room for this
+  but no repository/wiring exists yet.
+- No labeled classifier evaluation set or precision gate against real
+  AI output (the 90%+ launch-precision gates in `CLAUDE.md` were written
+  against this eventual reality) — accuracy is currently unverified.
 - Most commands from `CLAUDE.md`'s command-line contract
   (`rules`/`summary`/`undo`/`auth`/`config`/`doctor`) are implemented but
   not currently exposed in `cli.ts` (see "Command surface" above).

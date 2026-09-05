@@ -4,7 +4,7 @@ import { resolveAccount, type ResolvedAccount } from "./shared.js";
 import { authLogin } from "./auth.js";
 import { AuthRequiredError } from "../core/errors.js";
 import { runWorkScan } from "../core/orchestrator.js";
-import { RandomClassifier } from "../ai/random-classifier.js";
+import { resolveClassifier } from "../ai/resolve-classifier.js";
 import { RuleGroupsRepository } from "../state/repositories/rule-groups.js";
 import { RunsRepository, ActionsRepository } from "../state/repositories/runs.js";
 import { CalendarLinksRepository } from "../state/repositories/calendar-links.js";
@@ -29,14 +29,6 @@ import { withGoogleApiRetry } from "../core/google-api-retry.js";
 import { contentHash } from "../core/ids.js";
 import type { PolicyActionIntent } from "../core/policy.js";
 import type { ActionType, PlannedAction } from "../core/models.js";
-
-const RANDOM_CLASSIFIER_WARNING =
-  pc.yellow("⚠ AI classification is a RANDOM placeholder in this build.\n") +
-  pc.yellow(
-    "  It makes meaningless trash/star/archive/calendar decisions. Do not run this against a\n" +
-      "  real mailbox you care about — use --dry-run first, or a throwaway test account.\n" +
-      "  See src/ai/random-classifier.ts for where to plug in a real filter."
-  );
 
 export interface WorkOptions {
   dryRun: boolean;
@@ -80,10 +72,15 @@ export async function runWork(options: WorkOptions): Promise<number> {
   const ctx = bootstrap();
   const { account, gmailClient, calendarClient } = await resolveAccountSigningInIfNeeded(ctx);
 
+  const { classifier, description } = await resolveClassifier({
+    accountHash: account.accountHash,
+    credentialStore: ctx.credentialStore,
+    config: ctx.config
+  });
   // Always goes to stderr, even in --json mode: it never touches stdout,
-  // so it can't corrupt a piped JSON summary, and this warning is too
-  // important to hide from a human who happens to be running --json.
-  console.error(RANDOM_CLASSIFIER_WARNING);
+  // so it can't corrupt a piped JSON summary, and this is important
+  // enough to not hide from a human who happens to be running --json.
+  console.error(pc.dim(description));
 
   const lock = options.dryRun ? null : new ProcessLock(lockFilePath(account.accountHash));
   lock?.acquire();
@@ -93,7 +90,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
 
     const { summary, outcomes, scanNote } = await runWorkScan({
       gmailClient,
-      classifier: new RandomClassifier(),
+      classifier,
       ruleGroups,
       userEmail: account.emailDisplay ?? "",
       userTimezone: account.timezone,

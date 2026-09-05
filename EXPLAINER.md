@@ -176,21 +176,19 @@ from across messages. This limits how much damage a single adversarial
 email can do: it can lie about itself, but it can't build up an attack
 across multiple messages.
 
-> **Current status of this repository:** the real AI step described above
-> isn't wired up to an actual AI provider yet. In its place is a
-> placeholder that answers every message with a **uniformly random**
-> (but correctly-shaped) judgment — not a real opinion at all, just
-> something that exercises every branch of the pipeline described below
-> so it can be built and tested before a real filter exists. Because of
-> that, **running this tool for real right now would make meaningless,
-> random decisions about your actual mail** — it's meant for testing with
-> `--dry-run` or a throwaway test account, not daily use, until a real
-> classifier replaces it. Swapping in a real one is a small, contained
-> change precisely because of the "AI describes, ordinary code decides"
-> boundary: only the small module that produces the AI's answer needs to
-> change; the deterministic decision-maker downstream doesn't know or
-> care whether that answer came from a real model or a random number
-> generator.
+> **Current status of this repository:** the AI step now calls a real
+> provider (OpenAI's Responses API) when an API key is configured. If no
+> key is found, the tool automatically falls back to a safe placeholder
+> that reports "no answer available" for every message — the pipeline
+> still works, it just relies only on your explicit rules and read-mail
+> archiving until a key is set, exactly like every other refusal/timeout
+> case described above. A separate, deliberately meaningless placeholder
+> that answers with **uniformly random** judgments also still exists in
+> the code (useful for testing the pipeline without spending API calls)
+> but is not used by default. Swapping providers, or going back to
+> testing mode, is a small, contained change precisely because of the "AI
+> describes, ordinary code decides" boundary described above: only the
+> small module that produces the AI's answer needs to change.
 
 ### 5. Deciding (the deterministic policy)
 
