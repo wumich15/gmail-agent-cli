@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { buildClassificationInput, DEVELOPER_INSTRUCTIONS } from "../../src/ai/prompt.js";
+import {
+  buildClassificationInput,
+  buildDeterministicSummary,
+  DEVELOPER_INSTRUCTIONS,
+  FEW_SHOT_EXAMPLES
+} from "../../src/ai/prompt.js";
+import { EmailFlagsSchema } from "../../src/ai/schema.js";
 import { buildNormalizedMessage, headerMapFromList } from "../../src/gmail/normalize.js";
 
 function message(overrides: Partial<Parameters<typeof buildNormalizedMessage>[0]> = {}) {
@@ -73,5 +79,42 @@ describe("buildClassificationInput", () => {
   it("truncates very long content and notes the truncation", () => {
     const input = buildClassificationInput(message({ plainBody: "x".repeat(10_000) }));
     expect(input).toContain("[content truncated]");
+  });
+
+  it("does not leave a double space in the From line when there is no display name", () => {
+    const input = buildClassificationInput(
+      message({ headers: headerMapFromList([{ name: "From", value: "bare@example.com" }]) })
+    );
+    expect(input).toContain("From: <bare@example.com>");
+    expect(input).not.toMatch(/From: {2,}</);
+  });
+});
+
+describe("buildDeterministicSummary", () => {
+  it("combines the subject and the first non-blank line of content, with no AI call", () => {
+    const summary = buildDeterministicSummary(
+      message({ plainBody: "\n\nHi there, quick reminder about tomorrow.\nSecond line." })
+    );
+    expect(summary).toBe("Hello — Hi there, quick reminder about tomorrow.");
+  });
+
+  it("falls back to just the subject when there is no content", () => {
+    const summary = buildDeterministicSummary(message({ snippet: "" }));
+    expect(summary).toBe("Hello");
+  });
+});
+
+describe("FEW_SHOT_EXAMPLES", () => {
+  it("has at least a couple of examples, each with schema-valid output", () => {
+    expect(FEW_SHOT_EXAMPLES.length).toBeGreaterThanOrEqual(2);
+    for (const example of FEW_SHOT_EXAMPLES) {
+      expect(() => EmailFlagsSchema.parse(example.output)).not.toThrow();
+    }
+  });
+
+  it("covers the spam and suspicious cases distinctly", () => {
+    const kinds = FEW_SHOT_EXAMPLES.map((e) => ({ spam: e.output.spam, suspicious: e.output.suspicious }));
+    expect(kinds).toContainEqual({ spam: true, suspicious: false });
+    expect(kinds).toContainEqual({ spam: false, suspicious: true });
   });
 });

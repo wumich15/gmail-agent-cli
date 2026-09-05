@@ -1,37 +1,26 @@
 import { z } from "zod";
-import { EMAIL_ASSESSMENT_KINDS, EVENT_INTENTS, REASON_CODES } from "../core/models.js";
 
 /**
- * Strict Structured Outputs schema. Every property is required (nullable
- * where the model may have nothing to say), additionalProperties is
- * implicitly closed by using .strict(), and enums are closed. Structured
- * output guarantees shape, not truth — the deterministic policy is what
- * decides whether to act on it.
+ * Minimal, cheap wire schema: plain booleans instead of confidence
+ * floats, no free-text summary, no reasonCodes array. Every field the
+ * model has to fill in costs output tokens on every single call, so this
+ * is kept as small as it can be while still letting the deterministic
+ * mapping in openai-classifier.ts drive the exact same policy decisions
+ * (trash/star/important/archive/calendar) as the richer internal
+ * `EmailAssessment` type in core/models.ts, which is unchanged — only
+ * what's asked of the model got smaller.
  */
-export const EventCandidateSchema = z
+export const EmailFlagsSchema = z
   .object({
-    intent: z.enum(EVENT_INTENTS),
-    confidence: z.number().min(0).max(1),
-    title: z.string().max(200).nullable(),
-    start: z.string().max(40).nullable(),
-    end: z.string().max(40).nullable(),
-    allDay: z.boolean(),
-    timeZone: z.string().max(64).nullable(),
-    location: z.string().max(200).nullable(),
-    sourceEvidence: z.string().max(280).nullable()
+    spam: z.boolean(),
+    suspicious: z.boolean(),
+    important: z.boolean(),
+    hasEvent: z.boolean(),
+    eventTitle: z.string().max(100).nullable(),
+    eventStart: z.string().max(40).nullable(),
+    eventEnd: z.string().max(40).nullable(),
+    eventAllDay: z.boolean()
   })
   .strict();
 
-export const EmailAssessmentSchema = z
-  .object({
-    kind: z.enum(EMAIL_ASSESSMENT_KINDS),
-    confidence: z.number().min(0).max(1),
-    importanceScore: z.number().min(0).max(1),
-    importanceConfidence: z.number().min(0).max(1),
-    summary: z.string().max(240),
-    reasonCodes: z.array(z.enum(REASON_CODES)).max(8),
-    event: EventCandidateSchema
-  })
-  .strict();
-
-export type EmailAssessmentModelOutput = z.infer<typeof EmailAssessmentSchema>;
+export type EmailFlags = z.infer<typeof EmailFlagsSchema>;

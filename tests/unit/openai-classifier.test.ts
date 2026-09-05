@@ -3,6 +3,7 @@ import { AuthenticationError, RateLimitError, APIConnectionTimeoutError } from "
 import type OpenAI from "openai";
 import { OpenAiClassifier } from "../../src/ai/openai-classifier.js";
 import { buildNormalizedMessage, headerMapFromList } from "../../src/gmail/normalize.js";
+import type { EmailFlags } from "../../src/ai/schema.js";
 
 function message() {
   return buildNormalizedMessage({
@@ -20,43 +21,130 @@ function message() {
   });
 }
 
-function fakeClient(parseImpl: () => Promise<unknown>): OpenAI {
+function fakeClient(parseImpl: (params: unknown) => Promise<unknown>): OpenAI {
   return { responses: { parse: parseImpl } } as unknown as OpenAI;
 }
 
 const CONTEXT = { classifierVersion: "x", promptVersion: "x", schemaVersion: "x", policyVersion: "x" };
 
-function validAssessment() {
+function flags(overrides: Partial<EmailFlags> = {}): EmailFlags {
   return {
-    kind: "promotion" as const,
-    confidence: 0.95,
-    importanceScore: 0.1,
-    importanceConfidence: 0.1,
-    summary: "A promotional email.",
-    reasonCodes: ["marketing_content" as const],
-    event: {
-      intent: "none" as const,
-      confidence: 0,
-      title: null,
-      start: null,
-      end: null,
-      allDay: false,
-      timeZone: null,
-      location: null,
-      sourceEvidence: null
-    }
+    spam: false,
+    suspicious: false,
+    important: false,
+    hasEvent: false,
+    eventTitle: null,
+    eventStart: null,
+    eventEnd: null,
+    eventAllDay: false,
+    ...overrides
   };
 }
 
 describe("OpenAiClassifier", () => {
-  it("returns ok:true with the parsed assessment and its own version tags on success", async () => {
-    const client = fakeClient(async () => ({ output_parsed: validAssessment(), output: [] }));
+  it("never sends store:true, tools, or previous_response_id (stateless, isolated call)", async () => {
+    let capturedParams: Record<string, unknown> | undefined;
+    const client = fakeClient(async (params) => {
+      capturedParams = params as Record<string, unknown>;
+      return { output_parsed: flags(), output: [] };
+    });
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
+    await classifier.assess(message(), CONTEXT);
+
+    expect(capturedParams?.["store"]).toBe(false);
+    expect(capturedParams?.["tools"]).toBeUndefined();
+    expect(capturedParams?.["previous_response_id"]).toBeUndefined();
+  });
+
+  it("sends the few-shot examples plus the real message as separate input turns", async () => {
+    let capturedInput: unknown;
+    const client = fakeClient(async (params) => {
+      capturedInput = (params as { input: unknown }).input;
+      return { output_parsed: flags(), output: [] };
+    });
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
+    await classifier.assess(message(), CONTEXT);
+
+    expect(Array.isArray(capturedInput)).toBe(true);
+    const turns = capturedInput as { role: string; content: string }[];
+    // At least 2 examples * 2 turns each, plus the real message.
+    expect(turns.length).toBeGreaterThanOrEqual(5);
+    expect(turns[turns.length - 1]!.role).toBe("user");
+    expect(turns[turns.length - 1]!.content).toContain("a@example.com");
+  });
+
+  it("maps spam:true to a promotion assessment that clears the trash confidence threshold", async () => {
+    const client = fakeClient(async () => ({ output_parsed: flags({ spam: true }), output: [] }));
     const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
     const result = await classifier.assess(message(), CONTEXT);
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.assessment.kind).toBe("promotion");
-      expect(result.assessment.classifierVersion).toBe("openai:gpt-5.4-mini");
+      expect(result.assessment.confidence).toBeGreaterThanOrEqual(0.9);
+    }
+  });
+
+  it("maps suspicious:true to a suspicious assessment regardless of other flags (safety override)", async () => {
+    const client = fakeClient(async () => ({
+      output_parsed: flags({ suspicious: true, important: true, hasEvent: true, eventTitle: "x", eventStart: "2099-01-01" }),
+      output: []
+    }));
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
+    const result = await classifier.assess(message(), CONTEXT);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.assessment.kind).toBe("suspicious");
+    }
+  });
+
+  it("maps important:true to importance scores that clear the star threshold", async () => {
+    const client = fakeClient(async () => ({ output_parsed: flags({ important: true }), output: [] }));
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
+    const result = await classifier.assess(message(), CONTEXT);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.assessment.importanceScore).toBeGreaterThanOrEqual(0.9);
+      expect(result.assessment.importanceConfidence).toBeGreaterThanOrEqual(0.9);
+    }
+  });
+
+  it("maps hasEvent:false to a non-create event with sub-threshold confidence", async () => {
+    const client = fakeClient(async () => ({ output_parsed: flags(), output: [] }));
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
+    const result = await classifier.assess(message(), CONTEXT);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.assessment.event.intent).toBe("none");
+      expect(result.assessment.event.confidence).toBeLessThan(0.9);
+    }
+  });
+
+  it("maps hasEvent:true to a create-intent event carrying the model's fields through", async () => {
+    const client = fakeClient(async () => ({
+      output_parsed: flags({ hasEvent: true, eventTitle: "Dentist", eventStart: "2099-01-01T10:00:00", eventAllDay: false }),
+      output: []
+    }));
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
+    const result = await classifier.assess(message(), CONTEXT);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.assessment.event).toMatchObject({
+        intent: "create",
+        title: "Dentist",
+        start: "2099-01-01T10:00:00"
+      });
+      expect(result.assessment.event.confidence).toBeGreaterThanOrEqual(0.9);
+    }
+  });
+
+  it("uses a deterministic subject+first-line summary, not model output (schema has no summary field)", async () => {
+    const client = fakeClient(async () => ({ output_parsed: flags(), output: [] }));
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
+    const result = await classifier.assess(message(), CONTEXT);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.assessment.summary).toContain("Hi");
+      expect(result.assessment.summary).toContain("snippet text");
     }
   });
 

@@ -67,7 +67,7 @@ function baseDeps(overrides: Partial<Parameters<typeof runWorkScan>[0]> = {}) {
     userEmail: "me@example.com",
     userTimezone: "UTC",
     clock: new SystemClock(),
-    concurrency: { gmailReads: 5 },
+    concurrency: { gmailReads: 5, aiCalls: 2 },
     ...overrides
   };
 }
@@ -182,5 +182,35 @@ describe("runWorkScan", () => {
     expect(outcomes[0]!.decision.reviewReason).toBe("important_rule_auth_failed");
     // The rule's auth check failing must not silently grant Star/Important.
     expect(outcomes[0]!.decision.actions.some((a) => a.type === "star")).toBe(false);
+  });
+
+  it("bounds classifier concurrency by aiCalls independently of gmailReads", async () => {
+    const messages: FakeMessage[] = Array.from({ length: 6 }, (_, i) => ({
+      id: `m${i}`,
+      threadId: `t${i}`,
+      labelIds: ["INBOX", "UNREAD"],
+      headers: [{ name: "From", value: `person${i}@example.com` }]
+    }));
+    const client = fakeClient(messages);
+
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const trackingClassifier: Classifier = {
+      async assess() {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inFlight -= 1;
+        return { ok: false, unavailable: { reason: "not_configured", detail: null } };
+      }
+    };
+
+    // gmailReads is large enough that all 6 metadata fetches happen in one
+    // batch; only aiCalls should limit how many classifier calls overlap.
+    await runWorkScan(
+      baseDeps({ gmailClient: client, classifier: trackingClassifier, concurrency: { gmailReads: 6, aiCalls: 2 } })
+    );
+
+    expect(maxInFlight).toBeLessThanOrEqual(2);
   });
 });

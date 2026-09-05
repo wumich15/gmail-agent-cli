@@ -13,6 +13,8 @@ import { findMatchingRuleGroups } from "../rules/matcher.js";
 import { evaluateMessagePolicy, POLICY_VERSION, type PolicyThresholds } from "./policy.js";
 import { buildRunSummary, type MessageOutcome, type RunSummary } from "../summary/build-summary.js";
 import { validateEventCandidate, type ValidatedEvent } from "../calendar/event-policy.js";
+import { mapWithConcurrency } from "./concurrency.js";
+import type { AssessmentResult, NormalizedMessage, RuleAction } from "./models.js";
 import type { RuleGroup } from "./models.js";
 import type { Clock } from "./clock.js";
 
@@ -23,7 +25,15 @@ export interface OrchestratorDeps {
   userEmail: string;
   userTimezone: string;
   clock: Clock;
-  concurrency: { gmailReads: number };
+  /**
+   * gmailReads bounds concurrent Gmail metadata fetches; aiCalls bounds
+   * concurrent classifier calls. These are deliberately separate — Gmail
+   * and the AI provider are independent rate-limit domains, so batching
+   * AI calls at the same concurrency as Gmail reads would size one
+   * provider's in-flight request count off a completely unrelated API's
+   * quota characteristics.
+   */
+  concurrency: { gmailReads: number; aiCalls: number };
   /**
    * Caps the Inbox scan and the native-Spam scan to this many messages
    * each (most recent first — Gmail returns messages.list results newest
@@ -83,14 +93,33 @@ export async function runWorkScan(deps: OrchestratorDeps): Promise<WorkScanResul
   ]);
 
   const stubs = dedupeStubs([...spamResult.messages, ...inboxResult.messages]);
-  const outcomes: MessageOutcome[] = [];
 
+  // Phase 1: fetch + normalize + rule-match, batched at gmailReads
+  // concurrency. No classifier calls happen here.
+  const preprocessed: PreprocessedMessage[] = [];
   for (const batch of chunk(stubs, deps.concurrency.gmailReads)) {
-    const batchOutcomes = await Promise.all(
-      batch.map((stub) => processMessage(stub, deps, profile.emailAddress))
+    const batchResults = await Promise.all(
+      batch.map((stub) => fetchAndNormalize(stub, deps, profile.emailAddress))
     );
-    outcomes.push(...batchOutcomes);
+    preprocessed.push(...batchResults);
   }
+
+  // Phase 2: classify only the messages that aren't bypassed by an
+  // explicit rule or native spam, at the separate, lower aiCalls
+  // concurrency.
+  const assessmentResults = await mapWithConcurrency(preprocessed, deps.concurrency.aiCalls, (pre) =>
+    pre.bypassed
+      ? Promise.resolve(null)
+      : deps.classifier.assess(pre.normalized, {
+          classifierVersion: "not-configured",
+          promptVersion: "not-configured",
+          schemaVersion: "not-configured",
+          policyVersion: POLICY_VERSION
+        })
+  );
+
+  // Phase 3: pure policy evaluation + event validation, no I/O.
+  const outcomes = preprocessed.map((pre, i) => finalizeOutcome(pre, assessmentResults[i] ?? null, deps));
 
   const summary = buildRunSummary(inboxResult.messages.length, outcomes);
   return { summary, outcomes, historyIdAtSnapshot: profile.historyId, scanNote: buildScanNote(inboxResult, spamResult) };
@@ -120,11 +149,23 @@ function buildScanNote(
   return parts.length > 0 ? `--limit applied. ${parts.join(" ")}` : null;
 }
 
-async function processMessage(
+interface PreprocessedMessage {
+  stub: MessageStub;
+  normalized: NormalizedMessage;
+  labelIds: readonly string[];
+  nativeSpam: boolean;
+  explicitRule: { action: RuleAction; ruleGroupId: string } | null;
+  authFailedImportantRule: boolean;
+  isProtected: boolean;
+  /** True when native spam or an explicit spam rule means the classifier must never be called for this message. */
+  bypassed: boolean;
+}
+
+async function fetchAndNormalize(
   stub: MessageStub,
   deps: OrchestratorDeps,
   userEmail: string
-): Promise<MessageOutcome> {
+): Promise<PreprocessedMessage> {
   const raw = await fetchMessageMetadata(deps.gmailClient, stub.id);
   const headers = headersFromMessage(raw);
   const labelIds = raw.labelIds ?? [];
@@ -159,18 +200,27 @@ async function processMessage(
   const isProtected =
     explicitRule?.action === "important" || hasUnattributedProtectionLabel(labelIds, appAttributed);
 
-  const bypassed = explicitRule?.action === "spam" || nativeSpam;
-  const assessmentResult = bypassed
-    ? null
-    : await deps.classifier.assess(normalized, {
-        classifierVersion: "not-configured",
-        promptVersion: "not-configured",
-        schemaVersion: "not-configured",
-        policyVersion: POLICY_VERSION
-      });
+  return {
+    stub,
+    normalized,
+    labelIds,
+    nativeSpam,
+    explicitRule,
+    authFailedImportantRule,
+    isProtected,
+    bypassed: explicitRule?.action === "spam" || nativeSpam
+  };
+}
+
+function finalizeOutcome(
+  pre: PreprocessedMessage,
+  assessmentResult: AssessmentResult | null,
+  deps: OrchestratorDeps
+): MessageOutcome {
+  const { stub, normalized, labelIds, nativeSpam, explicitRule, authFailedImportantRule, isProtected } = pre;
 
   const assessment = assessmentResult?.ok ? assessmentResult.assessment : null;
-  const assessmentUnavailable = !bypassed && assessmentResult !== null && !assessmentResult.ok;
+  const assessmentUnavailable = !pre.bypassed && assessmentResult !== null && !assessmentResult.ok;
 
   const rawDecision = evaluateMessagePolicy(
     {

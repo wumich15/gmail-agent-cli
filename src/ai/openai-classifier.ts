@@ -8,13 +8,23 @@ import OpenAI, {
   RateLimitError
 } from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
-import { EmailAssessmentSchema } from "./schema.js";
-import { buildClassificationInput, DEVELOPER_INSTRUCTIONS, PROMPT_VERSION } from "./prompt.js";
+import { EmailFlagsSchema, type EmailFlags } from "./schema.js";
+import {
+  buildClassificationInput,
+  buildDeterministicSummary,
+  DEVELOPER_INSTRUCTIONS,
+  FEW_SHOT_EXAMPLES,
+  PROMPT_VERSION
+} from "./prompt.js";
 import type { ClassifyContext, Classifier } from "./classifier.js";
-import type { AssessmentResult, AssessmentUnavailable, NormalizedMessage } from "../core/models.js";
+import type { AssessmentResult, AssessmentUnavailable, EmailAssessment, NormalizedMessage } from "../core/models.js";
 
-export const SCHEMA_VERSION = "schema-v1";
+export const SCHEMA_VERSION = "schema-v2";
 const DEFAULT_TIMEOUT_MS = 20_000;
+
+/** Clearly above/below the 0.90 policy thresholds — the flags themselves are the decision; these just satisfy the existing threshold-based policy engine. */
+const HIGH_CONFIDENCE = 0.98;
+const LOW_CONFIDENCE = 0;
 
 export interface OpenAiClassifierOptions {
   /** Falls back to the OPENAI_API_KEY environment variable when omitted (the SDK's own default). */
@@ -29,9 +39,12 @@ export interface OpenAiClassifierOptions {
 
 /**
  * Real Classifier implementation: one stateless Responses API call per
- * message, Structured Outputs parsed through the strict Zod schema, no
- * tools, no store, no previous_response_id. See CLAUDE.md's "AI
- * assessment contract" for the exact requirements this follows.
+ * message, Structured Outputs parsed through a minimal boolean-flags Zod
+ * schema (see ai/schema.ts for why), no tools, no store, no
+ * previous_response_id. A few labeled examples are sent as real prior
+ * turns before the actual message to improve accuracy at near-zero
+ * marginal cost (identical prefix every call). See CLAUDE.md's "AI
+ * assessment contract" for the underlying requirements.
  */
 export class OpenAiClassifier implements Classifier {
   private readonly client: OpenAI;
@@ -55,9 +68,9 @@ export class OpenAiClassifier implements Classifier {
         {
           model: this.model,
           instructions: DEVELOPER_INSTRUCTIONS,
-          input: buildClassificationInput(message),
+          input: buildInputWithExamples(message),
           store: false,
-          text: { format: zodTextFormat(EmailAssessmentSchema, "email_assessment") }
+          text: { format: zodTextFormat(EmailFlagsSchema, "email_flags") }
         },
         { timeout: this.timeoutMs }
       );
@@ -76,26 +89,72 @@ export class OpenAiClassifier implements Classifier {
         };
       }
 
-      const parsed = response.output_parsed;
       return {
         ok: true,
-        assessment: {
-          kind: parsed.kind,
-          confidence: parsed.confidence,
-          importanceScore: parsed.importanceScore,
-          importanceConfidence: parsed.importanceConfidence,
-          summary: parsed.summary,
-          reasonCodes: parsed.reasonCodes,
-          event: parsed.event,
-          classifierVersion: `openai:${this.model}`,
-          promptVersion: PROMPT_VERSION,
-          schemaVersion: SCHEMA_VERSION
-        }
+        assessment: mapFlagsToAssessment(response.output_parsed, message, this.model)
       };
     } catch (error) {
       return { ok: false, unavailable: mapErrorToUnavailable(error) };
     }
   }
+}
+
+/** Few-shot example turns (fixed prefix) followed by the real, untrusted message. */
+function buildInputWithExamples(message: NormalizedMessage) {
+  const exampleTurns = FEW_SHOT_EXAMPLES.flatMap((example) => [
+    { role: "user" as const, content: example.input },
+    { role: "assistant" as const, content: JSON.stringify(example.output) }
+  ]);
+  return [...exampleTurns, { role: "user" as const, content: buildClassificationInput(message) }];
+}
+
+/**
+ * Deterministically maps the model's cheap boolean flags onto the richer
+ * internal EmailAssessment shape core/policy.ts already knows how to
+ * consume, at fixed confidence values that clearly clear or miss its
+ * 0.90 thresholds — the flags *are* the decision; these numbers only
+ * exist to satisfy a policy engine built around graded confidence.
+ * `suspicious` maps to a kind policy.ts already treats as "no AI-derived
+ * mutation, route to Review" regardless of the other flags, so a
+ * contradictory combination (e.g. suspicious+important both true) is
+ * still safe by construction.
+ */
+function mapFlagsToAssessment(flags: EmailFlags, message: NormalizedMessage, model: string): EmailAssessment {
+  const kind = flags.suspicious ? "suspicious" : flags.spam ? "promotion" : "personal_routine";
+  return {
+    kind,
+    confidence: flags.suspicious || flags.spam ? HIGH_CONFIDENCE : LOW_CONFIDENCE,
+    importanceScore: flags.important ? HIGH_CONFIDENCE : LOW_CONFIDENCE,
+    importanceConfidence: flags.important ? HIGH_CONFIDENCE : LOW_CONFIDENCE,
+    summary: buildDeterministicSummary(message),
+    reasonCodes: [],
+    event: flags.hasEvent
+      ? {
+          intent: "create",
+          confidence: HIGH_CONFIDENCE,
+          title: flags.eventTitle,
+          start: flags.eventStart,
+          end: flags.eventEnd,
+          allDay: flags.eventAllDay,
+          timeZone: null,
+          location: null,
+          sourceEvidence: null
+        }
+      : {
+          intent: "none",
+          confidence: LOW_CONFIDENCE,
+          title: null,
+          start: null,
+          end: null,
+          allDay: false,
+          timeZone: null,
+          location: null,
+          sourceEvidence: null
+        },
+    classifierVersion: `openai:${model}`,
+    promptVersion: PROMPT_VERSION,
+    schemaVersion: SCHEMA_VERSION
+  };
 }
 
 function extractRefusal(response: { output?: readonly unknown[] }): string | null {

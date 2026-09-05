@@ -95,7 +95,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
       userEmail: account.emailDisplay ?? "",
       userTimezone: account.timezone,
       clock: ctx.clock,
-      concurrency: { gmailReads: 5 },
+      concurrency: { gmailReads: 5, aiCalls: ctx.config?.concurrency.aiCalls ?? 2 },
       ...(options.limit !== undefined ? { limit: options.limit } : {})
     });
 

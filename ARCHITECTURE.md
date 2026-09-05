@@ -188,17 +188,41 @@ they live only in the OS credential store, addressed via
 The real OpenAI-backed classifier is implemented:
 `src/ai/openai-classifier.ts`'s `OpenAiClassifier` makes one stateless
 call to OpenAI's Responses API per unresolved message (`store: false`, no
-tools, no `previous_response_id`), parsing the model's answer through the
-strict Zod schema in `src/ai/schema.ts` via `zodTextFormat`. It never
+tools, no `previous_response_id`). By product decision, the model fills
+in a deliberately minimal, cheap wire schema (`src/ai/schema.ts`'s
+`EmailFlagsSchema`) — plain booleans (`spam`, `suspicious`, `important`,
+`hasEvent`) plus a few event fields, no confidence floats, no free-text
+summary, no reason-code array — parsed via `zodTextFormat`. It never
 receives Gmail/Calendar credentials or the ability to call anything — it
-returns a typed assessment, and `core/policy.ts` is the only thing that
-turns that into an action. `src/ai/prompt.ts` holds the prompt-injection-
-hardened developer instructions and builds the untrusted user/input block
-from the normalized message; it deliberately excludes raw
-`List-Unsubscribe`/`Authentication-Results` header values (only derived
-booleans), and currently sends Gmail's short snippet rather than the full
-body, since nothing in the live pipeline fetches `format=FULL` yet (see
-"Known deviations" below).
+returns flags, and `openai-classifier.ts` deterministically maps them
+onto the richer internal `EmailAssessment` shape `core/policy.ts` already
+knows how to consume (fixed confidence values that clearly clear or miss
+its 0.90 thresholds; the flags *are* the decision, the policy engine's
+threshold check is satisfied by construction). The `summary` field is no
+longer AI-generated at all — `buildDeterministicSummary` in
+`src/ai/prompt.ts` derives it from the subject and first non-blank line
+of content, at zero token cost.
+
+`src/ai/prompt.ts` holds the prompt-injection-hardened developer
+instructions (kept short — it's sent on every call), the untrusted
+user/input builder (excludes raw `List-Unsubscribe`/
+`Authentication-Results` header values, only derived booleans; currently
+sends Gmail's short snippet rather than the full body, see "Known
+deviations"), and `FEW_SHOT_EXAMPLES` — a few labeled input/output pairs
+sent as real prior turns before the actual message, for the accuracy
+one-shot/few-shot prompting buys. That example content is identical on
+every call, so it's a fixed prefix cost rather than something that scales
+with mailbox size.
+
+Gmail-read concurrency and classifier-call concurrency are separate:
+`OrchestratorDeps.concurrency` takes `{ gmailReads, aiCalls }`, and
+`runWorkScan` (`core/orchestrator.ts`) processes messages in three
+phases — fetch+normalize+rule-match (batched at `gmailReads`), then
+classify only the non-bypassed subset (bounded at `aiCalls` via
+`core/concurrency.ts`'s `mapWithConcurrency`, independent of the fetch
+batch size), then pure policy evaluation. Gmail and an AI provider are
+unrelated rate-limit domains, so sizing one off the other's batch size
+was a bug; `work.ts` reads `aiCalls` from config (default 2).
 
 `src/ai/resolve-classifier.ts` decides which classifier a run actually
 uses: if a usable API key is found (the OS credential store first, under
