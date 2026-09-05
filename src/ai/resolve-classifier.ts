@@ -36,7 +36,12 @@ export async function resolveClassifier(input: ResolveClassifierInput): Promise<
     };
   }
 
-  const model = input.config?.model ?? DEFAULT_MODEL;
+  // GMAIL_AGENT_MODEL is documented as a live override (CLAUDE.md's
+  // "Firm technology decisions" table), so it must win over whatever
+  // model got persisted into config.json at an earlier sign-in — a
+  // config file happily keeps a stale model name forever otherwise,
+  // since nothing else ever rewrites it.
+  const model = process.env["GMAIL_AGENT_MODEL"] || input.config?.model || DEFAULT_MODEL;
   const baseURL =
     input.config?.aiProvider === "openai-compatible" && input.config.aiBaseUrl ? input.config.aiBaseUrl : null;
 
