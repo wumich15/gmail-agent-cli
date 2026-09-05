@@ -60,8 +60,10 @@ export async function runWork(options: WorkOptions): Promise<number> {
       concurrency: { gmailReads: 5 }
     });
 
+    let runId: string | undefined;
+
     if (!options.dryRun) {
-      const runId = newRunId();
+      runId = newRunId();
       const nowIso = ctx.clock.nowIso();
       const runsRepo = new RunsRepository(ctx.db);
       const actionsRepo = new ActionsRepository(ctx.db);
@@ -145,9 +147,9 @@ export async function runWork(options: WorkOptions): Promise<number> {
     }
 
     if (options.json) {
-      console.log(JSON.stringify(renderJsonSummary(summary, { dryRun: options.dryRun })));
+      console.log(JSON.stringify({ ...renderJsonSummary(summary, { dryRun: options.dryRun }), runId: runId ?? null }));
     } else {
-      console.log(renderHumanSummary(summary, { dryRun: options.dryRun }));
+      console.log(renderHumanSummary(summary, { dryRun: options.dryRun, ...(runId ? { runId } : {}) }));
     }
     return EXIT_CODES.ok;
   } finally {

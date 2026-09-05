@@ -1,6 +1,6 @@
 import type { EmailAssessment, EventCandidate, RuleAction } from "./models.js";
 
-export const POLICY_VERSION = "policy-v1";
+export const POLICY_VERSION = "policy-v2";
 
 export interface PolicyThresholds {
   autoTrashPromotionConfidence: number;
@@ -10,12 +10,21 @@ export interface PolicyThresholds {
   autoCreateEventConfidence: number;
 }
 
+/**
+ * Lowered from the design doc's launch-precision defaults (0.97/0.98/0.85/
+ * 0.90/0.95) to a uniform 0.90 by product decision, accepting more
+ * aggressive automation in exchange for full auditability: every action a
+ * run takes is recorded in the durable ledger and enumerable via
+ * `gmail summary <run-id>`, and any of it can be reversed with `gmail undo`
+ * (except unsubscribe). Bumping POLICY_VERSION invalidates cached
+ * assessments made under the old thresholds.
+ */
 export const DEFAULT_POLICY_THRESHOLDS: PolicyThresholds = {
-  autoTrashPromotionConfidence: 0.97,
-  autoTrashAutomatedLowValueConfidence: 0.98,
-  autoStarImportanceScore: 0.85,
+  autoTrashPromotionConfidence: 0.9,
+  autoTrashAutomatedLowValueConfidence: 0.9,
+  autoStarImportanceScore: 0.9,
   autoStarImportanceConfidence: 0.9,
-  autoCreateEventConfidence: 0.95
+  autoCreateEventConfidence: 0.9
 };
 
 export interface MessagePolicyInput {

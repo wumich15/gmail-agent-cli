@@ -1,7 +1,10 @@
 import pc from "picocolors";
 import type { RunSummary } from "./build-summary.js";
 
-export function renderHumanSummary(summary: RunSummary, options: { dryRun: boolean }): string {
+export function renderHumanSummary(
+  summary: RunSummary,
+  options: { dryRun: boolean; runId?: string }
+): string {
   const lines: string[] = [];
   const totalTrashed = Object.values(summary.trashedByReason).reduce((a, b) => a + b, 0);
   const inboxAfter = summary.inboxCountBefore - totalTrashed - summary.archivedCount;
@@ -37,6 +40,14 @@ export function renderHumanSummary(summary: RunSummary, options: { dryRun: boole
     }
   }
   lines.push(`Failures: ${summary.failureCount}`);
+
+  if (options.runId) {
+    lines.push("");
+    lines.push(
+      pc.dim(`Every action from this run is listed in: gmail summary ${options.runId}`) +
+        pc.dim(`   Undo with: gmail undo ${options.runId}`)
+    );
+  }
 
   return lines.join("\n");
 }

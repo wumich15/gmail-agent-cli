@@ -23,7 +23,9 @@ export async function runSummary(runId: string | undefined, options: { json: boo
   }
 
   if (options.json) {
-    console.log(JSON.stringify({ run, actionCountsByType: byType }));
+    // Every action from the run, not just aggregate counts — the durable
+    // ledger is the full audit trail, and nothing here is truncated.
+    console.log(JSON.stringify({ run, actionCountsByType: byType, actions }));
     return EXIT_CODES.ok;
   }
 
@@ -33,9 +35,14 @@ export async function runSummary(runId: string | undefined, options: { json: boo
     console.log(`  ${type}: ${count}`);
   }
 
-  console.log(pc.dim("Reconstructed from the durable action ledger; cannot reproduce transient AI text exactly."));
+  console.log(
+    pc.dim(
+      `Reconstructed from the durable action ledger (${actions.length} action(s), all listed below); ` +
+        "cannot reproduce transient AI text exactly."
+    )
+  );
 
-  for (const action of actions.slice(0, 10)) {
+  for (const action of actions) {
     if (!action.targetGmailMessageId) continue;
     try {
       const { data } = await gmailClient.users.messages.get({

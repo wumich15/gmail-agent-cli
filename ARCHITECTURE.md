@@ -143,6 +143,14 @@ decides what happens to a message, applied in this precedence order:
 5. A qualifying importance score/confidence, or an explicit **important**
    rule, adds `STARRED` + `IMPORTANT`.
 6. A qualifying, validated event candidate creates a Calendar event.
+
+By product decision, every confidence threshold in
+`DEFAULT_POLICY_THRESHOLDS` (`src/core/policy.ts`) is currently a uniform
+**0.90** — lower than the design doc's original launch-precision defaults
+(0.97/0.98/0.85/0.90/0.95). This trades some precision for more automation,
+accepted specifically because every action is durably logged and fully
+enumerable via `gmail summary <run-id>` (no truncation) and reversible via
+`gmail undo` (except unsubscribe, which cannot be reversed by design).
 7. Every remaining message that is read and still in the Inbox gets
    archived — even if it was starred or used to create an event. Trash is
    the only outcome mutually exclusive with everything else.
@@ -187,6 +195,17 @@ for Review, and deterministic read-archiving still proceeds. The Zod
 Structured Outputs schema (`src/ai/schema.ts`) and the `Classifier`
 interface are in place so a real implementation can be dropped in behind
 `ai/openai-classifier.ts` later without touching `core/policy.ts`.
+
+### Pluggable provider (config surface only, not yet wired)
+
+`config/schema.ts` already models `aiProvider` (`"openai"` or
+`"openai-compatible"`) and `aiBaseUrl`, so a user is not required to hold
+an OpenAI API key specifically once a real classifier exists: pointing
+`aiBaseUrl` at any endpoint that implements the same Responses API +
+Structured Outputs shape (e.g. a self-hosted model server) would work
+without touching `core/policy.ts` or `core/orchestrator.ts` — only the
+`Classifier` implementation `work.ts` constructs would change. Both
+fields are currently inert; no classifier reads them yet.
 
 ## Command surface
 

@@ -364,17 +364,17 @@ Cloud AI must be opt-in during setup. `store: false` disables Responses applicat
 
 ## Deterministic action policy
 
-Centralize thresholds in versioned policy configuration. Initial defaults are deliberately precision-oriented:
+Centralize thresholds in versioned policy configuration. By product decision, the launch defaults trade some precision for more aggressive automation, accepted specifically because every action is durably logged and enumerable via `gmail summary <run-id>` and reversible via `gmail undo` (except unsubscribe):
 
 ```text
-auto-trash promotion confidence                 >= 0.97
-auto-trash automated_low_value confidence       >= 0.98
-auto-star importanceScore                       >= 0.85
+auto-trash promotion confidence                 >= 0.90
+auto-trash automated_low_value confidence       >= 0.90
+auto-star importanceScore                       >= 0.90
 auto-star importanceConfidence                  >= 0.90
-auto-create Calendar event confidence           >= 0.95
+auto-create Calendar event confidence           >= 0.90
 ```
 
-Do not tune these by intuition after launch; change them only from labeled evaluation results.
+Do not tune these further by intuition after launch; change them only from labeled evaluation results.
 
 Apply this precedence per message:
 

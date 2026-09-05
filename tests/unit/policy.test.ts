@@ -83,7 +83,7 @@ describe("evaluateMessagePolicy", () => {
 
   it("does not trash a promotion below the confidence threshold", () => {
     const decision = evaluateMessagePolicy(
-      baseInput({ assessment: assessment({ kind: "promotion", confidence: 0.9 }) })
+      baseInput({ assessment: assessment({ kind: "promotion", confidence: 0.8 }) })
     );
     expect(decision.actions.some((a) => a.type === "trash")).toBe(false);
   });
@@ -205,13 +205,13 @@ describe("evaluateMessagePolicy", () => {
     }
   });
 
-  it("uses default thresholds matching the design doc", () => {
+  it("uses the product-decided default thresholds (uniform 0.90)", () => {
     expect(DEFAULT_POLICY_THRESHOLDS).toEqual({
-      autoTrashPromotionConfidence: 0.97,
-      autoTrashAutomatedLowValueConfidence: 0.98,
-      autoStarImportanceScore: 0.85,
+      autoTrashPromotionConfidence: 0.9,
+      autoTrashAutomatedLowValueConfidence: 0.9,
+      autoStarImportanceScore: 0.9,
       autoStarImportanceConfidence: 0.9,
-      autoCreateEventConfidence: 0.95
+      autoCreateEventConfidence: 0.9
     });
   });
 });
