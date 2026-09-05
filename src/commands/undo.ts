@@ -5,7 +5,7 @@ import { resolveAccount } from "./shared.js";
 import { RunsRepository, ActionsRepository } from "../state/repositories/runs.js";
 import { EXIT_CODES } from "../core/errors.js";
 import { GMAIL_LABELS } from "../gmail/labels.js";
-import { withGoogleApiRetry } from "../core/google-api-retry.js";
+import { withApiRetry } from "../core/api-retry.js";
 
 export async function runUndo(runId: string, options: { yes: boolean }): Promise<number> {
   const ctx = bootstrap();
@@ -43,7 +43,7 @@ export async function runUndo(runId: string, options: { yes: boolean }): Promise
   for (const action of reversible) {
     if (!action.targetGmailMessageId) continue;
     try {
-      const { data } = await withGoogleApiRetry(() =>
+      const { data } = await withApiRetry(() =>
         gmailClient.users.messages.get({
           userId: "me",
           id: action.targetGmailMessageId!,
@@ -54,7 +54,7 @@ export async function runUndo(runId: string, options: { yes: boolean }): Promise
 
       switch (action.type) {
         case "trash":
-          await withGoogleApiRetry(() =>
+          await withApiRetry(() =>
             gmailClient.users.messages.untrash({ userId: "me", id: action.targetGmailMessageId! })
           );
           undone += 1;
@@ -63,7 +63,7 @@ export async function runUndo(runId: string, options: { yes: boolean }): Promise
           if (currentLabels.includes(GMAIL_LABELS.inbox)) {
             skipped += 1; // user already has it back in Inbox or re-archived differently; nothing to do.
           } else {
-            await withGoogleApiRetry(() =>
+            await withApiRetry(() =>
               gmailClient.users.messages.modify({
                 userId: "me",
                 id: action.targetGmailMessageId!,
@@ -74,7 +74,7 @@ export async function runUndo(runId: string, options: { yes: boolean }): Promise
           }
           break;
         case "star":
-          await withGoogleApiRetry(() =>
+          await withApiRetry(() =>
             gmailClient.users.messages.modify({
               userId: "me",
               id: action.targetGmailMessageId!,
@@ -84,7 +84,7 @@ export async function runUndo(runId: string, options: { yes: boolean }): Promise
           undone += 1;
           break;
         case "mark_important":
-          await withGoogleApiRetry(() =>
+          await withApiRetry(() =>
             gmailClient.users.messages.modify({
               userId: "me",
               id: action.targetGmailMessageId!,

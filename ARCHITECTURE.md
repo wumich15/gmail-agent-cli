@@ -222,7 +222,24 @@ classify only the non-bypassed subset (bounded at `aiCalls` via
 `core/concurrency.ts`'s `mapWithConcurrency`, independent of the fetch
 batch size), then pure policy evaluation. Gmail and an AI provider are
 unrelated rate-limit domains, so sizing one off the other's batch size
-was a bug; `work.ts` reads `aiCalls` from config (default 2).
+was a bug; `work.ts` reads `aiCalls` from config (default 5 — raised
+from an initial 2 once `OpenAiClassifier` itself gained retry/backoff,
+so the higher concurrency doesn't cost accuracy under rate-limit
+pressure). Immediately after phase 1, `preprocessed` is sorted
+most-recent-first by `internalDate` before classification begins, so
+both processing order and every downstream summary/output list newest
+mail first regardless of the order Gmail's `messages.list` happened to
+return it in.
+
+`OpenAiClassifier.assess` (`src/ai/openai-classifier.ts`) wraps its
+`responses.parse` call in `withApiRetry` (`src/core/api-retry.ts` —
+renamed from `google-api-retry.ts` once it started being shared by both
+the Google and OpenAI SDKs, both of which expose `.status`/
+`.response.headers.get()` in a compatible shape) with a smaller retry
+budget than the Gmail/Calendar default (3 attempts, 500ms/8s backoff
+vs. Google's 5 attempts/1s/30s) — this call runs once per message, so a
+worst-case full backoff cycle here is directly felt as "the whole run
+is slow," unlike a single Gmail list-page retry.
 
 `src/ai/resolve-classifier.ts` decides which classifier a run actually
 uses: if a usable API key is found (the OS credential store first, under
@@ -273,6 +290,17 @@ the MVP surface small:
   (`gmail spam` / `gmail important`); it dispatches to the same
   underlying logic in `src/commands/spam.ts` / `src/commands/important.ts`.
 
+Every `gmail` run's summary (`src/summary/build-summary.ts`) carries,
+in addition to the per-action-type detail lists, two sections built
+purely from in-memory outcomes at zero extra API/AI cost: a
+`recentUnread` list (the most-recent 10 unread messages regardless of
+what happened to them, relying on the orchestrator's most-recent-first
+ordering — a quick "what's actually new" glance without reading the
+whole run) and an `unchanged` list (every message that received no
+action and wasn't flagged for Review either, uncapped — so a message
+can never silently vanish from the summary between "acted on" and
+"needs review").
+
 The other commands `CLAUDE.md` specifies — `rules`, `summary`, `undo`,
 `auth`, `config`, `doctor` — are **not removed**, just not registered in
 `src/cli.ts` yet. Their implementations still exist under `src/commands/`
@@ -283,13 +311,14 @@ sign-in flow, so that logic isn't duplicated.
 
 ## Known deviations from the full design (as of this writing)
 
-- `src/core/google-api-retry.ts` now retries Gmail/Calendar 429 (quota
-  exceeded) and 5xx responses with exponential backoff and jitter,
-  honoring `Retry-After` — but there's still no bound on total *retried*
-  request volume across a whole run, so a sustained per-minute quota
-  exhaustion (as opposed to a transient spike) will still exhaust the
-  retry budget per call and eventually surface as a failure. `--limit`
-  is the practical mitigation for that case.
+- `src/core/api-retry.ts` (shared by the Gmail/Calendar and OpenAI call
+  sites) retries 429 (quota exceeded) and 5xx responses with
+  exponential backoff and jitter, honoring `Retry-After` — but there's
+  still no bound on total *retried* request volume across a whole run,
+  so a sustained per-minute quota exhaustion (as opposed to a transient
+  spike) will still exhaust the retry budget per call and eventually
+  surface as a failure. `--limit` is the practical mitigation for that
+  case.
 - No automated RFC 8058 DKIM-verified one-click HTTPS unsubscribe yet —
   `add spam` falls back to manual/`mailto:` handling, which is the spec's
   own safe default when DKIM coverage can't be verified.

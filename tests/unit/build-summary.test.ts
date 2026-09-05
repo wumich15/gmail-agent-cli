@@ -13,6 +13,8 @@ function outcome(overrides: Partial<MessageOutcome> & { decision: PolicyDecision
     labelIdsAtSnapshot: [],
     validatedEvent: null,
     classifierVersion: null,
+    internalDate: "1000",
+    isUnread: false,
     ...overrides
   };
 }
@@ -80,6 +82,57 @@ describe("buildRunSummary", () => {
     );
     const summary = buildRunSummary(8, outcomes);
     expect(summary.reviewSamples).toHaveLength(8);
+  });
+
+  it("lists unread messages under recentUnread, capped at 10, most-recent-first order preserved as given", () => {
+    const outcomes = Array.from({ length: 12 }, (_, i) =>
+      outcome({
+        subjectForDisplay: `Unread ${i}`,
+        isUnread: true,
+        internalDate: String(12 - i),
+        decision: { actions: [], needsReview: false, reviewReason: null }
+      })
+    );
+    const summary = buildRunSummary(12, outcomes);
+    expect(summary.recentUnread).toHaveLength(10);
+    expect(summary.recentUnread[0]!.subject).toBe("Unread 0");
+    expect(summary.recentUnread[9]!.subject).toBe("Unread 9");
+  });
+
+  it("does not list a read message under recentUnread", () => {
+    const summary = buildRunSummary(1, [
+      outcome({
+        subjectForDisplay: "Read message",
+        isUnread: false,
+        decision: { actions: [], needsReview: false, reviewReason: null }
+      })
+    ]);
+    expect(summary.recentUnread).toEqual([]);
+  });
+
+  it("lists a message with no action and no review flag under unchanged, uncapped", () => {
+    const outcomes = Array.from({ length: 15 }, (_, i) =>
+      outcome({
+        subjectForDisplay: `Unchanged ${i}`,
+        decision: { actions: [], needsReview: false, reviewReason: null }
+      })
+    );
+    const summary = buildRunSummary(15, outcomes);
+    expect(summary.unchanged).toHaveLength(15);
+  });
+
+  it("does not double-list a message under unchanged when it has an action or needs review", () => {
+    const summary = buildRunSummary(2, [
+      outcome({
+        subjectForDisplay: "Archived",
+        decision: { actions: [{ type: "archive", reasonCode: "read_non_trash" }], needsReview: false, reviewReason: null }
+      }),
+      outcome({
+        subjectForDisplay: "Needs review",
+        decision: { actions: [], needsReview: true, reviewReason: "assessment_unavailable" }
+      })
+    ]);
+    expect(summary.unchanged).toEqual([]);
   });
 });
 

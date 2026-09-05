@@ -23,6 +23,15 @@ export function renderHumanSummary(
   lines.push(`Inbox: ${summary.inboxCountBefore} before -> ${inboxAfter} after`);
   lines.push("");
 
+  // Quick executive summary first, most-recent-first: what's unread right
+  // now and what (if anything) happened to it, before the fuller
+  // category-by-category breakdown below.
+  if (summary.recentUnread.length > 0) {
+    lines.push(pc.bold(`Most recent unread (${summary.recentUnread.length})`));
+    printDetails(lines, summary.recentUnread);
+    lines.push("");
+  }
+
   if (totalTrashed > 0) {
     lines.push(pc.bold(`Trashed (${totalTrashed})`));
     for (const [reason, count] of Object.entries(summary.trashedByReason)) {
@@ -49,8 +58,12 @@ export function renderHumanSummary(
   printDetails(lines, summary.archived);
   lines.push("");
 
-  lines.push(pc.bold(`Review / unchanged: ${summary.reviewCount}`));
+  lines.push(pc.bold(`Review: ${summary.reviewCount}`));
   printDetails(lines, summary.reviewSamples);
+  lines.push("");
+
+  lines.push(pc.bold(`Unchanged, no action taken (${summary.unchanged.length})`));
+  printDetails(lines, summary.unchanged);
   lines.push(`Failures: ${summary.failureCount}`);
 
   if (options.runId) {

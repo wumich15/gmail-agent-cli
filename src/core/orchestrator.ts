@@ -104,6 +104,13 @@ export async function runWorkScan(deps: OrchestratorDeps): Promise<WorkScanResul
     preprocessed.push(...batchResults);
   }
 
+  // Most recent first: Gmail's own list order is not a documented,
+  // guaranteed contract, and this is what actually determines both
+  // classification priority (under concurrency, earlier array entries get
+  // picked up first) and the "most recent unread" summary section below —
+  // so it's made explicit here rather than assumed from the API response.
+  preprocessed.sort((a, b) => Number(b.normalized.internalDate) - Number(a.normalized.internalDate));
+
   // Phase 2: classify only the messages that aren't bypassed by an
   // explicit rule or native spam, at the separate, lower aiCalls
   // concurrency.
@@ -278,6 +285,8 @@ function finalizeOutcome(
     bypassReason: explicitRule?.action === "spam" ? "explicit_spam_rule" : nativeSpam ? "native_spam" : explicitRule?.action === "important" ? "explicit_important_rule" : null,
     labelIdsAtSnapshot: labelIds,
     validatedEvent,
-    classifierVersion: assessment?.classifierVersion ?? null
+    classifierVersion: assessment?.classifierVersion ?? null,
+    internalDate: normalized.internalDate,
+    isUnread: !isRead(labelIds)
   };
 }

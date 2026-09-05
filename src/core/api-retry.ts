@@ -1,12 +1,14 @@
 /**
- * Retry/backoff and HTTP-status helpers for Google API calls (Gmail and
- * Calendar both go through `googleapis`, which surfaces failures as
- * `gaxios`'s `GaxiosError`). gaxios only sets `.code` for low-level
- * network errors (e.g. `ECONNRESET`) — the HTTP status of a real
- * response, including 404/409/429, lives on `.status`, not `.code`.
+ * Retry/backoff and HTTP-status helpers shared by every outbound API this
+ * app calls. Both `gaxios` (which Gmail/Calendar via `googleapis` surface
+ * errors as) and the `openai` SDK expose the same shape on failure: a
+ * numeric `.status` and a fetch-like `.response.headers` with `.get()`.
+ * Note: `.code` is *not* the HTTP status on either SDK — gaxios only sets
+ * it for low-level network errors (e.g. `ECONNRESET`); the real status of
+ * a response, including 404/409/429, lives on `.status`.
  */
 
-export function googleApiErrorStatus(error: unknown): number | undefined {
+export function apiErrorStatus(error: unknown): number | undefined {
   if (typeof error !== "object" || error === null || !("status" in error)) {
     return undefined;
   }
@@ -46,12 +48,14 @@ const DEFAULT_OPTIONS: Required<RetryOptions> = {
 };
 
 /**
- * Retries a Google API call with truncated exponential backoff and jitter
- * on 429 (rate limit / quota exceeded) and 5xx responses, honoring
- * `Retry-After` when Google sends one. Every other error (4xx auth/
+ * Retries an API call with truncated exponential backoff and jitter on
+ * 429 (rate limit / quota exceeded) and 5xx responses, honoring
+ * `Retry-After` when the server sends one. Every other error (4xx auth/
  * permission/not-found failures) is not transient and is never retried.
+ * Works for Google (Gmail/Calendar) and OpenAI calls alike — see the
+ * module doc for why the same status-based logic applies to both.
  */
-export async function withGoogleApiRetry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
+export async function withApiRetry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
   const { maxAttempts, baseDelayMs, maxDelayMs } = { ...DEFAULT_OPTIONS, ...options };
   let attempt = 0;
   for (;;) {
@@ -59,7 +63,7 @@ export async function withGoogleApiRetry<T>(fn: () => Promise<T>, options: Retry
       return await fn();
     } catch (error) {
       attempt += 1;
-      const status = googleApiErrorStatus(error);
+      const status = apiErrorStatus(error);
       if (!isRetryableStatus(status) || attempt >= maxAttempts) {
         throw error;
       }

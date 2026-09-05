@@ -8,6 +8,7 @@ import OpenAI, {
   RateLimitError
 } from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
+import { withApiRetry } from "../core/api-retry.js";
 import { EmailFlagsSchema, type EmailFlags } from "./schema.js";
 import {
   buildClassificationInput,
@@ -64,15 +65,25 @@ export class OpenAiClassifier implements Classifier {
 
   async assess(message: NormalizedMessage, _context: ClassifyContext): Promise<AssessmentResult> {
     try {
-      const response = await this.client.responses.parse(
-        {
-          model: this.model,
-          instructions: DEVELOPER_INSTRUCTIONS,
-          input: buildInputWithExamples(message),
-          store: false,
-          text: { format: zodTextFormat(EmailFlagsSchema, "email_flags") }
-        },
-        { timeout: this.timeoutMs }
+      // Retries transient 429/5xx from OpenAI with backoff, same as every
+      // Gmail/Calendar call — lets a higher aiCalls concurrency actually
+      // pay off instead of losing messages to rate-limit blips. Capped
+      // lower/shorter than the Google default (3 attempts, 8s max delay):
+      // this runs once per message, so a worst case of several full
+      // backoff cycles here is directly felt as "the whole run is slow."
+      const response = await withApiRetry(
+        () =>
+          this.client.responses.parse(
+            {
+              model: this.model,
+              instructions: DEVELOPER_INSTRUCTIONS,
+              input: buildInputWithExamples(message),
+              store: false,
+              text: { format: zodTextFormat(EmailFlagsSchema, "email_flags") }
+            },
+            { timeout: this.timeoutMs }
+          ),
+        { maxAttempts: 3, baseDelayMs: 500, maxDelayMs: 8_000 }
       );
 
       const refusal = extractRefusal(response);

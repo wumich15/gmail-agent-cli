@@ -14,6 +14,10 @@ export interface MessageOutcome {
   validatedEvent: ValidatedEvent | null;
   /** The classifier version that produced this message's assessment, if any (for Calendar provenance). */
   classifierVersion: string | null;
+  /** Gmail's internalDate (epoch millis, as a string), used to order the summary most-recent-first. */
+  internalDate: string;
+  /** True when UNREAD is present at scan time. */
+  isUnread: boolean;
 }
 
 export interface ActionDetail {
@@ -38,17 +42,26 @@ export interface RunSummary {
   reviewCount: number;
   /** Every Review item's subject/sender/reason — not capped, matching the rest of this summary. */
   reviewSamples: ActionDetail[];
+  /** A quick, bounded, most-recent-first look at unread mail regardless of what (if anything) happened to it. */
+  recentUnread: ActionDetail[];
+  /** Every message that received no action and wasn't flagged for Review either — full list, never truncated. */
+  unchanged: ActionDetail[];
   failureCount: number;
   /** Set when --limit capped the scan; states what was skipped. */
   scanNote: string | null;
 }
+
+const MAX_RECENT_UNREAD = 10;
 
 /**
  * Builds the run summary deterministically from in-memory outcomes. No
  * second AI call narrates it; this only aggregates the plan already made.
  * Every category lists the exact subject/sender of every affected
  * message — the design's accepted trade-off for lower auto-action
- * thresholds is that nothing here is hidden or sampled.
+ * thresholds is that nothing here is hidden or sampled. `outcomes` is
+ * expected most-recent-first (core/orchestrator.ts sorts it that way),
+ * which this function relies on for `recentUnread` and preserves for
+ * `unchanged`.
  */
 export function buildRunSummary(inboxCountBefore: number, outcomes: readonly MessageOutcome[]): RunSummary {
   const trashedByReason: Record<string, number> = {};
@@ -58,6 +71,8 @@ export function buildRunSummary(inboxCountBefore: number, outcomes: readonly Mes
   const markedImportant: ActionDetail[] = [];
   const calendarCreated: ActionDetail[] = [];
   const reviewSamples: ActionDetail[] = [];
+  const recentUnread: ActionDetail[] = [];
+  const unchanged: ActionDetail[] = [];
   let reviewCount = 0;
 
   for (const outcome of outcomes) {
@@ -90,6 +105,18 @@ export function buildRunSummary(inboxCountBefore: number, outcomes: readonly Mes
     if (outcome.decision.needsReview) {
       reviewCount += 1;
       reviewSamples.push(detail(outcome.decision.reviewReason ?? "unspecified"));
+    } else if (outcome.decision.actions.length === 0) {
+      unchanged.push(detail("no_action"));
+    }
+
+    if (outcome.isUnread && recentUnread.length < MAX_RECENT_UNREAD) {
+      const actionSummary =
+        outcome.decision.actions.length > 0
+          ? outcome.decision.actions.map((a) => a.type).join("+")
+          : outcome.decision.needsReview
+            ? "review"
+            : "no_action";
+      recentUnread.push(detail(actionSummary));
     }
   }
 
@@ -107,6 +134,8 @@ export function buildRunSummary(inboxCountBefore: number, outcomes: readonly Mes
     calendarCreated,
     reviewCount,
     reviewSamples,
+    recentUnread,
+    unchanged,
     failureCount: 0,
     scanNote: null
   };

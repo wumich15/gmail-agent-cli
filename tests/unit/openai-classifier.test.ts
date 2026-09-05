@@ -202,6 +202,21 @@ describe("OpenAiClassifier", () => {
     if (!result.ok) expect(result.unavailable.reason).toBe("provider_unavailable");
   });
 
+  it("retries a transient rate-limit error and succeeds once the underlying call recovers", async () => {
+    let calls = 0;
+    const client = fakeClient(async () => {
+      calls += 1;
+      if (calls < 3) {
+        throw new RateLimitError(429, { error: { message: "quota" } }, "quota", {});
+      }
+      return { output_parsed: flags(), output: [] };
+    });
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
+    const result = await classifier.assess(message(), CONTEXT);
+    expect(calls).toBe(3);
+    expect(result.ok).toBe(true);
+  });
+
   it("never throws out of assess(), even for an unexpected error shape", async () => {
     const client = fakeClient(async () => {
       throw new Error("something weird");

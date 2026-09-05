@@ -26,11 +26,11 @@ export const ConfigSchema = z
     concurrency: z
       .object({
         gmailReads: z.number().int().min(1).max(20).default(5),
-        aiCalls: z.number().int().min(1).max(10).default(2),
+        aiCalls: z.number().int().min(1).max(10).default(5),
         calendarWrites: z.number().int().min(1).max(10).default(2)
       })
       .strict()
-      .default({ gmailReads: 5, aiCalls: 2, calendarWrites: 2 }),
+      .default({ gmailReads: 5, aiCalls: 5, calendarWrites: 2 }),
     policyThresholds: z
       .object({
         autoTrashPromotionConfidence: z.number().min(0).max(1),
@@ -63,7 +63,7 @@ export function defaultConfig(timezone: string): Config {
     aiProvider,
     ...(aiBaseUrl ? { aiBaseUrl } : {}),
     model: process.env["GMAIL_AGENT_MODEL"] ?? DEFAULT_MODEL,
-    concurrency: { gmailReads: 5, aiCalls: 2, calendarWrites: 2 },
+    concurrency: { gmailReads: 5, aiCalls: 5, calendarWrites: 2 },
     telemetryEnabled: false
   });
 }

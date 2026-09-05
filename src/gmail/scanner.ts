@@ -1,7 +1,7 @@
 import type { gmail_v1 } from "googleapis";
 import type { GmailClient } from "./client.js";
 import { headerMapFromList } from "./normalize.js";
-import { googleApiErrorStatus, withGoogleApiRetry } from "../core/google-api-retry.js";
+import { apiErrorStatus, withApiRetry } from "../core/api-retry.js";
 
 export const REQUIRED_METADATA_HEADERS = [
   "From",
@@ -25,7 +25,7 @@ export interface MailboxProfile {
 }
 
 export async function fetchProfile(client: GmailClient): Promise<MailboxProfile> {
-  const { data } = await withGoogleApiRetry(() => client.users.getProfile({ userId: "me" }));
+  const { data } = await withApiRetry(() => client.users.getProfile({ userId: "me" }));
   if (!data.emailAddress || !data.historyId) {
     throw new Error("Gmail profile response is missing emailAddress or historyId.");
   }
@@ -68,7 +68,7 @@ export async function listAllMessageIds(
   let estimatedTotal: number | null = null;
 
   do {
-    const { data } = await withGoogleApiRetry(() =>
+    const { data } = await withApiRetry(() =>
       client.users.messages.list({
         userId: "me",
         labelIds: params.labelIds,
@@ -101,7 +101,7 @@ export async function fetchMessageMetadata(
   client: GmailClient,
   messageId: string
 ): Promise<gmail_v1.Schema$Message> {
-  const { data } = await withGoogleApiRetry(() =>
+  const { data } = await withApiRetry(() =>
     client.users.messages.get({
       userId: "me",
       id: messageId,
@@ -116,7 +116,7 @@ export async function fetchMessageFull(
   client: GmailClient,
   messageId: string
 ): Promise<gmail_v1.Schema$Message> {
-  const { data } = await withGoogleApiRetry(() =>
+  const { data } = await withApiRetry(() =>
     client.users.messages.get({
       userId: "me",
       id: messageId,
@@ -165,7 +165,7 @@ export async function listHistorySince(
 
   try {
     do {
-      const { data } = await withGoogleApiRetry(() =>
+      const { data } = await withApiRetry(() =>
         client.users.history.list({
           userId: "me",
           startHistoryId,
@@ -212,5 +212,5 @@ export async function listHistorySince(
 }
 
 function isNotFoundError(error: unknown): boolean {
-  return googleApiErrorStatus(error) === 404;
+  return apiErrorStatus(error) === 404;
 }

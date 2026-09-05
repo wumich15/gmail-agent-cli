@@ -1,6 +1,6 @@
 import type { GmailClient } from "./client.js";
 import { GMAIL_LABELS } from "./labels.js";
-import { withGoogleApiRetry } from "../core/google-api-retry.js";
+import { withApiRetry } from "../core/api-retry.js";
 
 const BATCH_MODIFY_MAX_IDS = 1000;
 
@@ -53,7 +53,7 @@ export async function applyGroupedLabelMutations(
     for (let i = 0; i < ids.length; i += BATCH_MODIFY_MAX_IDS) {
       const chunk = ids.slice(i, i + BATCH_MODIFY_MAX_IDS);
       try {
-        await withGoogleApiRetry(() =>
+        await withApiRetry(() =>
           client.users.messages.batchModify({
             userId: "me",
             requestBody: {
@@ -75,7 +75,7 @@ export async function applyGroupedLabelMutations(
 
 /** Trash a single message. Never calls delete/batchDelete. */
 export async function trashMessage(client: GmailClient, messageId: string): Promise<void> {
-  await withGoogleApiRetry(() => client.users.messages.trash({ userId: "me", id: messageId }));
+  await withApiRetry(() => client.users.messages.trash({ userId: "me", id: messageId }));
 }
 
 /** Restores a trashed message and, if safe, its recorded prior labels. */
@@ -84,9 +84,9 @@ export async function untrashMessage(
   messageId: string,
   restoreLabelIds: readonly string[] = []
 ): Promise<void> {
-  await withGoogleApiRetry(() => client.users.messages.untrash({ userId: "me", id: messageId }));
+  await withApiRetry(() => client.users.messages.untrash({ userId: "me", id: messageId }));
   if (restoreLabelIds.length > 0) {
-    await withGoogleApiRetry(() =>
+    await withApiRetry(() =>
       client.users.messages.modify({
         userId: "me",
         id: messageId,

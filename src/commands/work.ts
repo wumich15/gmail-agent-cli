@@ -25,7 +25,7 @@ import {
   trashMessage
 } from "../gmail/executor.js";
 import { buildEventInsertPlan, insertIdempotentEvent } from "../calendar/idempotency.js";
-import { withGoogleApiRetry } from "../core/google-api-retry.js";
+import { withApiRetry } from "../core/api-retry.js";
 import { contentHash } from "../core/ids.js";
 import type { PolicyActionIntent } from "../core/policy.js";
 import type { ActionType, PlannedAction } from "../core/models.js";
@@ -95,7 +95,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
       userEmail: account.emailDisplay ?? "",
       userTimezone: account.timezone,
       clock: ctx.clock,
-      concurrency: { gmailReads: 5, aiCalls: ctx.config?.concurrency.aiCalls ?? 2 },
+      concurrency: { gmailReads: 5, aiCalls: ctx.config?.concurrency.aiCalls ?? 5 },
       ...(options.limit !== undefined ? { limit: options.limit } : {})
     });
 
@@ -182,7 +182,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
       const survivingTrash: string[] = [];
       for (const messageId of trashTargets) {
         try {
-          const { data } = await withGoogleApiRetry(() =>
+          const { data } = await withApiRetry(() =>
             gmailClient.users.messages.get({
               userId: "me",
               id: messageId,

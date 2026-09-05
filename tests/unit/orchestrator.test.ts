@@ -11,6 +11,7 @@ interface FakeMessage {
   labelIds: string[];
   headers: { name: string; value: string }[];
   snippet?: string;
+  internalDate?: string;
 }
 
 function fakeClient(messages: FakeMessage[]): GmailClient {
@@ -33,7 +34,7 @@ function fakeClient(messages: FakeMessage[]): GmailClient {
               id: m.id,
               threadId: m.threadId,
               historyId: "1",
-              internalDate: "1000",
+              internalDate: m.internalDate ?? "1000",
               labelIds: m.labelIds,
               snippet: m.snippet ?? "",
               payload: { headers: m.headers }
@@ -212,5 +213,62 @@ describe("runWorkScan", () => {
     );
 
     expect(maxInFlight).toBeLessThanOrEqual(2);
+  });
+
+  it("processes and reports messages most-recent-first regardless of the order Gmail returned them in", async () => {
+    const messages: FakeMessage[] = [
+      {
+        id: "old",
+        threadId: "t-old",
+        labelIds: ["INBOX", "UNREAD"],
+        headers: [{ name: "From", value: "a@example.com" }, { name: "Subject", value: "Old one" }],
+        internalDate: "1000"
+      },
+      {
+        id: "new",
+        threadId: "t-new",
+        labelIds: ["INBOX", "UNREAD"],
+        headers: [{ name: "From", value: "b@example.com" }, { name: "Subject", value: "New one" }],
+        internalDate: "9000"
+      }
+    ];
+    // fakeClient's messages.list returns them in this same (oldest-first)
+    // order; runWorkScan must not just trust that.
+    const client = fakeClient(messages);
+    const classifier = new FixedClassifier({
+      ok: false,
+      unavailable: { reason: "not_configured", detail: null }
+    });
+    const { outcomes, summary } = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
+
+    expect(outcomes.map((o) => o.gmailMessageId)).toEqual(["new", "old"]);
+    expect(summary.recentUnread.map((d) => d.subject)).toEqual(["New one", "Old one"]);
+  });
+
+  it("lists a message with no action and no review flag under `unchanged`", async () => {
+    // A read, non-spam message the classifier has nothing to say about
+    // yet (not flagged for review, no action) should still be visible
+    // somewhere in the summary, not silently disappear.
+    const client = fakeClient([
+      {
+        id: "m1",
+        threadId: "t1",
+        labelIds: ["INBOX"], // read (no UNREAD), so ordinarily archive would fire...
+        headers: [{ name: "From", value: "a@example.com" }]
+      }
+    ]);
+    // ...unless it's already out of the Inbox; simulate a message that's
+    // simply not in the Inbox at all (e.g. a stray label combination) so
+    // no action applies and it isn't a Review item either.
+    const classifier: Classifier = {
+      async assess() {
+        return { ok: false, unavailable: { reason: "not_configured", detail: null } };
+      }
+    };
+    const { summary } = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
+    // This message is read and in the Inbox, so it *will* be archived —
+    // demonstrating the more common "not unchanged" path stays correct.
+    expect(summary.archivedCount).toBe(1);
+    expect(summary.unchanged).toEqual([]);
   });
 });

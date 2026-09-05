@@ -16,6 +16,8 @@ export interface JsonSummaryOutput {
   calendarCreated: ActionDetail[];
   reviewCount: number;
   reviewSamples: ActionDetail[];
+  recentUnread: ActionDetail[];
+  unchanged: ActionDetail[];
   failureCount: number;
   scanNote: string | null;
 }
@@ -39,6 +41,8 @@ export function renderJsonSummary(summary: RunSummary, options: { dryRun: boolea
     calendarCreated: summary.calendarCreated,
     reviewCount: summary.reviewCount,
     reviewSamples: summary.reviewSamples,
+    recentUnread: summary.recentUnread,
+    unchanged: summary.unchanged,
     failureCount: summary.failureCount,
     scanNote: summary.scanNote
   };
