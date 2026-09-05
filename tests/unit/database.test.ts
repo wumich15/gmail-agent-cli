@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { openDatabase } from "../../src/state/database.js";
 import { AccountsRepository } from "../../src/state/repositories/accounts.js";
 import { RuleGroupsRepository } from "../../src/state/repositories/rule-groups.js";
+import { MessagesRepository } from "../../src/state/repositories/messages.js";
 
 let dir: string;
 
@@ -85,6 +86,96 @@ describe("openDatabase", () => {
     const groups = repo.list("abc");
     expect(groups).toHaveLength(1);
     expect(groups[0]!.matchers).toHaveLength(1);
+    db.close();
+  });
+
+  it("persists and reads back an account's history marker", () => {
+    const db = openDatabase(freshDbPath());
+    const repo = new AccountsRepository(db);
+    repo.upsert({
+      accountHash: "abc",
+      emailDisplay: null,
+      timezone: "UTC",
+      historyMarker: null,
+      setupComplete: true,
+      automationEnabled: false,
+      createdAt: "now",
+      updatedAt: "now"
+    });
+    repo.updateHistoryMarker("abc", "12345", "later");
+    expect(repo.get("abc")?.historyMarker).toBe("12345");
+    db.close();
+  });
+
+  it("round-trips a cached message record, including its label snapshot", () => {
+    const db = openDatabase(freshDbPath());
+    new AccountsRepository(db).upsert({
+      accountHash: "abc",
+      emailDisplay: null,
+      timezone: "UTC",
+      historyMarker: null,
+      setupComplete: true,
+      automationEnabled: false,
+      createdAt: "now",
+      updatedAt: "now"
+    });
+    const repo = new MessagesRepository(db);
+    repo.upsert({
+      accountHash: "abc",
+      gmailMessageId: "m1",
+      gmailThreadId: "t1",
+      contentHash: "hash-1",
+      labelSnapshot: ["INBOX", "UNREAD"],
+      classifierVersion: null,
+      promptVersion: null,
+      schemaVersion: null,
+      policyVersion: null,
+      assessmentKind: null,
+      assessmentConfidence: null,
+      importanceScore: null,
+      importanceConfidence: null,
+      reasonCodes: null,
+      processedAt: "now"
+    });
+    const found = repo.get("abc", "m1");
+    expect(found?.contentHash).toBe("hash-1");
+    expect(found?.labelSnapshot).toEqual(["INBOX", "UNREAD"]);
+    expect(repo.countForAccount("abc")).toBe(1);
+    db.close();
+  });
+
+  it("upserting a cached message record twice updates it in place rather than duplicating", () => {
+    const db = openDatabase(freshDbPath());
+    new AccountsRepository(db).upsert({
+      accountHash: "abc",
+      emailDisplay: null,
+      timezone: "UTC",
+      historyMarker: null,
+      setupComplete: true,
+      automationEnabled: false,
+      createdAt: "now",
+      updatedAt: "now"
+    });
+    const repo = new MessagesRepository(db);
+    const base = {
+      accountHash: "abc",
+      gmailMessageId: "m1",
+      gmailThreadId: "t1",
+      labelSnapshot: ["INBOX"],
+      classifierVersion: null,
+      promptVersion: null,
+      schemaVersion: null,
+      policyVersion: null,
+      assessmentKind: null,
+      assessmentConfidence: null,
+      importanceScore: null,
+      importanceConfidence: null,
+      reasonCodes: null
+    };
+    repo.upsert({ ...base, contentHash: "hash-1", processedAt: "t0" });
+    repo.upsert({ ...base, contentHash: "hash-2", processedAt: "t1" });
+    expect(repo.countForAccount("abc")).toBe(1);
+    expect(repo.get("abc", "m1")?.contentHash).toBe("hash-2");
     db.close();
   });
 });

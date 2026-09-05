@@ -112,6 +112,16 @@ export async function fetchMessageMetadata(
   return data;
 }
 
+/**
+ * A single cheap `users.labels.get` call for the current Inbox message
+ * count — used as the "before" count for the run summary when an
+ * incremental scan means we never list the whole Inbox.
+ */
+export async function fetchInboxMessageCount(client: GmailClient): Promise<number> {
+  const { data } = await withApiRetry(() => client.users.labels.get({ userId: "me", id: "INBOX" }));
+  return data.messagesTotal ?? 0;
+}
+
 export async function fetchMessageFull(
   client: GmailClient,
   messageId: string
@@ -141,7 +151,8 @@ export function historyIdGreaterThan(a: string, b: string): boolean {
 }
 
 export interface HistorySyncResult {
-  changedMessageIds: Set<string>;
+  /** Changed message ID -> its thread ID (both come straight from the history record, no extra fetch needed). */
+  changedMessages: Map<string, string>;
   deletedMessageIds: Set<string>;
   endHistoryId: string;
   /** True when Gmail returned 404 for the starting marker; caller must fall back to a full rescan. */
@@ -150,7 +161,7 @@ export interface HistorySyncResult {
 
 /**
  * Paginates users.history.list from a persisted marker and reconciles
- * every change into a set of message IDs that need re-evaluation. History
+ * every change into the set of messages that need re-evaluation. History
  * IDs are increasing but not contiguous; only an optimization over a full
  * rescan, never a correctness requirement.
  */
@@ -158,10 +169,14 @@ export async function listHistorySince(
   client: GmailClient,
   startHistoryId: string
 ): Promise<HistorySyncResult> {
-  const changedMessageIds = new Set<string>();
+  const changedMessages = new Map<string, string>();
   const deletedMessageIds = new Set<string>();
   let pageToken: string | undefined;
   let latestHistoryId = startHistoryId;
+
+  const record = (id: string | null | undefined, threadId: string | null | undefined): void => {
+    if (id) changedMessages.set(id, threadId ?? id);
+  };
 
   try {
     do {
@@ -174,21 +189,24 @@ export async function listHistorySince(
         })
       );
 
-      for (const record of data.history ?? []) {
-        if (record.id && historyIdGreaterThan(record.id, latestHistoryId)) {
-          latestHistoryId = record.id;
+      for (const entry of data.history ?? []) {
+        if (entry.id && historyIdGreaterThan(entry.id, latestHistoryId)) {
+          latestHistoryId = entry.id;
         }
-        for (const m of record.messagesAdded ?? []) {
-          if (m.message?.id) changedMessageIds.add(m.message.id);
+        for (const m of entry.messagesAdded ?? []) {
+          record(m.message?.id, m.message?.threadId);
         }
-        for (const m of record.labelsAdded ?? []) {
-          if (m.message?.id) changedMessageIds.add(m.message.id);
+        for (const m of entry.labelsAdded ?? []) {
+          record(m.message?.id, m.message?.threadId);
         }
-        for (const m of record.labelsRemoved ?? []) {
-          if (m.message?.id) changedMessageIds.add(m.message.id);
+        for (const m of entry.labelsRemoved ?? []) {
+          record(m.message?.id, m.message?.threadId);
         }
-        for (const m of record.messagesDeleted ?? []) {
-          if (m.message?.id) deletedMessageIds.add(m.message.id);
+        for (const m of entry.messagesDeleted ?? []) {
+          if (m.message?.id) {
+            deletedMessageIds.add(m.message.id);
+            changedMessages.delete(m.message.id);
+          }
         }
       }
       pageToken = data.nextPageToken ?? undefined;
@@ -199,7 +217,7 @@ export async function listHistorySince(
   } catch (error: unknown) {
     if (isNotFoundError(error)) {
       return {
-        changedMessageIds: new Set(),
+        changedMessages: new Map(),
         deletedMessageIds: new Set(),
         endHistoryId: startHistoryId,
         expiredMarker: true
@@ -208,7 +226,7 @@ export async function listHistorySince(
     throw error;
   }
 
-  return { changedMessageIds, deletedMessageIds, endHistoryId: latestHistoryId, expiredMarker: false };
+  return { changedMessages, deletedMessageIds, endHistoryId: latestHistoryId, expiredMarker: false };
 }
 
 function isNotFoundError(error: unknown): boolean {

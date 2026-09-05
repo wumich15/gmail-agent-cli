@@ -22,6 +22,14 @@ function fakeClient(messages: FakeMessage[]): GmailClient {
   const client = {
     users: {
       getProfile: async () => ({ data: { emailAddress: "me@example.com", historyId: "100" } }),
+      history: {
+        // No changes during the (instantaneous, in these tests) full-scan
+        // window — runFullScan's post-scan reconciliation call is a no-op.
+        list: async () => ({ data: { history: [], historyId: "100" } })
+      },
+      labels: {
+        get: async () => ({ data: { messagesTotal: inboxIds.length } })
+      },
       messages: {
         list: async ({ labelIds }: { labelIds: string[] }) => {
           const source = labelIds.includes("SPAM") ? spamIds : inboxIds;
@@ -357,6 +365,132 @@ describe("runWorkScan", () => {
     expect(labelActions).toHaveLength(10);
     // Every survivor uses the exact same display name, not a mix of casings.
     expect(new Set(labelActions.map((a) => (a as { labelName: string }).labelName)).size).toBe(1);
+  });
+
+  it("runs an incremental scan when a valid historyMarker is given, never listing the whole Inbox/Spam", async () => {
+    const changedMessage: FakeMessage = {
+      id: "changed-1",
+      threadId: "t-changed-1",
+      labelIds: ["INBOX", "UNREAD"],
+      headers: [{ name: "From", value: "person@example.com" }]
+    };
+    let listCalled = false;
+    const client: GmailClient = {
+      users: {
+        getProfile: async () => ({ data: { emailAddress: "me@example.com", historyId: "200" } }),
+        history: {
+          list: async () => ({
+            data: {
+              history: [{ id: "150", labelsAdded: [{ message: { id: "changed-1", threadId: "t-changed-1" } }] }],
+              historyId: "200"
+            }
+          })
+        },
+        labels: { get: async () => ({ data: { messagesTotal: 42 } }) },
+        messages: {
+          list: async () => {
+            listCalled = true;
+            return { data: { messages: [] } };
+          },
+          get: async ({ id }: { id: string }) => {
+            if (id !== "changed-1") throw new Error(`unexpected fetch for ${id}`);
+            return {
+              data: {
+                id: changedMessage.id,
+                threadId: changedMessage.threadId,
+                historyId: "150",
+                internalDate: "5000",
+                labelIds: changedMessage.labelIds,
+                snippet: "",
+                payload: { headers: changedMessage.headers }
+              }
+            };
+          }
+        }
+      }
+    } as unknown as GmailClient;
+
+    const classifier = new FixedClassifier({
+      ok: false,
+      unavailable: { reason: "not_configured", detail: null }
+    });
+    const { outcomes, summary, newHistoryMarker, usedIncrementalSync } = await runWorkScan(
+      baseDeps({ gmailClient: client, classifier, historyMarker: "100" })
+    );
+
+    expect(listCalled).toBe(false);
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.gmailMessageId).toBe("changed-1");
+    expect(usedIncrementalSync).toBe(true);
+    expect(newHistoryMarker).toBe("200");
+    expect(summary.inboxCountBefore).toBe(42);
+  });
+
+  it("excludes a changed message that is no longer in Inbox or Spam from an incremental scan", async () => {
+    const client: GmailClient = {
+      users: {
+        getProfile: async () => ({ data: { emailAddress: "me@example.com", historyId: "200" } }),
+        history: {
+          list: async () => ({
+            data: {
+              history: [{ id: "150", labelsRemoved: [{ message: { id: "archived-1", threadId: "t1" } }] }],
+              historyId: "200"
+            }
+          })
+        },
+        labels: { get: async () => ({ data: { messagesTotal: 10 } }) },
+        messages: {
+          list: async () => ({ data: { messages: [] } }),
+          get: async () => ({
+            data: {
+              id: "archived-1",
+              threadId: "t1",
+              historyId: "150",
+              internalDate: "5000",
+              labelIds: [], // no INBOX, no SPAM — the user archived it themselves
+              snippet: "",
+              payload: { headers: [{ name: "From", value: "person@example.com" }] }
+            }
+          })
+        }
+      }
+    } as unknown as GmailClient;
+
+    const { outcomes } = await runWorkScan(
+      baseDeps({ gmailClient: client, classifier: NEVER_CALLED_CLASSIFIER, historyMarker: "100" })
+    );
+    expect(outcomes).toHaveLength(0);
+  });
+
+  it("falls back to a full scan when the stored historyMarker has expired", async () => {
+    const message: FakeMessage = {
+      id: "m1",
+      threadId: "t1",
+      labelIds: ["INBOX", "UNREAD"],
+      headers: [{ name: "From", value: "person@example.com" }]
+    };
+    const full = fakeClient([message]);
+    const client: GmailClient = {
+      users: {
+        ...full.users,
+        history: {
+          list: async () => {
+            const error = Object.assign(new Error("not found"), { status: 404 });
+            throw error;
+          }
+        }
+      }
+    } as unknown as GmailClient;
+
+    const classifier = new FixedClassifier({
+      ok: false,
+      unavailable: { reason: "not_configured", detail: null }
+    });
+    const { outcomes, usedIncrementalSync } = await runWorkScan(
+      baseDeps({ gmailClient: client, classifier, historyMarker: "stale-100" })
+    );
+    expect(usedIncrementalSync).toBe(false);
+    expect(outcomes).toHaveLength(1);
   });
 
   it("adds a Calendar label and archives the message when a validated event is created, regardless of read state", async () => {

@@ -2,9 +2,13 @@ import type { Classifier } from "../ai/classifier.js";
 import type { GmailClient } from "../gmail/client.js";
 import {
   fetchProfile,
+  fetchInboxMessageCount,
   headersFromMessage,
   listAllMessageIds,
+  listHistorySince,
   fetchMessageFull,
+  type HistorySyncResult,
+  type MailboxProfile,
   type MessageStub
 } from "../gmail/scanner.js";
 import { buildNormalizedMessage, extractBodyParts } from "../gmail/normalize.js";
@@ -47,6 +51,16 @@ export interface OrchestratorDeps {
   appAttributedLabelsByMessageId?: ReadonlyMap<string, ReadonlySet<"STARRED" | "IMPORTANT">>;
   /** The user's current custom Gmail label names, passed to the classifier so it prefers reusing one. */
   existingLabels?: readonly string[];
+  /**
+   * The account's persisted Gmail history marker from the last successful
+   * run, if any. When present and still valid, the scan reconciles only
+   * the messages `users.history.list` reports as changed since that point
+   * instead of re-listing and re-fetching the whole Inbox and Spam label
+   * every time — the main lever for staying under Gmail's API quota on
+   * repeat runs. Omit or pass null to force a full snapshot (e.g. the
+   * account's first-ever run, or `gmail cache`'s explicit full rebaseline).
+   */
+  historyMarker?: string | null;
 }
 
 /**
@@ -61,12 +75,15 @@ export const MIN_LABEL_BATCH_SIZE = 10;
 export interface WorkScanResult {
   summary: RunSummary;
   outcomes: MessageOutcome[];
-  historyIdAtSnapshot: string;
-  /** Set when --limit capped the Inbox and/or Spam scan; states what was skipped, per CLAUDE.md's "state exactly how many remain" requirement. */
+  /** The Gmail history ID the caller should persist as this account's new marker once the run's ledger is durable. */
+  newHistoryMarker: string;
+  /** True when this scan reconciled only changed messages via history.list rather than listing the whole Inbox/Spam. */
+  usedIncrementalSync: boolean;
+  /** Set when --limit capped the scan, or an incremental scan happened; states what was skipped/reconciled. */
   scanNote: string | null;
 }
 
-function dedupeStubs(stubs: readonly MessageStub[]): MessageStub[] {
+export function dedupeStubs(stubs: readonly MessageStub[]): MessageStub[] {
   const seen = new Map<string, MessageStub>();
   for (const stub of stubs) {
     seen.set(stub.id, stub);
@@ -86,10 +103,69 @@ function chunk<T>(items: readonly T[], size: number): T[][] {
  * Read-only snapshot + normalize + explicit rules + policy pipeline. Safe
  * to call for `--dry-run`: it only reads Gmail and calls the classifier,
  * never mutates Gmail, Calendar, rules, or durable state.
+ *
+ * Picks between a full snapshot and an incremental (history.list-based)
+ * scan depending on whether `deps.historyMarker` is present and still
+ * valid — see "Incremental synchronization" in CLAUDE.md. History is only
+ * ever an optimization: it changes which messages get looked at on a
+ * given run, never the policy that decides what happens to them.
  */
 export async function runWorkScan(deps: OrchestratorDeps): Promise<WorkScanResult> {
   const profile = await fetchProfile(deps.gmailClient);
 
+  if (deps.historyMarker) {
+    const history = await listHistorySince(deps.gmailClient, deps.historyMarker);
+    if (!history.expiredMarker) {
+      return runIncrementalScan(deps, profile, history);
+    }
+    // Gmail returned 404 for the stored marker (it expired) — fall through
+    // to the fenced full-rescan procedure below, exactly as CLAUDE.md
+    // specifies for this case.
+  }
+  return runFullScan(deps, profile);
+}
+
+/** Phase 1: fetch + normalize + rule-match every stub, batched at gmailReads concurrency, sorted most-recent-first. */
+async function fetchAndNormalizeAll(
+  stubs: readonly MessageStub[],
+  deps: OrchestratorDeps,
+  userEmail: string
+): Promise<PreprocessedMessage[]> {
+  const preprocessed: PreprocessedMessage[] = [];
+  for (const batch of chunk(stubs, deps.concurrency.gmailReads)) {
+    const batchResults = await Promise.all(batch.map((stub) => fetchAndNormalize(stub, deps, userEmail)));
+    preprocessed.push(...batchResults);
+  }
+  // Most recent first: Gmail's own list/history order is not a documented,
+  // guaranteed contract, and this is what actually determines both
+  // classification priority (under concurrency, earlier array entries get
+  // picked up first) and the "most recent unread" summary section below —
+  // so it's made explicit here rather than assumed from the API response.
+  preprocessed.sort((a, b) => Number(b.normalized.internalDate) - Number(a.normalized.internalDate));
+  return preprocessed;
+}
+
+/** Phases 2-4: classify (bounded at aiCalls concurrency), evaluate policy, then the run-wide label-batch threshold. No further Gmail I/O. */
+async function classifyAndFinalize(
+  preprocessed: readonly PreprocessedMessage[],
+  deps: OrchestratorDeps
+): Promise<MessageOutcome[]> {
+  const assessmentResults = await mapWithConcurrency(preprocessed, deps.concurrency.aiCalls, (pre) =>
+    pre.bypassed
+      ? Promise.resolve(null)
+      : deps.classifier.assess(pre.normalized, {
+          classifierVersion: "not-configured",
+          promptVersion: "not-configured",
+          schemaVersion: "not-configured",
+          policyVersion: POLICY_VERSION,
+          existingLabels: deps.existingLabels ?? []
+        })
+  );
+  const rawOutcomes = preprocessed.map((pre, i) => finalizeOutcome(pre, assessmentResults[i] ?? null, deps));
+  return applyLabelBatchThreshold(rawOutcomes);
+}
+
+async function runFullScan(deps: OrchestratorDeps, profile: MailboxProfile): Promise<WorkScanResult> {
   const [spamResult, inboxResult] = await Promise.all([
     listAllMessageIds(deps.gmailClient, {
       labelIds: [GMAIL_LABELS.spam],
@@ -104,49 +180,61 @@ export async function runWorkScan(deps: OrchestratorDeps): Promise<WorkScanResul
   ]);
 
   const stubs = dedupeStubs([...spamResult.messages, ...inboxResult.messages]);
+  const preprocessed = await fetchAndNormalizeAll(stubs, deps, profile.emailAddress);
+  const outcomes = await classifyAndFinalize(preprocessed, deps);
+  const summary = buildRunSummary(inboxResult.messages.length, outcomes);
 
-  // Phase 1: fetch + normalize + rule-match, batched at gmailReads
-  // concurrency. No classifier calls happen here.
-  const preprocessed: PreprocessedMessage[] = [];
-  for (const batch of chunk(stubs, deps.concurrency.gmailReads)) {
-    const batchResults = await Promise.all(
-      batch.map((stub) => fetchAndNormalize(stub, deps, profile.emailAddress))
-    );
-    preprocessed.push(...batchResults);
+  // Catches anything that changed while this full snapshot was being
+  // listed/fetched, so it isn't silently missed forever by the next
+  // incremental run (which starts from the marker persisted below) — see
+  // CLAUDE.md's "read historyId before listing... then reconcile every
+  // change through the returned ending history ID."
+  const postScanHistory = await listHistorySince(deps.gmailClient, profile.historyId);
+  const newHistoryMarker = postScanHistory.expiredMarker ? profile.historyId : postScanHistory.endHistoryId;
+
+  return {
+    summary,
+    outcomes,
+    newHistoryMarker,
+    usedIncrementalSync: false,
+    scanNote: buildScanNote(inboxResult, spamResult)
+  };
+}
+
+async function runIncrementalScan(
+  deps: OrchestratorDeps,
+  profile: MailboxProfile,
+  history: HistorySyncResult
+): Promise<WorkScanResult> {
+  const allChanged = [...history.changedMessages.entries()];
+  let stubs: MessageStub[] = allChanged.map(([id, threadId]) => ({ id, threadId }));
+  let truncationNote: string | null = null;
+  if (deps.limit !== undefined && stubs.length > deps.limit) {
+    truncationNote = `--limit applied: processing ${deps.limit} of ${stubs.length} changed message(s); the rest will be reconciled on a later run.`;
+    stubs = stubs.slice(0, deps.limit);
   }
 
-  // Most recent first: Gmail's own list order is not a documented,
-  // guaranteed contract, and this is what actually determines both
-  // classification priority (under concurrency, earlier array entries get
-  // picked up first) and the "most recent unread" summary section below —
-  // so it's made explicit here rather than assumed from the API response.
-  preprocessed.sort((a, b) => Number(b.normalized.internalDate) - Number(a.normalized.internalDate));
+  const preprocessedAll = await fetchAndNormalizeAll(stubs, deps, profile.emailAddress);
+  // Only a message currently in Inbox or native Spam is ever actionable —
+  // exactly the same two input streams a full scan lists directly. A
+  // message that changed for an unrelated reason (the user archived or
+  // trashed it themselves, etc.) simply isn't evaluated, matching how it
+  // would never have appeared in a full listAllMessageIds pass either.
+  const preprocessed = preprocessedAll.filter((pre) => isInInbox(pre.labelIds) || isNativeSpam(pre.labelIds));
 
-  // Phase 2: classify only the messages that aren't bypassed by an
-  // explicit rule or native spam, at the separate, lower aiCalls
-  // concurrency.
-  const assessmentResults = await mapWithConcurrency(preprocessed, deps.concurrency.aiCalls, (pre) =>
-    pre.bypassed
-      ? Promise.resolve(null)
-      : deps.classifier.assess(pre.normalized, {
-          classifierVersion: "not-configured",
-          promptVersion: "not-configured",
-          schemaVersion: "not-configured",
-          policyVersion: POLICY_VERSION,
-          existingLabels: deps.existingLabels ?? []
-        })
-  );
+  const outcomes = await classifyAndFinalize(preprocessed, deps);
+  const inboxCountBefore = await fetchInboxMessageCount(deps.gmailClient);
+  const summary = buildRunSummary(inboxCountBefore, outcomes);
 
-  // Phase 3: pure policy evaluation + event validation, no I/O.
-  const rawOutcomes = preprocessed.map((pre, i) => finalizeOutcome(pre, assessmentResults[i] ?? null, deps));
+  const incrementalNote = `Incremental scan: reconciled ${preprocessed.length} changed, currently Inbox/Spam message(s) since the last run (${allChanged.length} total change(s) detected).`;
 
-  // Phase 4: a run-wide check on how many messages actually agree on each
-  // AI-guessed category before any of them really get labeled — see
-  // MIN_LABEL_BATCH_SIZE.
-  const outcomes = applyLabelBatchThreshold(rawOutcomes);
-
-  const summary = buildRunSummary(inboxResult.messages.length, outcomes);
-  return { summary, outcomes, historyIdAtSnapshot: profile.historyId, scanNote: buildScanNote(inboxResult, spamResult) };
+  return {
+    summary,
+    outcomes,
+    newHistoryMarker: history.endHistoryId,
+    usedIncrementalSync: true,
+    scanNote: truncationNote ? `${truncationNote} ${incrementalNote}` : incrementalNote
+  };
 }
 
 /**

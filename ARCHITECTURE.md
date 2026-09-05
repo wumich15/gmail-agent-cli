@@ -212,6 +212,56 @@ Secrets (OAuth refresh tokens, AI API keys) never enter this database —
 they live only in the OS credential store, addressed via
 `CREDENTIAL_KEYS` in `src/auth/credential-store.ts`.
 
+## Incremental Gmail history synchronization
+
+Implemented to address real Gmail API quota pressure: `runWorkScan`
+(`src/core/orchestrator.ts`) now branches on `deps.historyMarker` (read
+from `accounts.history_marker` by `work.ts` and passed straight through):
+
+- **No marker, or it expired** (`listHistorySince` returns
+  `expiredMarker: true` on Gmail's 404): `runFullScan` does exactly what
+  the whole pipeline always did — list every Inbox/Spam message ID, fetch
+  each, classify, decide. After the snapshot, it makes one extra
+  `listHistorySince(gmailClient, profile.historyId)` call to catch
+  anything that changed *during* that listing/fetch window (CLAUDE.md's
+  fence-then-reconcile requirement), and returns that call's
+  `endHistoryId` (or the original fence if nothing changed) as
+  `newHistoryMarker`.
+- **A valid marker**: `runIncrementalScan` calls `listHistorySince` once,
+  takes the resulting `changedMessages` (a `Map<id, threadId>` —
+  `listHistorySince` now preserves `threadId` straight from the history
+  record instead of discarding it, since downstream code needs a real
+  thread ID, not a guess), fetches only those messages, and filters to
+  ones that *currently* carry `INBOX` or native `SPAM` before they ever
+  reach the classifier — a message that changed for an unrelated reason
+  (the user archived/trashed it themselves) is simply not evaluated, the
+  same as it would never have appeared in a full `listAllMessageIds` pass
+  either. The Inbox "before" count for the summary comes from one cheap
+  `users.labels.get("INBOX")` call (`fetchInboxMessageCount`, 1 quota
+  unit) instead of a full listing.
+
+Both paths share the same `fetchAndNormalizeAll` (Phase 1) and
+`classifyAndFinalize` (Phases 2-4) functions — history sync only changes
+*which* message IDs are discovered, never how they're processed or
+decided. `WorkScanResult.usedIncrementalSync` and `.scanNote` report which
+path ran and how many messages were reconciled, printed to stderr and
+folded into the human/JSON summary respectively.
+
+`work.ts` only calls `AccountsRepository.updateHistoryMarker` with the
+returned `newHistoryMarker` *after* `runsRepo.finish(...)` — i.e. only
+once the run's plan/ledger is durable — and never in `--dry-run` (which
+must not mutate durable state at all, per CLAUDE.md).
+
+`gmail cache` (`src/commands/cache.ts`) is the explicit, always-full,
+read-only counterpart: no `--limit`, no classifier, no mutations — it
+exists purely to let a user pay the expensive full-traversal cost once,
+deliberately, and refresh the history-marker baseline, so every
+`gmail`/`gmail work` run afterward is cheap. It also upserts each visited
+message's non-verbatim projection (`contentHash`, sorted `labelSnapshot`,
+no assessment fields) into the `messages` table via the new
+`MessagesRepository`, laying groundwork for the not-yet-implemented
+assessment-reuse cache described in "Known deviations."
+
 ## AI status in this build
 
 The real OpenAI-backed classifier is implemented:
@@ -389,6 +439,17 @@ the MVP surface small:
   `gmail` run to start reusing right away, rather than waiting for the
   10-message threshold to invent and clear it from scratch. Acquires the
   same per-account process lock as every other mutating command.
+- **`gmail cache`** (`src/commands/cache.ts`) — a full, read-only Inbox +
+  Spam snapshot with no AI calls and no Gmail/Calendar mutations, purely
+  to (re)establish a fresh Gmail history-marker baseline (see "Incremental
+  Gmail history synchronization" below) and record each visited message's
+  non-verbatim projection into the local `messages` table via the new
+  `MessagesRepository` (`src/state/repositories/messages.ts`) — content
+  hash and label snapshot only, never body text, matching CLAUDE.md's
+  "keep... full email bodies... out of SQLite." Exists so a user under
+  Gmail API quota pressure can pay the expensive full-traversal cost once,
+  explicitly, and have every subsequent `gmail`/`gmail work` run scan
+  incrementally instead.
 
 Every `gmail` run's summary (`src/summary/build-summary.ts`) carries,
 in addition to the per-action-type detail lists, two sections built
@@ -422,14 +483,22 @@ sign-in flow, so that logic isn't duplicated.
 - No automated RFC 8058 DKIM-verified one-click HTTPS unsubscribe yet —
   `add spam` falls back to manual/`mailto:` handling, which is the spec's
   own safe default when DKIM coverage can't be verified.
-- No incremental Gmail `history.list` synchronization yet — `gmail`
-  does a full snapshot every run (correct, just not optimized).
 - No interactive sender/message pickers — `gmail add` requires at least
   one explicit category argument.
 - No response caching by content+model+prompt+schema+policy hash, so a
-  message unchanged since the last run is still re-classified (and
-  re-billed) from scratch every time — `messages` table has room for this
-  but no repository/wiring exists yet.
+  message unchanged since the last run (but touched for some other
+  reason, e.g. a label change) is still re-classified (and re-billed)
+  from scratch — `messages`/`MessagesRepository` now exist and are
+  populated by `gmail cache`, giving a future enhancement everything it
+  needs (content hash + label snapshot per message) to skip a redundant
+  OpenAI call, but `work.ts`'s classify step doesn't consult that table
+  yet. This is an OpenAI-cost optimization, distinct from the
+  history-based Gmail-quota optimization below, which is implemented.
+- No version-triggered targeted rescan yet: per CLAUDE.md, a
+  prompt/model/policy version change should force re-evaluation of
+  already-processed Inbox mail even under incremental sync, but
+  `runWorkScan` doesn't compare the persisted `messages` rows' version
+  columns against the current versions to decide this.
 - No labeled classifier evaluation set or precision gate against real
   AI output (the 90%+ launch-precision gates in `CLAUDE.md` were written
   against this eventual reality) — accuracy is currently unverified.

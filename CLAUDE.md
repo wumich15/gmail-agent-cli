@@ -77,6 +77,7 @@ gmail work [--dry-run] [--json]
 gmail spam [CATEGORY...] [--yes] [--all-mail] [--allow-mailto] [--retry-unsubscribe]
 gmail important [CATEGORY...] [--yes]
 gmail category <NAME...>
+gmail cache
 gmail rules list [--json]
 gmail rules remove <RULE_GROUP_ID>
 gmail summary [RUN_ID] [--json]
@@ -302,6 +303,8 @@ The initial scan needs a history fence so mail arriving during pagination cannot
 
 History is only an optimization. A new/changed rule, classifier prompt version, model version, or policy version triggers a targeted current-Inbox rescan because old messages need evaluation under the new logic. Save the next history marker only after ingestion and the resulting action plan are durable.
 
+**Implemented behavior:** `gmail`/`gmail work` reads the account's persisted history marker and, when present and not expired, reconciles only the messages `users.history.list` reports as changed since that point — fetching just those, filtering to whichever currently still carry `INBOX` or native `SPAM` (a message that changed for an unrelated reason, e.g. the user archived it themselves, is simply not evaluated, exactly as it would never have appeared in a full listing either). This is the main lever for staying under Gmail's API quota on repeat runs. `gmail cache` performs the full snapshot explicitly and read-only — no AI calls, no Gmail/Calendar mutations — purely to (re)establish a fresh history-marker baseline (and record each message's non-verbatim projection — content hash and label snapshot, never body text — in the local `messages` table) so that every `gmail`/`gmail work` run afterward can scan incrementally. **Not yet implemented:** the version-triggered targeted rescan described above (a prompt/model/policy change does not yet force a re-evaluation of already-processed Inbox mail).
+
 ### Local signals and protection
 
 Evaluate these before calling AI:
@@ -398,6 +401,8 @@ A message that gets a real, validated Calendar event created for it (see "Calend
 Label actions are recorded in the action ledger like any other mutation (see "Local database") and are undoable like a star/important label add, with the same "skip on a later user conflict" rule as everywhere else.
 
 `gmail category <NAME...>` is the explicit, no-threshold counterpart: it creates (or reuses, case-insensitively) one or more real Gmail labels immediately, with no message search and no 10-message batch requirement — it exists purely so a user can pre-create a category they want the AI to start reusing on the very next `gmail`/`gmail work` run, rather than waiting for the AI to invent one from scratch and clear the batch threshold.
+
+`gmail cache` performs a full, read-only Inbox+Spam snapshot with no AI calls and no Gmail/Calendar mutations, purely to (re)establish a fresh Gmail history-marker baseline — see "Incremental synchronization" above. Run it once (e.g. under Gmail API quota pressure) and every `gmail`/`gmail work` run afterward scans incrementally instead of re-listing and re-fetching the whole mailbox.
 
 ## Deterministic action policy
 

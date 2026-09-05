@@ -1,11 +1,10 @@
 import pc from "picocolors";
 import { bootstrap } from "../core/bootstrap.js";
-import { resolveAccount, type ResolvedAccount } from "./shared.js";
-import { authLogin } from "./auth.js";
-import { AuthRequiredError } from "../core/errors.js";
+import { resolveAccountSigningInIfNeeded } from "./shared.js";
 import { runWorkScan } from "../core/orchestrator.js";
 import { resolveClassifier } from "../ai/resolve-classifier.js";
 import { RuleGroupsRepository } from "../state/repositories/rule-groups.js";
+import { AccountsRepository } from "../state/repositories/accounts.js";
 import { RunsRepository, ActionsRepository } from "../state/repositories/runs.js";
 import { CalendarLinksRepository } from "../state/repositories/calendar-links.js";
 import { buildPlannedActions } from "../core/action-plan.js";
@@ -59,24 +58,6 @@ function mutationForActions(actions: readonly PolicyActionIntent[], labelIdByNam
   return combineMutations(mutations);
 }
 
-async function resolveAccountSigningInIfNeeded(ctx: ReturnType<typeof bootstrap>): Promise<ResolvedAccount> {
-  try {
-    return await resolveAccount(ctx);
-  } catch (error) {
-    if (!(error instanceof AuthRequiredError)) {
-      throw error;
-    }
-    // `gmail` on its own is the whole onboarding experience — no separate
-    // `gmail auth login` command in this build. First run signs you in
-    // right here, inline, then continues straight into the scan.
-    const loginExitCode = await authLogin();
-    if (loginExitCode !== 0) {
-      throw error;
-    }
-    return resolveAccount(ctx);
-  }
-}
-
 export async function runWork(options: WorkOptions): Promise<number> {
   const ctx = bootstrap();
   const { account, gmailClient, calendarClient } = await resolveAccountSigningInIfNeeded(ctx);
@@ -104,7 +85,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
     const existingLabels = await listUserLabels(gmailClient);
     const labelIdByName = new Map(existingLabels.map((l) => [l.name.trim().toLowerCase(), l.id]));
 
-    const { summary, outcomes, scanNote } = await runWorkScan({
+    const { summary, outcomes, scanNote, newHistoryMarker, usedIncrementalSync } = await runWorkScan({
       gmailClient,
       classifier,
       ruleGroups,
@@ -113,8 +94,18 @@ export async function runWork(options: WorkOptions): Promise<number> {
       clock: ctx.clock,
       concurrency: { gmailReads: 5, aiCalls: ctx.config?.concurrency.aiCalls ?? 5 },
       existingLabels: existingLabels.map((l) => l.name),
+      // Incremental sync against Gmail's history API is the main lever for
+      // staying under Gmail's API quota on repeat runs — see
+      // CLAUDE.md's "Incremental synchronization". Passing null/omitting
+      // forces a full snapshot (this account's first-ever run).
+      historyMarker: account.historyMarker,
       ...(options.limit !== undefined ? { limit: options.limit } : {})
     });
+    // Always goes to stderr for the same reason as the classifier
+    // description above: informational, never part of a piped --json summary.
+    console.error(
+      pc.dim(usedIncrementalSync ? "Incremental scan (via Gmail history)." : "Full inbox/spam snapshot scan.")
+    );
 
     let runId: string | undefined;
     let failureCount = 0;
@@ -341,6 +332,13 @@ export async function runWork(options: WorkOptions): Promise<number> {
         },
         failureCount > 0 ? `${failureCount} action(s) failed; see the actions table for run ${runId}` : null
       );
+
+      // Only advance the marker now that the run's plan/ledger is durable
+      // (CLAUDE.md: "Advance Gmail history only after the ingestion/plan
+      // checkpoint is durable"). A failed individual action still stays in
+      // the ledger for later reconciliation regardless of this — advancing
+      // history only changes which messages a *future* scan looks at.
+      new AccountsRepository(ctx.db).updateHistoryMarker(account.accountHash, newHistoryMarker, finishedAt);
     }
 
     const finalSummary = { ...summary, failureCount, scanNote };

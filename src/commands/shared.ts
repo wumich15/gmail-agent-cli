@@ -5,6 +5,7 @@ import { loadDevOAuthClientCredentials, oauthClientFromRefreshToken } from "../a
 import { createGmailClient, type GmailClient } from "../gmail/client.js";
 import { createCalendarClient, type CalendarClient } from "../calendar/client.js";
 import { AuthRequiredError } from "../core/errors.js";
+import { authLogin } from "./auth.js";
 import type { AccountRecord } from "../core/models.js";
 import type { OAuth2Client } from "google-auth-library";
 
@@ -40,4 +41,25 @@ export async function resolveAccount(ctx: CliContext): Promise<ResolvedAccount> 
     gmailClient: createGmailClient(oauthClient),
     calendarClient: createCalendarClient(oauthClient)
   };
+}
+
+/**
+ * Same as `resolveAccount`, but signs in inline (in the system browser) the
+ * first time there's no account yet, rather than requiring a separate
+ * `gmail auth login` first — this is what lets `gmail` and `gmail cache`
+ * both work as one-shot commands with no prerequisite setup step.
+ */
+export async function resolveAccountSigningInIfNeeded(ctx: CliContext): Promise<ResolvedAccount> {
+  try {
+    return await resolveAccount(ctx);
+  } catch (error) {
+    if (!(error instanceof AuthRequiredError)) {
+      throw error;
+    }
+    const loginExitCode = await authLogin();
+    if (loginExitCode !== 0) {
+      throw error;
+    }
+    return resolveAccount(ctx);
+  }
 }

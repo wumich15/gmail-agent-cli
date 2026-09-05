@@ -4,6 +4,7 @@ import pc from "picocolors";
 import { runWork } from "./commands/work.js";
 import { runAdd } from "./commands/add.js";
 import { runCategory } from "./commands/category.js";
+import { runCache } from "./commands/cache.js";
 import { GmailAgentError, EXIT_CODES } from "./core/errors.js";
 
 function parsePositiveInt(value: string): number {
@@ -15,11 +16,12 @@ function parsePositiveInt(value: string): number {
 }
 
 // MVP command surface: `gmail` (scan + clean up, with inline sign-in on
-// first run), `gmail add` (create a spam/important rule), and
-// `gmail category` (create a Gmail label directly, on demand). The other
-// commands (spam/important/rules/summary/undo/auth/config/doctor) still
-// exist as working code under src/commands/ — they're just not wired up
-// as CLI subcommands yet. Re-add them here when they're back in scope.
+// first run), `gmail add` (create a spam/important rule), `gmail category`
+// (create a Gmail label directly, on demand), and `gmail cache` (read-only
+// full-inbox snapshot that seeds incremental scanning). The other commands
+// (spam/important/rules/summary/undo/auth/config/doctor) still exist as
+// working code under src/commands/ — they're just not wired up as CLI
+// subcommands yet. Re-add them here when they're back in scope.
 
 const program = new Command();
 
@@ -77,13 +79,23 @@ program
     withExitHandling(() => runCategory(names));
   });
 
+program
+  .command("cache")
+  .description(
+    "Read-only full snapshot of the whole Inbox and Spam, with no AI calls and no mutations, so every " +
+      "gmail/gmail work run after it can scan incrementally instead of re-fetching everything"
+  )
+  .action(() => {
+    withExitHandling(() => runCache());
+  });
+
 // Commander's root `.action()` absorbs ANY unrecognized first argument as
 // if it were plain `gmail` with no subcommand — so `gmail spam "x"` (a
 // plausible typo for `gmail add spam "x"`) or any other typo would
 // otherwise silently run the full mutating pipeline instead of erroring.
 // Since bare `gmail` performs real mailbox mutations, that's a dangerous
 // default; check the first token explicitly before letting Commander parse.
-const KNOWN_SUBCOMMANDS = new Set(["add", "category", "help"]);
+const KNOWN_SUBCOMMANDS = new Set(["add", "category", "cache", "help"]);
 const firstArg = process.argv[2];
 if (firstArg !== undefined && !firstArg.startsWith("-") && !KNOWN_SUBCOMMANDS.has(firstArg)) {
   console.error(pc.red(`Unknown command: ${firstArg}`));
