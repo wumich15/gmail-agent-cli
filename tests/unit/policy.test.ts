@@ -206,6 +206,66 @@ describe("evaluateMessagePolicy", () => {
     }
   });
 
+  it("still creates a calendar event for a protected (already-Important) message (regression: protection must bypass importance classification, not event extraction)", () => {
+    const decision = evaluateMessagePolicy(
+      baseInput({
+        isProtected: true,
+        assessment: assessment({
+          kind: "transactional_important",
+          confidence: 0,
+          event: {
+            intent: "create",
+            confidence: 0.97,
+            title: "Dentist",
+            start: "2099-01-01T10:00:00Z",
+            end: "2099-01-01T11:00:00Z",
+            allDay: false,
+            timeZone: "UTC",
+            location: null,
+            sourceEvidence: "see you at 10am"
+          }
+        })
+      })
+    );
+    expect(decision.actions.some((a) => a.type === "calendar_create")).toBe(true);
+  });
+
+  it("still labels a protected message when the assessment carries a category", () => {
+    const decision = evaluateMessagePolicy(
+      baseInput({
+        isProtected: true,
+        assessment: assessment({ kind: "personal_routine", confidence: 0, category: "Receipts" })
+      })
+    );
+    expect(decision.actions).toContainEqual({
+      type: "label",
+      reasonCode: "ai_category:Receipts",
+      labelName: "Receipts"
+    });
+  });
+
+  it("never trashes a protected message via AI assessment alone, even at high promotion confidence", () => {
+    const decision = evaluateMessagePolicy(
+      baseInput({ isProtected: true, assessment: assessment({ kind: "promotion", confidence: 0.99 }) })
+    );
+    expect(decision.actions.some((a) => a.type === "trash")).toBe(false);
+  });
+
+  it("does not double-star a protected message via AI importance (the explicit rule or existing label already covers it)", () => {
+    const decision = evaluateMessagePolicy(
+      baseInput({
+        isProtected: true,
+        assessment: assessment({
+          kind: "personal_important",
+          confidence: 0,
+          importanceScore: 0.99,
+          importanceConfidence: 0.99
+        })
+      })
+    );
+    expect(decision.actions.some((a) => a.type === "star")).toBe(false);
+  });
+
   it("proposes a label action when the assessment carries a category", () => {
     const decision = evaluateMessagePolicy(
       baseInput({ assessment: assessment({ kind: "personal_routine", confidence: 0, category: "Shopping" }) })

@@ -3,6 +3,7 @@ import { Command, InvalidArgumentError } from "commander";
 import pc from "picocolors";
 import { runWork } from "./commands/work.js";
 import { runAdd } from "./commands/add.js";
+import { runCategory } from "./commands/category.js";
 import { GmailAgentError, EXIT_CODES } from "./core/errors.js";
 
 function parsePositiveInt(value: string): number {
@@ -13,8 +14,9 @@ function parsePositiveInt(value: string): number {
   return parsed;
 }
 
-// MVP command surface: just `gmail` (scan + clean up, with inline sign-in
-// on first run) and `gmail add` (create a spam/important rule). The other
+// MVP command surface: `gmail` (scan + clean up, with inline sign-in on
+// first run), `gmail add` (create a spam/important rule), and
+// `gmail category` (create a Gmail label directly, on demand). The other
 // commands (spam/important/rules/summary/undo/auth/config/doctor) still
 // exist as working code under src/commands/ — they're just not wired up
 // as CLI subcommands yet. Re-add them here when they're back in scope.
@@ -65,13 +67,23 @@ program
     withExitHandling(() => runAdd(type, categories, { yes: opts.yes }));
   });
 
+program
+  .command("category <names...>")
+  .description(
+    'Create one or more Gmail labels directly, e.g. gmail category "Shopping" "Travel" ' +
+      "(independent of the AI auto-labeling threshold in a normal gmail run)"
+  )
+  .action((names: string[]) => {
+    withExitHandling(() => runCategory(names));
+  });
+
 // Commander's root `.action()` absorbs ANY unrecognized first argument as
 // if it were plain `gmail` with no subcommand — so `gmail spam "x"` (a
 // plausible typo for `gmail add spam "x"`) or any other typo would
 // otherwise silently run the full mutating pipeline instead of erroring.
 // Since bare `gmail` performs real mailbox mutations, that's a dangerous
 // default; check the first token explicitly before letting Commander parse.
-const KNOWN_SUBCOMMANDS = new Set(["add", "help"]);
+const KNOWN_SUBCOMMANDS = new Set(["add", "category", "help"]);
 const firstArg = process.argv[2];
 if (firstArg !== undefined && !firstArg.startsWith("-") && !KNOWN_SUBCOMMANDS.has(firstArg)) {
   console.error(pc.red(`Unknown command: ${firstArg}`));

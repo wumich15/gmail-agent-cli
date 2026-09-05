@@ -173,6 +173,24 @@ enforced in `policy.ts` and covered by unit tests in
 `tests/unit/policy.test.ts` (e.g. "never trashes a protected message even
 with an explicit spam rule").
 
+**Fixed bug (protection was blocking event/label extraction, not just
+trash/star):** `evaluateMessagePolicy` used to gate its *entire*
+AI-derived block — trash, star, Calendar event, and label — behind a
+single `!isProtected` check, even though `CLAUDE.md` is explicit that
+protection ("an important rule... can bypass importance classification
+but not event extraction") should only suppress trash and the redundant
+AI-derived star. Since Gmail's own ML frequently marks transactional and
+appointment mail `IMPORTANT` on its own — exactly the mail most likely to
+contain a real calendar event — this silently dropped calendar-event (and
+topical-label) creation for a large, non-obvious slice of messages,
+independent of confidence or any other setting. Trash-eligibility and the
+AI-derived star/important addition are now gated behind `!isProtected`
+individually inside the assessment block, while event extraction and
+topical labeling are evaluated unconditionally whenever a usable
+assessment exists — matching the precedence list above and the explicit
+spec language. `POLICY_VERSION` was bumped (`policy-v4`) to invalidate
+any assessment cached under the old behavior.
+
 ## Data model (SQLite, `src/state/migrations/001_initial_schema.ts`)
 
 One database per OS user, WAL mode, foreign keys on, `0600` permissions
@@ -363,6 +381,14 @@ the MVP surface small:
   call; one category's failure (no matches, a conflict, etc.) doesn't
   stop the rest, and the command's exit code reflects the worst
   individual result.
+- **`gmail category <names...>`** (`src/commands/category.ts`) — creates
+  (or reuses, case-insensitively) one or more real Gmail labels
+  immediately via the same `gmail/custom-labels.ts` helpers `work.ts`
+  uses, with no message search and no batch-size threshold. It exists so
+  a user can pre-seed a label they want the AI auto-labeling in a normal
+  `gmail` run to start reusing right away, rather than waiting for the
+  10-message threshold to invent and clear it from scratch. Acquires the
+  same per-account process lock as every other mutating command.
 
 Every `gmail` run's summary (`src/summary/build-summary.ts`) carries,
 in addition to the per-action-type detail lists, two sections built

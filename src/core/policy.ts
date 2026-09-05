@@ -1,6 +1,6 @@
 import type { EmailAssessment, EventCandidate, RuleAction } from "./models.js";
 
-export const POLICY_VERSION = "policy-v3";
+export const POLICY_VERSION = "policy-v4";
 
 export interface PolicyThresholds {
   autoTrashPromotionConfidence: number;
@@ -107,11 +107,9 @@ export function evaluateMessagePolicy(
     return trashOnly("native_spam");
   }
 
-  // From here on, only unprotected AI-derived signals may trigger Trash.
-  // 4 & 6: an authenticated high-risk signal, or any failure to obtain a
-  // usable assessment, blocks AI-derived trash/star/event entirely.
-  const canUseAiMutations =
-    !input.isProtected && input.assessment !== null && !input.assessmentUnavailable;
+  // 4 & 6: any failure to obtain a usable assessment blocks every
+  // AI-derived mutation — there's simply nothing to act on.
+  const hasUsableAssessment = input.assessment !== null && !input.assessmentUnavailable;
 
   const actions: PolicyActionIntent[] = [];
   let needsReview = false;
@@ -122,29 +120,36 @@ export function evaluateMessagePolicy(
     reviewReason = "assessment_unavailable";
   }
 
-  if (canUseAiMutations && input.assessment) {
+  if (hasUsableAssessment && input.assessment) {
     const a = input.assessment;
 
-    // 5: high-confidence promotion / automated_low_value -> trash, nothing else.
-    const isTrashKind = a.kind === "promotion" || a.kind === "automated_low_value";
-    const trashThreshold =
-      a.kind === "promotion"
-        ? thresholds.autoTrashPromotionConfidence
-        : thresholds.autoTrashAutomatedLowValueConfidence;
-    const trashEligible = isTrashKind && a.confidence >= trashThreshold;
+    // 5: high-confidence promotion / automated_low_value -> trash, nothing
+    // else. Never for a protected message — protection always wins over
+    // AI-derived trash, exactly like the explicit-rule/native-spam checks
+    // above.
+    if (!input.isProtected) {
+      const isTrashKind = a.kind === "promotion" || a.kind === "automated_low_value";
+      const trashThreshold =
+        a.kind === "promotion"
+          ? thresholds.autoTrashPromotionConfidence
+          : thresholds.autoTrashAutomatedLowValueConfidence;
+      const trashEligible = isTrashKind && a.confidence >= trashThreshold;
 
-    if (trashEligible && !input.hasAuthenticatedHighRiskSignal) {
-      return trashOnly(`ai_${a.kind}`);
-    }
-    if (trashEligible && input.hasAuthenticatedHighRiskSignal) {
-      // Veto: a promotional label/kind alone cannot override an
-      // authenticated high-risk signal. Route to review instead of trashing.
-      needsReview = true;
-      reviewReason = "authenticated_high_risk_veto";
+      if (trashEligible && !input.hasAuthenticatedHighRiskSignal) {
+        return trashOnly(`ai_${a.kind}`);
+      }
+      if (trashEligible && input.hasAuthenticatedHighRiskSignal) {
+        // Veto: a promotional label/kind alone cannot override an
+        // authenticated high-risk signal. Route to review instead of trashing.
+        needsReview = true;
+        reviewReason = "authenticated_high_risk_veto";
+      }
     }
 
     // 6: suspicious/unknown produce no AI-derived mutation of any kind
-    // (no star, no important, no event), only review eligibility.
+    // (no star, no important, no event, no label), only review
+    // eligibility — regardless of protection: being protected means "never
+    // trash this," not "trust an assessment that couldn't classify it."
     const isUnresolvedKind = a.kind === "suspicious" || a.kind === "unknown";
     if (isUnresolvedKind) {
       needsReview = true;
@@ -152,16 +157,28 @@ export function evaluateMessagePolicy(
     }
 
     if (!isUnresolvedKind) {
-      // 7: star + important, unless already decided as review-only above for trash-eligible+veto.
-      const importanceQualifies =
-        a.importanceScore >= thresholds.autoStarImportanceScore &&
-        a.importanceConfidence >= thresholds.autoStarImportanceConfidence;
-      if (importanceQualifies) {
-        actions.push({ type: "star", reasonCode: `ai_importance_${a.kind}` });
-        actions.push({ type: "mark_important", reasonCode: `ai_importance_${a.kind}` });
+      // 7: star + important. Skipped for an already-protected message — it
+      // is already starred/important, or an explicit important rule adds
+      // both unconditionally below — so this only ever fires for a message
+      // that wasn't already protected.
+      if (!input.isProtected) {
+        const importanceQualifies =
+          a.importanceScore >= thresholds.autoStarImportanceScore &&
+          a.importanceConfidence >= thresholds.autoStarImportanceConfidence;
+        if (importanceQualifies) {
+          actions.push({ type: "star", reasonCode: `ai_importance_${a.kind}` });
+          actions.push({ type: "mark_important", reasonCode: `ai_importance_${a.kind}` });
+        }
       }
 
-      // 8: high-confidence future event.
+      // 8: high-confidence future event. Evaluated regardless of
+      // protection — CLAUDE.md is explicit that an important rule or a
+      // preexisting Important label "can bypass importance classification
+      // but not event extraction." A previous version of this function
+      // gated the entire block (including this) behind `!isProtected`,
+      // which silently dropped every calendar event for a message Gmail's
+      // own ML had already marked Important — exactly the kind of
+      // transactional/appointment mail most likely to contain one.
       if (
         a.event.intent === "create" &&
         a.event.confidence >= thresholds.autoCreateEventConfidence
@@ -173,9 +190,12 @@ export function evaluateMessagePolicy(
         });
       }
 
-      // Topical labeling: a candidate only, gated on a run-wide minimum
-      // batch size applied later in core/orchestrator.ts — one message's
-      // classification is never enough on its own to create/apply a label.
+      // Topical labeling: also evaluated regardless of protection (not a
+      // destructive action, and there's no reason to withhold a useful
+      // category from mail that's already protected). A candidate only —
+      // gated on a run-wide minimum batch size applied later in
+      // core/orchestrator.ts, since one message's classification is never
+      // enough on its own to create/apply a label.
       if (a.category !== null) {
         actions.push({ type: "label", reasonCode: `ai_category:${a.category}`, labelName: a.category });
       }

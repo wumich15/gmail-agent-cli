@@ -76,6 +76,7 @@ gmail                              # identical to: gmail work
 gmail work [--dry-run] [--json]
 gmail spam [CATEGORY...] [--yes] [--all-mail] [--allow-mailto] [--retry-unsubscribe]
 gmail important [CATEGORY...] [--yes]
+gmail category <NAME...>
 gmail rules list [--json]
 gmail rules remove <RULE_GROUP_ID>
 gmail summary [RUN_ID] [--json]
@@ -395,6 +396,8 @@ Label creation uses `users.labels.create`, which is covered by the already-reque
 A message that gets a real, validated Calendar event created for it (see "Calendar policy and idempotency") separately and unconditionally gets a "Calendar" label and is removed from the Inbox, regardless of read state — the event itself is now the durable record. This is a deterministic 1:1 consequence of a real event, not a fuzzy AI guess, so it is exempt from the 10-message threshold above and always applies.
 
 Label actions are recorded in the action ledger like any other mutation (see "Local database") and are undoable like a star/important label add, with the same "skip on a later user conflict" rule as everywhere else.
+
+`gmail category <NAME...>` is the explicit, no-threshold counterpart: it creates (or reuses, case-insensitively) one or more real Gmail labels immediately, with no message search and no 10-message batch requirement — it exists purely so a user can pre-create a category they want the AI to start reusing on the very next `gmail`/`gmail work` run, rather than waiting for the AI to invent one from scratch and clear the batch threshold.
 
 ## Deterministic action policy
 
