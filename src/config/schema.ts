@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const DEFAULT_MODEL = "gpt-5.6-terra";
+export const DEFAULT_MODEL = "gpt-5.4-mini";
 
 /**
  * "openai" talks to the standard OpenAI API. "openai-compatible" points at

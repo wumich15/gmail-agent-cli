@@ -51,18 +51,18 @@ function validAssessment() {
 describe("OpenAiClassifier", () => {
   it("returns ok:true with the parsed assessment and its own version tags on success", async () => {
     const client = fakeClient(async () => ({ output_parsed: validAssessment(), output: [] }));
-    const classifier = new OpenAiClassifier({ model: "gpt-5.6-terra", client });
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
     const result = await classifier.assess(message(), CONTEXT);
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.assessment.kind).toBe("promotion");
-      expect(result.assessment.classifierVersion).toBe("openai:gpt-5.6-terra");
+      expect(result.assessment.classifierVersion).toBe("openai:gpt-5.4-mini");
     }
   });
 
   it("returns schema_failure when output_parsed is null with no refusal", async () => {
     const client = fakeClient(async () => ({ output_parsed: null, output: [] }));
-    const classifier = new OpenAiClassifier({ model: "gpt-5.6-terra", client });
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
     const result = await classifier.assess(message(), CONTEXT);
     expect(result.ok).toBe(false);
     if (!result.ok) {
@@ -75,7 +75,7 @@ describe("OpenAiClassifier", () => {
       output_parsed: null,
       output: [{ content: [{ type: "refusal", refusal: "I can't help with that." }] }]
     }));
-    const classifier = new OpenAiClassifier({ model: "gpt-5.6-terra", client });
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
     const result = await classifier.assess(message(), CONTEXT);
     expect(result.ok).toBe(false);
     if (!result.ok) {
@@ -88,7 +88,7 @@ describe("OpenAiClassifier", () => {
     const client = fakeClient(async () => {
       throw new APIConnectionTimeoutError();
     });
-    const classifier = new OpenAiClassifier({ model: "gpt-5.6-terra", client });
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
     const result = await classifier.assess(message(), CONTEXT);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.unavailable.reason).toBe("timeout");
@@ -98,7 +98,7 @@ describe("OpenAiClassifier", () => {
     const client = fakeClient(async () => {
       throw new AuthenticationError(401, { error: { message: "bad key" } }, "bad key", {});
     });
-    const classifier = new OpenAiClassifier({ model: "gpt-5.6-terra", client });
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
     const result = await classifier.assess(message(), CONTEXT);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.unavailable.reason).toBe("not_configured");
@@ -108,7 +108,7 @@ describe("OpenAiClassifier", () => {
     const client = fakeClient(async () => {
       throw new RateLimitError(429, { error: { message: "quota" } }, "quota", {});
     });
-    const classifier = new OpenAiClassifier({ model: "gpt-5.6-terra", client });
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
     const result = await classifier.assess(message(), CONTEXT);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.unavailable.reason).toBe("provider_unavailable");
@@ -118,7 +118,7 @@ describe("OpenAiClassifier", () => {
     const client = fakeClient(async () => {
       throw new Error("something weird");
     });
-    const classifier = new OpenAiClassifier({ model: "gpt-5.6-terra", client });
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
     await expect(classifier.assess(message(), CONTEXT)).resolves.toEqual(
       expect.objectContaining({ ok: false })
     );
