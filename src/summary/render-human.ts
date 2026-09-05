@@ -1,5 +1,11 @@
 import pc from "picocolors";
-import type { RunSummary } from "./build-summary.js";
+import type { ActionDetail, RunSummary } from "./build-summary.js";
+
+function printDetails(lines: string[], details: readonly ActionDetail[]): void {
+  for (const item of details) {
+    lines.push(`  · ${item.subject} — ${item.sender} (${item.reasonCode})`);
+  }
+}
 
 export function renderHumanSummary(
   summary: RunSummary,
@@ -22,26 +28,29 @@ export function renderHumanSummary(
     for (const [reason, count] of Object.entries(summary.trashedByReason)) {
       lines.push(`  ${count} ${reason}`);
     }
+    printDetails(lines, summary.trashed);
     lines.push("");
   }
 
   if (summary.starredCount > 0 || summary.markedImportantCount > 0) {
-    lines.push(`Starred: ${summary.starredCount}   Marked important: ${summary.markedImportantCount}`);
+    lines.push(pc.bold(`Starred: ${summary.starredCount}   Marked important: ${summary.markedImportantCount}`));
+    printDetails(lines, summary.starred);
+    printDetails(lines, summary.markedImportant);
     lines.push("");
   }
 
   if (summary.calendarCreatedCount > 0) {
-    lines.push(`Calendar events created: ${summary.calendarCreatedCount}`);
+    lines.push(pc.bold(`Calendar events created: ${summary.calendarCreatedCount}`));
+    printDetails(lines, summary.calendarCreated);
     lines.push("");
   }
 
-  lines.push(`Archived read mail: ${summary.archivedCount}`);
-  lines.push(`Review / unchanged: ${summary.reviewCount}`);
-  if (summary.reviewSamples.length > 0) {
-    for (const sample of summary.reviewSamples) {
-      lines.push(`  · ${sample.subject} — ${sample.sender} (${sample.reason})`);
-    }
-  }
+  lines.push(pc.bold(`Archived read mail: ${summary.archivedCount}`));
+  printDetails(lines, summary.archived);
+  lines.push("");
+
+  lines.push(pc.bold(`Review / unchanged: ${summary.reviewCount}`));
+  printDetails(lines, summary.reviewSamples);
   lines.push(`Failures: ${summary.failureCount}`);
 
   if (options.runId) {

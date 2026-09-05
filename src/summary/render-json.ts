@@ -1,15 +1,21 @@
-import type { RunSummary } from "./build-summary.js";
+import type { ActionDetail, RunSummary } from "./build-summary.js";
 
 export interface JsonSummaryOutput {
   dryRun: boolean;
   inboxCountBefore: number;
   inboxCountAfter: number;
   trashedByReason: Record<string, number>;
+  trashed: ActionDetail[];
   archivedCount: number;
+  archived: ActionDetail[];
   starredCount: number;
+  starred: ActionDetail[];
   markedImportantCount: number;
+  markedImportant: ActionDetail[];
   calendarCreatedCount: number;
+  calendarCreated: ActionDetail[];
   reviewCount: number;
+  reviewSamples: ActionDetail[];
   failureCount: number;
   scanNote: string | null;
 }
@@ -22,11 +28,17 @@ export function renderJsonSummary(summary: RunSummary, options: { dryRun: boolea
     inboxCountBefore: summary.inboxCountBefore,
     inboxCountAfter: summary.inboxCountBefore - totalTrashed - summary.archivedCount,
     trashedByReason: summary.trashedByReason,
+    trashed: summary.trashed,
     archivedCount: summary.archivedCount,
+    archived: summary.archived,
     starredCount: summary.starredCount,
+    starred: summary.starred,
     markedImportantCount: summary.markedImportantCount,
+    markedImportant: summary.markedImportant,
     calendarCreatedCount: summary.calendarCreatedCount,
+    calendarCreated: summary.calendarCreated,
     reviewCount: summary.reviewCount,
+    reviewSamples: summary.reviewSamples,
     failureCount: summary.failureCount,
     scanNote: summary.scanNote
   };
