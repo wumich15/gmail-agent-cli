@@ -2,8 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   buildClassificationInput,
   buildDeterministicSummary,
-  DEVELOPER_INSTRUCTIONS,
-  FEW_SHOT_EXAMPLES
+  buildDeveloperInstructions,
+  FEW_SHOT_EXAMPLES,
+  normalizeCategoryLabel
 } from "../../src/ai/prompt.js";
 import { EmailFlagsSchema } from "../../src/ai/schema.js";
 import { buildNormalizedMessage, headerMapFromList } from "../../src/gmail/normalize.js";
@@ -28,14 +29,52 @@ function message(overrides: Partial<Parameters<typeof buildNormalizedMessage>[0]
   });
 }
 
-describe("DEVELOPER_INSTRUCTIONS", () => {
+describe("buildDeveloperInstructions", () => {
   it("tells the model to ignore instructions embedded in the email content", () => {
-    expect(DEVELOPER_INSTRUCTIONS).toMatch(/ignore/i);
-    expect(DEVELOPER_INSTRUCTIONS).toMatch(/untrusted|not instructions/i);
+    const instructions = buildDeveloperInstructions([]);
+    expect(instructions).toMatch(/ignore/i);
+    expect(instructions).toMatch(/untrusted|not instructions/i);
   });
 
   it("states the model has no tools and cannot take action", () => {
-    expect(DEVELOPER_INSTRUCTIONS).toMatch(/no tools/i);
+    expect(buildDeveloperInstructions([])).toMatch(/no tools/i);
+  });
+
+  it("omits the appended existing-labels list when there are none", () => {
+    expect(buildDeveloperInstructions([])).not.toMatch(/existing labels you can reuse/i);
+  });
+
+  it("lists existing labels so the model prefers reusing them", () => {
+    const instructions = buildDeveloperInstructions(["Shopping", "Travel"]);
+    expect(instructions).toMatch(/existing labels you can reuse/i);
+    expect(instructions).toContain("Shopping");
+    expect(instructions).toContain("Travel");
+  });
+
+  it("produces identical text across calls with the same label list (prompt-prefix caching)", () => {
+    expect(buildDeveloperInstructions(["Shopping"])).toBe(buildDeveloperInstructions(["Shopping"]));
+  });
+});
+
+describe("normalizeCategoryLabel", () => {
+  it("passes a clean short name through unchanged", () => {
+    expect(normalizeCategoryLabel("Shopping")).toBe("Shopping");
+  });
+
+  it("returns null for null input", () => {
+    expect(normalizeCategoryLabel(null)).toBeNull();
+  });
+
+  it("returns null for blank/whitespace-only input", () => {
+    expect(normalizeCategoryLabel("   ")).toBeNull();
+  });
+
+  it("strips control characters and trims whitespace", () => {
+    expect(normalizeCategoryLabel("  Shop\n\tping  ")).toBe("Shop ping");
+  });
+
+  it("bounds length to 30 characters", () => {
+    expect(normalizeCategoryLabel("x".repeat(50))).toHaveLength(30);
   });
 });
 

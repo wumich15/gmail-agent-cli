@@ -37,6 +37,7 @@ function flags(overrides: Partial<EmailFlags> = {}): EmailFlags {
     eventStart: null,
     eventEnd: null,
     eventAllDay: false,
+    category: null,
     ...overrides
   };
 }
@@ -146,6 +147,41 @@ describe("OpenAiClassifier", () => {
       expect(result.assessment.summary).toContain("Hi");
       expect(result.assessment.summary).toContain("snippet text");
     }
+  });
+
+  it("maps a category flag through to the assessment", async () => {
+    const client = fakeClient(async () => ({ output_parsed: flags({ category: "Shopping" }), output: [] }));
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
+    const result = await classifier.assess(message(), CONTEXT);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.assessment.category).toBe("Shopping");
+    }
+  });
+
+  it("forces category to null for a suspicious message even if the model set one (safety override)", async () => {
+    const client = fakeClient(async () => ({
+      output_parsed: flags({ suspicious: true, category: "Finance" }),
+      output: []
+    }));
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
+    const result = await classifier.assess(message(), CONTEXT);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.assessment.category).toBeNull();
+    }
+  });
+
+  it("passes existingLabels from the classify context into the developer instructions", async () => {
+    let capturedInstructions: unknown;
+    const client = fakeClient(async (params) => {
+      capturedInstructions = (params as { instructions: unknown }).instructions;
+      return { output_parsed: flags(), output: [] };
+    });
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
+    await classifier.assess(message(), { ...CONTEXT, existingLabels: ["Shopping", "Travel"] });
+    expect(capturedInstructions).toContain("Shopping");
+    expect(capturedInstructions).toContain("Travel");
   });
 
   it("returns schema_failure when output_parsed is null with no refusal", async () => {

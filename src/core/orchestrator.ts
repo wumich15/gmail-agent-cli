@@ -4,10 +4,10 @@ import {
   fetchProfile,
   headersFromMessage,
   listAllMessageIds,
-  fetchMessageMetadata,
+  fetchMessageFull,
   type MessageStub
 } from "../gmail/scanner.js";
-import { buildNormalizedMessage } from "../gmail/normalize.js";
+import { buildNormalizedMessage, extractBodyParts } from "../gmail/normalize.js";
 import { GMAIL_LABELS, hasUnattributedProtectionLabel, isInInbox, isNativeSpam, isRead } from "../gmail/labels.js";
 import { findMatchingRuleGroups } from "../rules/matcher.js";
 import { evaluateMessagePolicy, POLICY_VERSION, type PolicyThresholds } from "./policy.js";
@@ -45,7 +45,18 @@ export interface OrchestratorDeps {
   policyThresholds?: PolicyThresholds;
   /** Message IDs the app's own ledger has starred/marked-important, for protection detection. */
   appAttributedLabelsByMessageId?: ReadonlyMap<string, ReadonlySet<"STARRED" | "IMPORTANT">>;
+  /** The user's current custom Gmail label names, passed to the classifier so it prefers reusing one. */
+  existingLabels?: readonly string[];
 }
+
+/**
+ * A single AI-guessed category is never enough to create/apply a label on
+ * its own — only once at least this many messages in the same run agree on
+ * (a case-insensitive form of) the same name does the label actually get
+ * created and applied, keeping one-off guesses from cluttering the
+ * mailbox with near-duplicate labels.
+ */
+export const MIN_LABEL_BATCH_SIZE = 10;
 
 export interface WorkScanResult {
   summary: RunSummary;
@@ -121,15 +132,68 @@ export async function runWorkScan(deps: OrchestratorDeps): Promise<WorkScanResul
           classifierVersion: "not-configured",
           promptVersion: "not-configured",
           schemaVersion: "not-configured",
-          policyVersion: POLICY_VERSION
+          policyVersion: POLICY_VERSION,
+          existingLabels: deps.existingLabels ?? []
         })
   );
 
   // Phase 3: pure policy evaluation + event validation, no I/O.
-  const outcomes = preprocessed.map((pre, i) => finalizeOutcome(pre, assessmentResults[i] ?? null, deps));
+  const rawOutcomes = preprocessed.map((pre, i) => finalizeOutcome(pre, assessmentResults[i] ?? null, deps));
+
+  // Phase 4: a run-wide check on how many messages actually agree on each
+  // AI-guessed category before any of them really get labeled — see
+  // MIN_LABEL_BATCH_SIZE.
+  const outcomes = applyLabelBatchThreshold(rawOutcomes);
 
   const summary = buildRunSummary(inboxResult.messages.length, outcomes);
   return { summary, outcomes, historyIdAtSnapshot: profile.historyId, scanNote: buildScanNote(inboxResult, spamResult) };
+}
+
+/**
+ * Filters out `label` actions produced from an AI-guessed category
+ * (reasonCode `ai_category:...`) unless at least MIN_LABEL_BATCH_SIZE
+ * messages in this same run agreed on the same name, case-insensitively.
+ * The "Calendar" label added alongside a validated event
+ * (`calendar_label:...`) is a deterministic 1:1 link to a real event, not
+ * a fuzzy guess, and always passes through untouched. Every surviving
+ * category label in a group is normalized to one exact display name (the
+ * first-seen casing) so messages that agreed case-insensitively still end
+ * up under the exact same Gmail label instead of near-duplicates.
+ */
+function applyLabelBatchThreshold(outcomes: readonly MessageOutcome[]): MessageOutcome[] {
+  const groups = new Map<string, { count: number; displayName: string }>();
+  for (const outcome of outcomes) {
+    for (const action of outcome.decision.actions) {
+      if (action.type === "label" && action.reasonCode.startsWith("ai_category:")) {
+        const key = action.labelName.trim().toLowerCase();
+        const group = groups.get(key);
+        if (group) {
+          group.count += 1;
+        } else {
+          groups.set(key, { count: 1, displayName: action.labelName.trim() });
+        }
+      }
+    }
+  }
+
+  return outcomes.map((outcome) => {
+    const actions = outcome.decision.actions
+      .filter((action) => {
+        if (action.type !== "label" || !action.reasonCode.startsWith("ai_category:")) {
+          return true;
+        }
+        const key = action.labelName.trim().toLowerCase();
+        return (groups.get(key)?.count ?? 0) >= MIN_LABEL_BATCH_SIZE;
+      })
+      .map((action) => {
+        if (action.type === "label" && action.reasonCode.startsWith("ai_category:")) {
+          const displayName = groups.get(action.labelName.trim().toLowerCase())!.displayName;
+          return { ...action, labelName: displayName, reasonCode: `ai_category:${displayName}` };
+        }
+        return action;
+      });
+    return { ...outcome, decision: { ...outcome.decision, actions } };
+  });
 }
 
 function buildScanNote(
@@ -173,9 +237,16 @@ async function fetchAndNormalize(
   deps: OrchestratorDeps,
   userEmail: string
 ): Promise<PreprocessedMessage> {
-  const raw = await fetchMessageMetadata(deps.gmailClient, stub.id);
+  // format=full costs the same Gmail API quota unit as format=metadata (5
+  // units either way), so fetching the body up front — rather than a
+  // second round trip only for messages that turn out to need
+  // classification — costs no extra requests, just larger responses for
+  // the messages that end up bypassed. This is what lets event extraction
+  // actually see the message body instead of only Gmail's short snippet.
+  const raw = await fetchMessageFull(deps.gmailClient, stub.id);
   const headers = headersFromMessage(raw);
   const labelIds = raw.labelIds ?? [];
+  const { plain, html } = extractBodyParts(raw.payload ?? undefined);
 
   const normalized = buildNormalizedMessage({
     gmailMessageId: stub.id,
@@ -185,8 +256,8 @@ async function fetchAndNormalize(
     labelIds,
     snippet: raw.snippet ?? "",
     headers,
-    htmlBody: null,
-    plainBody: null,
+    htmlBody: html,
+    plainBody: plain,
     userEmail,
     threadHasUserSentMessage: false
   });
@@ -267,6 +338,22 @@ function finalizeOutcome(
         reviewReason: rawDecision.reviewReason ?? `event_validation_failed_${validation.reason}`
       };
     }
+  }
+
+  // A message that actually gets a Calendar event also gets a "Calendar"
+  // label and is moved out of the Inbox, regardless of read state — the
+  // event itself is now the durable record, so the mail doesn't need to
+  // stay in the Inbox to be found again. This never applies to a fuzzy
+  // AI-guessed category (see applyLabelBatchThreshold): it's a
+  // deterministic 1:1 consequence of a real, validated event.
+  if (validatedEvent !== null) {
+    const withCalendarLabel = decision.actions.some((a) => a.type === "label" && a.reasonCode === "calendar_label:Calendar")
+      ? decision.actions
+      : [...decision.actions, { type: "label" as const, reasonCode: "calendar_label:Calendar", labelName: "Calendar" }];
+    const withCalendarArchive = withCalendarLabel.some((a) => a.type === "archive")
+      ? withCalendarLabel
+      : [...withCalendarLabel, { type: "archive" as const, reasonCode: "calendar_archive" }];
+    decision = { ...decision, actions: withCalendarArchive };
   }
 
   if (authFailedImportantRule) {

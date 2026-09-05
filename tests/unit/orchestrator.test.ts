@@ -135,6 +135,7 @@ describe("runWorkScan", () => {
           location: null,
           sourceEvidence: null
         },
+        category: null,
         classifierVersion: "test",
         promptVersion: "test",
         schemaVersion: "test"
@@ -270,5 +271,132 @@ describe("runWorkScan", () => {
     // demonstrating the more common "not unchanged" path stays correct.
     expect(summary.archivedCount).toBe(1);
     expect(summary.unchanged).toEqual([]);
+  });
+
+  it("only applies an AI-guessed category label once at least 10 messages in the run agree on it", async () => {
+    const messages: FakeMessage[] = Array.from({ length: 9 }, (_, i) => ({
+      id: `under-${i}`,
+      threadId: `t-under-${i}`,
+      labelIds: ["INBOX", "UNREAD"],
+      headers: [{ name: "From", value: `person${i}@example.com` }]
+    }));
+    const client = fakeClient(messages);
+    const classifier = new FixedClassifier({
+      ok: true,
+      assessment: {
+        kind: "personal_routine",
+        confidence: 0,
+        importanceScore: 0,
+        importanceConfidence: 0,
+        summary: "test",
+        reasonCodes: [],
+        event: {
+          intent: "none",
+          confidence: 0,
+          title: null,
+          start: null,
+          end: null,
+          allDay: false,
+          timeZone: null,
+          location: null,
+          sourceEvidence: null
+        },
+        category: "Shopping",
+        classifierVersion: "test",
+        promptVersion: "test",
+        schemaVersion: "test"
+      }
+    });
+    const { outcomes } = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
+    expect(outcomes.every((o) => !o.decision.actions.some((a) => a.type === "label"))).toBe(true);
+  });
+
+  it("applies a category label once 10+ messages agree, normalizing case-insensitive spelling variants to one name", async () => {
+    const messages: FakeMessage[] = Array.from({ length: 10 }, (_, i) => ({
+      id: `over-${i}`,
+      threadId: `t-over-${i}`,
+      labelIds: ["INBOX", "UNREAD"],
+      headers: [{ name: "From", value: `person${i}@example.com` }]
+    }));
+    const client = fakeClient(messages);
+    let call = 0;
+    const classifier: Classifier = {
+      async assess() {
+        call += 1;
+        const category = call === 1 ? "shopping" : "Shopping"; // one differently-cased guess
+        return {
+          ok: true,
+          assessment: {
+            kind: "personal_routine",
+            confidence: 0,
+            importanceScore: 0,
+            importanceConfidence: 0,
+            summary: "test",
+            reasonCodes: [],
+            event: {
+              intent: "none",
+              confidence: 0,
+              title: null,
+              start: null,
+              end: null,
+              allDay: false,
+              timeZone: null,
+              location: null,
+              sourceEvidence: null
+            },
+            category,
+            classifierVersion: "test",
+            promptVersion: "test",
+            schemaVersion: "test"
+          }
+        };
+      }
+    };
+    const { outcomes } = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
+    const labelActions = outcomes.flatMap((o) => o.decision.actions.filter((a) => a.type === "label"));
+    expect(labelActions).toHaveLength(10);
+    // Every survivor uses the exact same display name, not a mix of casings.
+    expect(new Set(labelActions.map((a) => (a as { labelName: string }).labelName)).size).toBe(1);
+  });
+
+  it("adds a Calendar label and archives the message when a validated event is created, regardless of read state", async () => {
+    const client = fakeClient([
+      {
+        id: "m1",
+        threadId: "t1",
+        labelIds: ["INBOX", "UNREAD"], // unread — would not otherwise be archived
+        headers: [{ name: "From", value: "clinic@example.com" }]
+      }
+    ]);
+    const classifier = new FixedClassifier({
+      ok: true,
+      assessment: {
+        kind: "transactional_important",
+        confidence: 0.99,
+        importanceScore: 0,
+        importanceConfidence: 0,
+        summary: "test",
+        reasonCodes: [],
+        event: {
+          intent: "create",
+          confidence: 0.99,
+          title: "Dentist",
+          start: "2099-01-01T10:00:00Z",
+          end: "2099-01-01T11:00:00Z",
+          allDay: false,
+          timeZone: "UTC",
+          location: null,
+          sourceEvidence: null
+        },
+        category: null,
+        classifierVersion: "test",
+        promptVersion: "test",
+        schemaVersion: "test"
+      }
+    });
+    const { outcomes } = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
+    const actions = outcomes[0]!.decision.actions;
+    expect(actions).toContainEqual({ type: "label", reasonCode: "calendar_label:Calendar", labelName: "Calendar" });
+    expect(actions).toContainEqual({ type: "archive", reasonCode: "calendar_archive" });
   });
 });

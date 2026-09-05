@@ -112,6 +112,10 @@ export function markImportantOnlyMutation(): LabelMutation {
   return { addLabelIds: [GMAIL_LABELS.important], removeLabelIds: [] };
 }
 
+export function labelOnlyMutation(labelId: string): LabelMutation {
+  return { addLabelIds: [labelId], removeLabelIds: [] };
+}
+
 export function combineMutations(mutations: readonly LabelMutation[]): LabelMutation {
   const add = new Set<string>();
   const remove = new Set<string>();

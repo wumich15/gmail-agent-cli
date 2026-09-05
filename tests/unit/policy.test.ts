@@ -40,6 +40,7 @@ function assessment(overrides: Partial<EmailAssessment> = {}): EmailAssessment {
       location: null,
       sourceEvidence: null
     },
+    category: null,
     classifierVersion: "test",
     promptVersion: "test",
     schemaVersion: "test",
@@ -203,6 +204,36 @@ describe("evaluateMessagePolicy", () => {
       expect(decision.actions).toEqual([]);
       expect(decision.needsReview).toBe(true);
     }
+  });
+
+  it("proposes a label action when the assessment carries a category", () => {
+    const decision = evaluateMessagePolicy(
+      baseInput({ assessment: assessment({ kind: "personal_routine", confidence: 0, category: "Shopping" }) })
+    );
+    expect(decision.actions).toContainEqual({
+      type: "label",
+      reasonCode: "ai_category:Shopping",
+      labelName: "Shopping"
+    });
+  });
+
+  it("does not propose a label action when category is null", () => {
+    const decision = evaluateMessagePolicy(
+      baseInput({ assessment: assessment({ kind: "personal_routine", confidence: 0, category: null }) })
+    );
+    expect(decision.actions.some((a) => a.type === "label")).toBe(false);
+  });
+
+  it("never labels a suspicious/unknown message even if category is somehow set", () => {
+    const decision = evaluateMessagePolicy(
+      baseInput({ isRead: false, assessment: assessment({ kind: "suspicious", category: "Shopping" }) })
+    );
+    expect(decision.actions.some((a) => a.type === "label")).toBe(false);
+  });
+
+  it("never labels a message that gets trashed (mutual exclusivity)", () => {
+    const decision = evaluateMessagePolicy(baseInput({ isNativeSpam: true }));
+    expect(decision.actions.some((a) => a.type === "label")).toBe(false);
   });
 
   it("uses the product-decided default thresholds (uniform 0.90)", () => {

@@ -15,17 +15,42 @@ function isRuleType(value: string): value is RuleType {
 }
 
 /**
- * `gmail add <type> <category>` — a single entry point over the
- * spam/important rule-creation logic, e.g.:
+ * `gmail add <type> <category...>` — a single entry point over the
+ * spam/important rule-creation logic, accepting one or more categories in
+ * a single invocation, e.g.:
  *   gmail add spam "LinkedIn"
+ *   gmail add spam "LinkedIn" "NYT" "Amazon"
  *   gmail add important "Boss"
+ *
+ * Each category is handled as its own independent rule creation — one
+ * category failing (a conflict, no matches, etc.) does not stop the rest
+ * from being attempted, matching this app's "continue independent actions
+ * after an isolated failure" approach everywhere else.
  */
-export async function runAdd(type: string, category: string | undefined, options: AddOptions): Promise<number> {
+export async function runAdd(type: string, categories: string[], options: AddOptions): Promise<number> {
   if (!isRuleType(type)) {
     console.error(pc.red(`Unknown rule type "${type}". Expected one of: ${RULE_TYPES.join(", ")}.`));
     return EXIT_CODES.invalidOrAuthRequired;
   }
 
+  if (categories.length === 0) {
+    return runOne(type, undefined, options);
+  }
+
+  let worstExitCode: number = EXIT_CODES.ok;
+  for (const [i, category] of categories.entries()) {
+    if (categories.length > 1) {
+      console.log(pc.bold(`\n--- ${category} (${i + 1}/${categories.length}) ---`));
+    }
+    const exitCode = await runOne(type, category, options);
+    if (exitCode !== EXIT_CODES.ok) {
+      worstExitCode = exitCode;
+    }
+  }
+  return worstExitCode;
+}
+
+async function runOne(type: RuleType, category: string | undefined, options: AddOptions): Promise<number> {
   try {
     if (type === "spam") {
       return await runSpam(category, {

@@ -6,6 +6,8 @@ export interface ClassifyContext {
   promptVersion: string;
   schemaVersion: string;
   policyVersion: string;
+  /** The user's current Gmail label names, so the model prefers reusing one over inventing a near-duplicate. */
+  existingLabels?: readonly string[];
 }
 
 /**

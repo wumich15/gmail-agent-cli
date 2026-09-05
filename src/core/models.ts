@@ -100,6 +100,15 @@ export interface EmailAssessment {
   summary: string;
   reasonCodes: readonly ReasonCode[];
   event: EventCandidate;
+  /**
+   * A short, memorable topical label name (e.g. "Shopping", "Receipts") the
+   * model proposes for grouping recurring mail, reusing one of the user's
+   * existing Gmail labels when it fits, or null when nothing applies. Only
+   * ever applied to real messages after a run-level batch-size check (see
+   * core/orchestrator.ts) — a single guess is never enough to create a new
+   * label on its own.
+   */
+  category: string | null;
   /** Set by the classifier adapter, not the model, for cache/versioning. */
   classifierVersion: string;
   promptVersion: string;
@@ -147,6 +156,7 @@ export type ActionType =
   | "archive"
   | "star"
   | "mark_important"
+  | "label"
   | "calendar_create"
   | "calendar_update"
   | "calendar_cancel"

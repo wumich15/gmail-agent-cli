@@ -14,6 +14,8 @@ export interface JsonSummaryOutput {
   markedImportant: ActionDetail[];
   calendarCreatedCount: number;
   calendarCreated: ActionDetail[];
+  labeledCount: number;
+  labeled: ActionDetail[];
   reviewCount: number;
   reviewSamples: ActionDetail[];
   recentUnread: ActionDetail[];
@@ -39,6 +41,8 @@ export function renderJsonSummary(summary: RunSummary, options: { dryRun: boolea
     markedImportant: summary.markedImportant,
     calendarCreatedCount: summary.calendarCreatedCount,
     calendarCreated: summary.calendarCreated,
+    labeledCount: summary.labeledCount,
+    labeled: summary.labeled,
     reviewCount: summary.reviewCount,
     reviewSamples: summary.reviewSamples,
     recentUnread: summary.recentUnread,

@@ -54,6 +54,12 @@ export function renderHumanSummary(
     lines.push("");
   }
 
+  if (summary.labeledCount > 0) {
+    lines.push(pc.bold(`Labeled: ${summary.labeledCount}`));
+    printDetails(lines, summary.labeled);
+    lines.push("");
+  }
+
   lines.push(pc.bold(`Archived read mail: ${summary.archivedCount}`));
   printDetails(lines, summary.archived);
   lines.push("");

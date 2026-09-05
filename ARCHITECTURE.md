@@ -143,6 +143,17 @@ decides what happens to a message, applied in this precedence order:
 5. A qualifying importance score/confidence, or an explicit **important**
    rule, adds `STARRED` + `IMPORTANT`.
 6. A qualifying, validated event candidate creates a Calendar event.
+6a. A non-null `category` from the assessment proposes a topical **label**
+    action — gated on a *separate*, run-wide batch-size check applied in
+    `core/orchestrator.ts` after all messages are classified (see
+    "Automatic topical labeling" below), not in `policy.ts` itself, since
+    that decision needs to see every other message in the run.
+6b. A message that actually gets a validated Calendar event also gets a
+    deterministic "Calendar" label action and an archive action,
+    regardless of read state — added in `orchestrator.ts`'s
+    `finalizeOutcome`, right alongside the `calendar_create` prediction,
+    the same way `calendar_create` itself is "predicted at policy time,
+    executed later in `work.ts`."
 
 By product decision, every confidence threshold in
 `DEFAULT_POLICY_THRESHOLDS` (`src/core/policy.ts`) is currently a uniform
@@ -191,8 +202,9 @@ call to OpenAI's Responses API per unresolved message (`store: false`, no
 tools, no `previous_response_id`). By product decision, the model fills
 in a deliberately minimal, cheap wire schema (`src/ai/schema.ts`'s
 `EmailFlagsSchema`) — plain booleans (`spam`, `suspicious`, `important`,
-`hasEvent`) plus a few event fields, no confidence floats, no free-text
-summary, no reason-code array — parsed via `zodTextFormat`. It never
+`hasEvent`) plus a few event fields and one short nullable string
+(`category`), no confidence floats, no free-text summary, no reason-code
+array — parsed via `zodTextFormat`. It never
 receives Gmail/Calendar credentials or the ability to call anything — it
 returns flags, and `openai-classifier.ts` deterministically maps them
 onto the richer internal `EmailAssessment` shape `core/policy.ts` already
@@ -203,16 +215,25 @@ longer AI-generated at all — `buildDeterministicSummary` in
 `src/ai/prompt.ts` derives it from the subject and first non-blank line
 of content, at zero token cost.
 
-`src/ai/prompt.ts` holds the prompt-injection-hardened developer
-instructions (kept short — it's sent on every call), the untrusted
-user/input builder (excludes raw `List-Unsubscribe`/
-`Authentication-Results` header values, only derived booleans; currently
-sends Gmail's short snippet rather than the full body, see "Known
-deviations"), and `FEW_SHOT_EXAMPLES` — a few labeled input/output pairs
-sent as real prior turns before the actual message, for the accuracy
-one-shot/few-shot prompting buys. That example content is identical on
-every call, so it's a fixed prefix cost rather than something that scales
-with mailbox size.
+`src/ai/prompt.ts` holds `buildDeveloperInstructions(existingLabels)` —
+the prompt-injection-hardened developer instructions (kept short — it's
+sent on every call) plus, when the account has any custom Gmail labels, a
+fixed suffix listing them so the model prefers reusing one over inventing
+a near-duplicate; identical for every call within one run, so it's still
+a fixed-prefix cost, not something that scales with mailbox size. It also
+holds the untrusted user/input builder (excludes raw `List-Unsubscribe`/
+`Authentication-Results` header values, only derived booleans; now
+receives the message's real body when Gmail has one — see "Full message
+body now fetched" below), and `FEW_SHOT_EXAMPLES` — a few labeled
+input/output pairs sent as real prior turns before the actual message,
+for the accuracy one-shot/few-shot prompting buys.
+
+`normalizeCategoryLabel` (also in `prompt.ts`) trims/bounds the model's
+free-text `category` guess before it's ever used as a real Gmail label
+name; `openai-classifier.ts`'s `mapFlagsToAssessment` additionally forces
+`category` to `null` whenever `suspicious` is true, regardless of what
+the model returned for `category` — a phishing/scam message must never
+be quietly filed under a friendly label.
 
 Gmail-read concurrency and classifier-call concurrency are separate:
 `OrchestratorDeps.concurrency` takes `{ gmailReads, aiCalls }`, and
@@ -261,6 +282,53 @@ without any API key — still exists but is no longer wired into `work.ts`.
 It remains useful for testing the trash/star/archive/Calendar-creation
 paths without spending API calls; **never point it at a real mailbox**.
 
+### Full message body now fetched
+
+`core/orchestrator.ts`'s `fetchAndNormalize` calls `fetchMessageFull`
+(`format=full`) instead of `fetchMessageMetadata` (`format=metadata`) for
+every message, bypassed or not — Gmail's `messages.get` costs the same 5
+quota units regardless of `format`, so this is strictly more information
+(the real body, via `extractBodyParts`) at no extra request-count or
+quota cost, only larger response payloads for messages that turn out to
+be bypassed. This is what actually lets event/calendar detection see real
+message content instead of only Gmail's short snippet.
+`fetchMessageMetadata` itself is unchanged and still exported from
+`gmail/scanner.ts`, just no longer called from the orchestrator.
+
+### Automatic topical labeling
+
+`core/policy.ts` pushes a `label` `PolicyActionIntent` (`{ reasonCode:
+"ai_category:<name>", labelName }`) whenever a non-suspicious assessment
+carries a non-null `category`, gated by the same `!isUnresolvedKind`
+check as star/important/event — so it's never proposed for a
+trash-eligible or suspicious/unknown message. This is only a *candidate*:
+`core/orchestrator.ts`'s `applyLabelBatchThreshold`, run once after every
+message in the scan has been classified, groups these by
+case-insensitive `labelName`, normalizes each surviving group to one
+exact display name (first-seen casing), and drops any label action whose
+group has fewer than `MIN_LABEL_BATCH_SIZE` (10) messages — a lone AI
+guess never reaches Gmail. A message that gets a validated Calendar event
+separately, unconditionally gets a `calendar_label:Calendar` label action
+and an `archive` action added directly in `finalizeOutcome` (not subject
+to the batch-size check, since it's a deterministic 1:1 consequence of a
+real event, not a guess).
+
+`gmail/custom-labels.ts` is the only place that talks to Gmail's label
+API: `listUserLabels` (filtered to `type: "user"`, read-only, safe in
+`--dry-run`) and `getOrCreateLabelId`, which matches case-insensitively
+against a caller-supplied `Map` before ever calling `labels.create`, and
+falls back to re-listing on an HTTP 409 (a name created concurrently,
+e.g. by the user in the Gmail UI mid-run) rather than failing. `work.ts`
+only calls `getOrCreateLabelId` — i.e. only actually creates a label —
+inside its `!options.dryRun` branch, after threshold filtering has
+already happened; a name that fails to resolve (a transient Gmail error)
+is simply left out of that run's mutations rather than failing the whole
+run. `gmail/executor.ts`'s `labelOnlyMutation(labelId)` and `work.ts`'s
+extended `mutationForActions` fold label additions into the same
+`applyGroupedLabelMutations` batch as star/important/archive, so a
+message needing several of these gets one combined `batchModify` call,
+not several.
+
 ### Pluggable provider
 
 `config/schema.ts` models `aiProvider` (`"openai"` or
@@ -285,10 +353,16 @@ the MVP surface small:
   call (via `listAllMessageIds`'s `safetyCapCount`, in
   `src/gmail/scanner.ts`) — that's what actually bounds Gmail API quota
   usage, not just how many list pages get fetched.
-- **`gmail add <spam|important> <category>`** — a single unified entry
+- **`gmail add <spam|important> <category...>`** — a single unified entry
   point over what `CLAUDE.md` specifies as two separate commands
   (`gmail spam` / `gmail important`); it dispatches to the same
   underlying logic in `src/commands/spam.ts` / `src/commands/important.ts`.
+  Accepts one or more category arguments (Commander's `[categories...]`
+  variadic syntax) — `runAdd` (`src/commands/add.ts`) loops over them,
+  running each as its own fully independent `runSpam`/`runImportant`
+  call; one category's failure (no matches, a conflict, etc.) doesn't
+  stop the rest, and the command's exit code reflects the worst
+  individual result.
 
 Every `gmail` run's summary (`src/summary/build-summary.ts`) carries,
 in addition to the per-action-type detail lists, two sections built
@@ -324,13 +398,8 @@ sign-in flow, so that logic isn't duplicated.
   own safe default when DKIM coverage can't be verified.
 - No incremental Gmail `history.list` synchronization yet — `gmail`
   does a full snapshot every run (correct, just not optimized).
-- No interactive sender/message pickers — `gmail add` requires an
-  explicit category argument.
-- The AI classifier only ever sees Gmail's short snippet, not the full
-  message body — `core/orchestrator.ts` fetches `format=metadata`, never
-  `format=full`. Fetching the full body for every unresolved message
-  would improve classification but meaningfully increase Gmail API quota
-  usage; this hasn't been made conditional/selective yet.
+- No interactive sender/message pickers — `gmail add` requires at least
+  one explicit category argument.
 - No response caching by content+model+prompt+schema+policy hash, so a
   message unchanged since the last run is still re-classified (and
   re-billed) from scratch every time — `messages` table has room for this
@@ -341,3 +410,25 @@ sign-in flow, so that logic isn't duplicated.
 - Most commands from `CLAUDE.md`'s command-line contract
   (`rules`/`summary`/`undo`/`auth`/`config`/`doctor`) are implemented but
   not currently exposed in `cli.ts` (see "Command surface" above).
+- If a proposed label's Gmail-side creation fails partway through a run
+  (e.g. a transient API error on `labels.create`), `work.ts` currently
+  still marks that message's `label` ledger row `applied` once the rest
+  of its combined label/star/important/archive `batchModify` call
+  succeeds, since ledger status is tracked per-message per-batch, not
+  per-individual-label-within-a-mutation. The label itself is correctly
+  never added to Gmail in that case (the unresolved name is dropped from
+  the mutation before it's sent) — only the ledger's bookkeeping for that
+  specific sub-action can be slightly optimistic. This is a narrow edge
+  case (a `labels.create` failure that survives its own retry budget) and
+  is not a case `gmail undo` needs to reverse (there's nothing to undo).
+- The "Calendar" label + archive added alongside a validated event
+  (`calendar_label:Calendar` / `calendar_archive` in `orchestrator.ts`)
+  is predicted at policy time and executed unconditionally in the same
+  label-mutation batch as everything else, *before* `work.ts`'s actual
+  Calendar-insert loop runs — mirroring `calendar_create`'s own existing
+  "predict now, the summary reports the prediction" behavior rather than
+  gating on the real Calendar API call's outcome. In the rare case the
+  Calendar insert itself later fails, the message can end up with a
+  "Calendar" label and be archived without a real Calendar event to back
+  it — a narrower version of the same predict-vs-confirm gap
+  `calendar_create` already had.

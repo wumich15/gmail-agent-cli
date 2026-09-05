@@ -1,6 +1,6 @@
 import type { EmailAssessment, EventCandidate, RuleAction } from "./models.js";
 
-export const POLICY_VERSION = "policy-v2";
+export const POLICY_VERSION = "policy-v3";
 
 export interface PolicyThresholds {
   autoTrashPromotionConfidence: number;
@@ -63,7 +63,8 @@ export type PolicyActionIntent =
   | { type: "star"; reasonCode: string }
   | { type: "mark_important"; reasonCode: string }
   | { type: "archive"; reasonCode: string }
-  | { type: "calendar_create"; reasonCode: string; event: EventCandidate };
+  | { type: "calendar_create"; reasonCode: string; event: EventCandidate }
+  | { type: "label"; reasonCode: string; labelName: string };
 
 export interface PolicyDecision {
   actions: readonly PolicyActionIntent[];
@@ -170,6 +171,13 @@ export function evaluateMessagePolicy(
           reasonCode: `ai_event_${a.kind}`,
           event: a.event
         });
+      }
+
+      // Topical labeling: a candidate only, gated on a run-wide minimum
+      // batch size applied later in core/orchestrator.ts — one message's
+      // classification is never enough on its own to create/apply a label.
+      if (a.category !== null) {
+        actions.push({ type: "label", reasonCode: `ai_category:${a.category}`, labelName: a.category });
       }
     }
   }

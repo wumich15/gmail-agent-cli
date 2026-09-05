@@ -13,14 +13,15 @@ import { EmailFlagsSchema, type EmailFlags } from "./schema.js";
 import {
   buildClassificationInput,
   buildDeterministicSummary,
-  DEVELOPER_INSTRUCTIONS,
+  buildDeveloperInstructions,
   FEW_SHOT_EXAMPLES,
+  normalizeCategoryLabel,
   PROMPT_VERSION
 } from "./prompt.js";
 import type { ClassifyContext, Classifier } from "./classifier.js";
 import type { AssessmentResult, AssessmentUnavailable, EmailAssessment, NormalizedMessage } from "../core/models.js";
 
-export const SCHEMA_VERSION = "schema-v2";
+export const SCHEMA_VERSION = "schema-v3";
 const DEFAULT_TIMEOUT_MS = 20_000;
 
 /** Clearly above/below the 0.90 policy thresholds — the flags themselves are the decision; these just satisfy the existing threshold-based policy engine. */
@@ -63,7 +64,7 @@ export class OpenAiClassifier implements Classifier {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
 
-  async assess(message: NormalizedMessage, _context: ClassifyContext): Promise<AssessmentResult> {
+  async assess(message: NormalizedMessage, context: ClassifyContext): Promise<AssessmentResult> {
     try {
       // Retries transient 429/5xx from OpenAI with backoff, same as every
       // Gmail/Calendar call — lets a higher aiCalls concurrency actually
@@ -76,7 +77,7 @@ export class OpenAiClassifier implements Classifier {
           this.client.responses.parse(
             {
               model: this.model,
-              instructions: DEVELOPER_INSTRUCTIONS,
+              instructions: buildDeveloperInstructions(context.existingLabels ?? []),
               input: buildInputWithExamples(message),
               store: false,
               text: { format: zodTextFormat(EmailFlagsSchema, "email_flags") }
@@ -162,6 +163,7 @@ function mapFlagsToAssessment(flags: EmailFlags, message: NormalizedMessage, mod
           location: null,
           sourceEvidence: null
         },
+    category: flags.suspicious ? null : normalizeCategoryLabel(flags.category),
     classifierVersion: `openai:${model}`,
     promptVersion: PROMPT_VERSION,
     schemaVersion: SCHEMA_VERSION

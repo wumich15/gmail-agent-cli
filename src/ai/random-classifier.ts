@@ -72,6 +72,7 @@ export class RandomClassifier implements Classifier {
         summary: `Randomly classified as "${kind}" (placeholder classifier, not a real judgment).`,
         reasonCodes: [pick(REASON_CODES)],
         event: randomEventCandidate(eventIntent),
+        category: Math.random() < 0.3 ? pick(["Shopping", "Updates", "Receipts"]) : null,
         classifierVersion: CLASSIFIER_VERSION,
         promptVersion: "none",
         schemaVersion: "none"

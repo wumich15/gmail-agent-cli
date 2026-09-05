@@ -20,10 +20,12 @@ import {
   applyGroupedLabelMutations,
   archiveMutation,
   combineMutations,
+  labelOnlyMutation,
   markImportantOnlyMutation,
   starOnlyMutation,
   trashMessage
 } from "../gmail/executor.js";
+import { getOrCreateLabelId, listUserLabels } from "../gmail/custom-labels.js";
 import { buildEventInsertPlan, insertIdempotentEvent } from "../calendar/idempotency.js";
 import { withApiRetry } from "../core/api-retry.js";
 import { contentHash } from "../core/ids.js";
@@ -37,15 +39,22 @@ export interface WorkOptions {
   limit?: number;
 }
 
-function mutationForActions(actions: readonly PolicyActionIntent[]) {
+/** `labelIdByName` must already hold an entry for every label action's name (lowercased) before this is called. */
+function mutationForActions(actions: readonly PolicyActionIntent[], labelIdByName: ReadonlyMap<string, string>) {
   const mutations = actions
-    .filter((a): a is Extract<PolicyActionIntent, { type: "star" | "mark_important" | "archive" }> =>
-      a.type === "star" || a.type === "mark_important" || a.type === "archive"
+    .filter(
+      (a): a is Extract<PolicyActionIntent, { type: "star" | "mark_important" | "archive" | "label" }> =>
+        a.type === "star" || a.type === "mark_important" || a.type === "archive" || a.type === "label"
     )
     .map((a) => {
       if (a.type === "star") return starOnlyMutation();
       if (a.type === "mark_important") return markImportantOnlyMutation();
-      return archiveMutation();
+      if (a.type === "archive") return archiveMutation();
+      const labelId = labelIdByName.get(a.labelName.trim().toLowerCase());
+      // Should always be present — the caller resolves every needed label
+      // before building mutations — but a message simply keeps whatever
+      // its other actions already do rather than throwing if not.
+      return labelId ? labelOnlyMutation(labelId) : { addLabelIds: [], removeLabelIds: [] };
     });
   return combineMutations(mutations);
 }
@@ -88,6 +97,13 @@ export async function runWork(options: WorkOptions): Promise<number> {
   try {
     const ruleGroups = new RuleGroupsRepository(ctx.db).listEnabled(account.accountHash);
 
+    // Reading the label list is safe even in --dry-run (no mutation); it's
+    // what lets the classifier prefer reusing an existing label over
+    // inventing a near-duplicate. `labelIdByName` seeds label resolution
+    // below for any label actions that survive the run's threshold check.
+    const existingLabels = await listUserLabels(gmailClient);
+    const labelIdByName = new Map(existingLabels.map((l) => [l.name.trim().toLowerCase(), l.id]));
+
     const { summary, outcomes, scanNote } = await runWorkScan({
       gmailClient,
       classifier,
@@ -96,6 +112,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
       userTimezone: account.timezone,
       clock: ctx.clock,
       concurrency: { gmailReads: 5, aiCalls: ctx.config?.concurrency.aiCalls ?? 5 },
+      existingLabels: existingLabels.map((l) => l.name),
       ...(options.limit !== undefined ? { limit: options.limit } : {})
     });
 
@@ -132,7 +149,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
       });
 
       const trashTargets: string[] = [];
-      const labelTargets: { messageId: string; mutation: ReturnType<typeof mutationForActions> }[] = [];
+      const nonTrashOutcomes: typeof outcomes = [];
       const actionsByMessageId = new Map<string, PlannedAction[]>();
 
       for (const outcome of outcomes) {
@@ -152,10 +169,36 @@ export async function runWork(options: WorkOptions): Promise<number> {
         if (isTrash) {
           trashTargets.push(outcome.gmailMessageId);
         } else {
-          const mutation = mutationForActions(outcome.decision.actions);
-          if (mutation.addLabelIds.length > 0 || mutation.removeLabelIds.length > 0) {
-            labelTargets.push({ messageId: outcome.gmailMessageId, mutation });
+          nonTrashOutcomes.push(outcome);
+        }
+      }
+
+      // Resolve every label name this run actually needs to a real Gmail
+      // label ID, creating new ones only now that a real (non-dry-run) run
+      // is committed to acting. A name that fails to resolve (e.g. a
+      // transient Gmail error creating it) is simply left out of every
+      // mutation that needed it below, rather than failing the whole run.
+      const neededLabelNames = new Set<string>();
+      for (const outcome of nonTrashOutcomes) {
+        for (const action of outcome.decision.actions) {
+          if (action.type === "label") neededLabelNames.add(action.labelName);
+        }
+      }
+      for (const name of neededLabelNames) {
+        if (!labelIdByName.has(name.trim().toLowerCase())) {
+          try {
+            await getOrCreateLabelId(gmailClient, name, labelIdByName);
+          } catch {
+            // Left unresolved; mutationForActions below omits it for this run.
           }
+        }
+      }
+
+      const labelTargets: { messageId: string; mutation: ReturnType<typeof mutationForActions> }[] = [];
+      for (const outcome of nonTrashOutcomes) {
+        const mutation = mutationForActions(outcome.decision.actions, labelIdByName);
+        if (mutation.addLabelIds.length > 0 || mutation.removeLabelIds.length > 0) {
+          labelTargets.push({ messageId: outcome.gmailMessageId, mutation });
         }
       }
 
@@ -213,14 +256,14 @@ export async function runWork(options: WorkOptions): Promise<number> {
       }
 
       for (const { messageId } of labelTargets) {
-        markActions(messageId, ["star", "mark_important", "archive"], "applying");
+        markActions(messageId, ["star", "mark_important", "archive", "label"], "applying");
       }
       const labelResult = await applyGroupedLabelMutations(gmailClient, labelTargets);
       for (const messageId of labelResult.succeededMessageIds) {
-        markActions(messageId, ["star", "mark_important", "archive"], "applied");
+        markActions(messageId, ["star", "mark_important", "archive", "label"], "applied");
       }
       for (const messageId of labelResult.failedMessageIds) {
-        markActions(messageId, ["star", "mark_important", "archive"], "failed_retryable", "gmail_api_error");
+        markActions(messageId, ["star", "mark_important", "archive", "label"], "failed_retryable", "gmail_api_error");
         failureCount += 1;
       }
 

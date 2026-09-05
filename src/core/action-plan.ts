@@ -16,7 +16,8 @@ const ACTION_TYPE_BY_INTENT: Record<PolicyActionIntent["type"], ActionType> = {
   star: "star",
   mark_important: "mark_important",
   archive: "archive",
-  calendar_create: "calendar_create"
+  calendar_create: "calendar_create",
+  label: "label"
 };
 
 /** Turns policy intents into durable, deterministically-keyed planned actions. */
@@ -29,7 +30,9 @@ export function buildPlannedActions(
     const payload =
       intent.type === "calendar_create"
         ? { reasonCode: intent.reasonCode, event: intent.event }
-        : { reasonCode: intent.reasonCode };
+        : intent.type === "label"
+          ? { reasonCode: intent.reasonCode, labelName: intent.labelName }
+          : { reasonCode: intent.reasonCode };
     const hash = payloadHash(payload);
     return {
       actionKey: deterministicActionKey({

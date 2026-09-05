@@ -39,6 +39,9 @@ export interface RunSummary {
   markedImportant: ActionDetail[];
   calendarCreatedCount: number;
   calendarCreated: ActionDetail[];
+  labeledCount: number;
+  /** Every applied/planned label action's subject/sender, with the label name itself in place of a reasonCode. */
+  labeled: ActionDetail[];
   reviewCount: number;
   /** Every Review item's subject/sender/reason — not capped, matching the rest of this summary. */
   reviewSamples: ActionDetail[];
@@ -70,6 +73,7 @@ export function buildRunSummary(inboxCountBefore: number, outcomes: readonly Mes
   const starred: ActionDetail[] = [];
   const markedImportant: ActionDetail[] = [];
   const calendarCreated: ActionDetail[] = [];
+  const labeled: ActionDetail[] = [];
   const reviewSamples: ActionDetail[] = [];
   const recentUnread: ActionDetail[] = [];
   const unchanged: ActionDetail[] = [];
@@ -99,6 +103,9 @@ export function buildRunSummary(inboxCountBefore: number, outcomes: readonly Mes
           break;
         case "calendar_create":
           calendarCreated.push(detail(action.reasonCode));
+          break;
+        case "label":
+          labeled.push(detail(action.labelName));
           break;
       }
     }
@@ -132,6 +139,8 @@ export function buildRunSummary(inboxCountBefore: number, outcomes: readonly Mes
     markedImportant,
     calendarCreatedCount: calendarCreated.length,
     calendarCreated,
+    labeledCount: labeled.length,
+    labeled,
     reviewCount,
     reviewSamples,
     recentUnread,

@@ -19,7 +19,9 @@ export const EmailFlagsSchema = z
     eventTitle: z.string().max(100).nullable(),
     eventStart: z.string().max(40).nullable(),
     eventEnd: z.string().max(40).nullable(),
-    eventAllDay: z.boolean()
+    eventAllDay: z.boolean(),
+    /** A short, memorable topical label name, or null if none fits. See prompt.ts. */
+    category: z.string().max(30).nullable()
   })
   .strict();
 

@@ -56,11 +56,13 @@ program.action((opts: { dryRun: boolean; json: boolean; limit?: number }) => {
 });
 
 program
-  .command("add <type> [category]")
-  .description('Add a rule: "gmail add spam <category>" or "gmail add important <category>"')
+  .command("add <type> [categories...]")
+  .description(
+    'Add one or more rules: "gmail add spam <category>" or "gmail add important <category> <category2> ..."'
+  )
   .option("--yes", "authorize the rule and its immediate current-message actions", false)
-  .action((type: string, category: string | undefined, opts: { yes: boolean }) => {
-    withExitHandling(() => runAdd(type, category, { yes: opts.yes }));
+  .action((type: string, categories: string[], opts: { yes: boolean }) => {
+    withExitHandling(() => runAdd(type, categories, { yes: opts.yes }));
   });
 
 // Commander's root `.action()` absorbs ANY unrecognized first argument as
