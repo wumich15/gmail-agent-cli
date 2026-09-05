@@ -43,10 +43,10 @@ export function renderHumanSummary(
 
   if (options.runId) {
     lines.push("");
-    lines.push(
-      pc.dim(`Every action from this run is listed in: gmail summary ${options.runId}`) +
-        pc.dim(`   Undo with: gmail undo ${options.runId}`)
-    );
+    // `gmail summary`/`gmail undo` aren't registered CLI commands in this
+    // build (see ARCHITECTURE.md's "Command surface"), so this points at
+    // the run ID rather than a command that would currently fail to parse.
+    lines.push(pc.dim(`Run ID: ${options.runId} (every action is recorded in the local action ledger).`));
   }
 
   return lines.join("\n");

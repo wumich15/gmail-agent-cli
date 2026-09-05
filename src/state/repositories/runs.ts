@@ -120,6 +120,15 @@ export class RunsRepository {
 export class ActionsRepository {
   constructor(private readonly db: GmailAgentDatabase) {}
 
+  /**
+   * Inserts new planned actions, or re-claims an existing non-terminal row
+   * (e.g. `planned`/`failed_retryable`/`unknown_no_retry`) for a new run.
+   * A row that already reached a terminal disposition (`applied`,
+   * `failed_terminal`, `skipped_conflict`) is left untouched: the
+   * deterministic action key exists precisely so a later run recognizes
+   * "this already happened" instead of silently re-adopting the row into
+   * its own run and erasing which run actually did the work.
+   */
   upsertPlanned(actions: readonly PlannedAction[]): void {
     const insert = this.db.prepare(
       `INSERT INTO actions (action_key, run_id, account_hash, type, target_gmail_message_id, target_gmail_thread_id, target_calendar_event_id, reason_code, before_state_hash, payload_hash, status, attempt_count, error_class, created_at, updated_at)
@@ -129,7 +138,8 @@ export class ActionsRepository {
          status = excluded.status,
          attempt_count = excluded.attempt_count,
          error_class = excluded.error_class,
-         updated_at = excluded.updated_at`
+         updated_at = excluded.updated_at
+       WHERE actions.status NOT IN ('applied', 'failed_terminal', 'skipped_conflict')`
     );
     const transaction = this.db.transaction(() => {
       for (const action of actions) {

@@ -17,7 +17,7 @@ export class CredentialStoreUnavailableError extends Error {
     super(
       "The OS credential store (macOS Keychain, Windows Credential Manager, or " +
         "Linux Secret Service) is unavailable. Refusing to store secrets in a " +
-        "plaintext fallback. Run `gmail doctor` for details.",
+        "plaintext fallback.",
       { cause }
     );
     this.name = "CredentialStoreUnavailableError";

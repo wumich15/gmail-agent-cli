@@ -18,7 +18,7 @@ export class GmailAgentError extends Error {
 }
 
 export class AuthRequiredError extends GmailAgentError {
-  constructor(message = "Authentication is required. Run: gmail auth login") {
+  constructor(message = "Authentication is required. Run `gmail` to sign in.") {
     super(message, EXIT_CODES.invalidOrAuthRequired);
   }
 }

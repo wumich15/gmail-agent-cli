@@ -8,12 +8,10 @@ import { buildNormalizedMessage, headerMapFromList } from "../gmail/normalize.js
 import { newRuleGroupId } from "../core/ids.js";
 import { EXIT_CODES, RuleConflictError } from "../core/errors.js";
 import { trashMessage } from "../gmail/executor.js";
-import {
-  isOneClickPost,
-  parseListUnsubscribeHeader,
-  parseMailtoUri
-} from "../unsubscribe/headers.js";
+import { isOneClickPost, parseListUnsubscribeHeader } from "../unsubscribe/headers.js";
 import { redactUrlForLogging } from "../unsubscribe/safe-http.js";
+import { ProcessLock } from "../core/lock.js";
+import { lockFilePath } from "../config/paths.js";
 import type { NormalizedMessage } from "../core/models.js";
 import type { GmailClient } from "../gmail/client.js";
 
@@ -29,7 +27,12 @@ async function searchRecentCandidates(
   category: string,
   includeArchived: boolean
 ): Promise<NormalizedMessage[]> {
-  const q = includeArchived ? category : `${category} in:anywhere -in:trash`;
+  // Default scope is Inbox + native Spam only, per the design's "recent
+  // non-Trash mail" default. --all-mail explicitly widens this to
+  // archived mail (Gmail's plain search already spans All Mail once you
+  // drop the in:inbox/in:spam restriction, so "in:anywhere -in:trash"
+  // here is the actually-wider query, not the narrower default).
+  const q = includeArchived ? `${category} in:anywhere -in:trash` : `${category} (in:inbox OR in:spam)`;
   const { data } = await gmailClient.users.messages.list({ userId: "me", q, maxResults: 50 });
   const results: NormalizedMessage[] = [];
   for (const stub of data.messages ?? []) {
@@ -70,8 +73,8 @@ export async function runSpam(category: string | undefined, options: SpamOptions
   if (!category) {
     console.error(
       pc.yellow(
-        "An interactive sender picker isn't implemented in this build. Run `gmail spam \"<category>\"` " +
-          "with an explicit category, e.g. `gmail spam \"LinkedIn\"`."
+        "An interactive sender picker isn't implemented in this build. Run `gmail add spam \"<category>\"` " +
+          "with an explicit category, e.g. `gmail add spam \"LinkedIn\"`."
       )
     );
     return EXIT_CODES.invalidOrAuthRequired;
@@ -79,6 +82,23 @@ export async function runSpam(category: string | undefined, options: SpamOptions
 
   const ctx = bootstrap();
   const { account, gmailClient } = await resolveAccount(ctx);
+  const lock = new ProcessLock(lockFilePath(account.accountHash));
+  lock.acquire();
+
+  try {
+    return await runSpamLocked(category, options, ctx, account, gmailClient);
+  } finally {
+    lock.release();
+  }
+}
+
+async function runSpamLocked(
+  category: string,
+  options: SpamOptions,
+  ctx: ReturnType<typeof bootstrap>,
+  account: Awaited<ReturnType<typeof resolveAccount>>["account"],
+  gmailClient: GmailClient
+): Promise<number> {
   const ruleGroupsRepo = new RuleGroupsRepository(ctx.db);
   const existingGroups = ruleGroupsRepo.list(account.accountHash);
 
@@ -131,8 +151,14 @@ export async function runSpam(category: string | undefined, options: SpamOptions
   });
   console.log(pc.green(`Created spam rule "${category}" [${ruleGroupId}].`));
 
+  // Only trash candidates that actually resolved to one of the identities
+  // this rule now covers — not every raw search hit. A message with
+  // neither a List-ID nor a usable From address contributes to no
+  // identity and must not be trashed just for appearing in the search.
+  const resolvedMessageIds = new Set(identities.flatMap((identity) => identity.sampleMessageIds));
   let trashedCount = 0;
   for (const message of candidates) {
+    if (!resolvedMessageIds.has(message.gmailMessageId)) continue;
     await trashMessage(gmailClient, message.gmailMessageId);
     trashedCount += 1;
   }
@@ -157,19 +183,21 @@ export async function runSpam(category: string | undefined, options: SpamOptions
     }
 
     if (parsed.mailto && options.allowMailto) {
-      const mailto = parseMailtoUri(`mailto:${parsed.mailto.address}${parsed.mailto.subject ? `?subject=${encodeURIComponent(parsed.mailto.subject)}` : ""}`);
-      if (mailto) {
-        await gmailClient.users.messages.send({
-          userId: "me",
-          requestBody: {
-            raw: Buffer.from(
-              `To: ${mailto.address}\r\nSubject: ${mailto.subject ?? "Unsubscribe"}\r\n\r\n${mailto.body ?? ""}`
-            ).toString("base64url")
-          }
-        });
-        unsubHandled += 1;
-        continue;
-      }
+      // parsed.mailto was already produced by parseMailtoUri inside
+      // parseListUnsubscribeHeader — use it directly rather than
+      // re-encoding just the address/subject into a new URI and
+      // reparsing, which silently dropped the original body.
+      const mailto = parsed.mailto;
+      await gmailClient.users.messages.send({
+        userId: "me",
+        requestBody: {
+          raw: Buffer.from(
+            `To: ${mailto.address}\r\nSubject: ${mailto.subject ?? "Unsubscribe"}\r\n\r\n${mailto.body ?? ""}`
+          ).toString("base64url")
+        }
+      });
+      unsubHandled += 1;
+      continue;
     }
 
     if (parsed.mailto && !options.allowMailto) {

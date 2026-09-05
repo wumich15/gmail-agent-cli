@@ -78,6 +78,31 @@ export function contentHash(input: string): string {
   return sha256Hex(`gmail-agent-content-v1\0${input}`);
 }
 
+/**
+ * Deterministic JSON serialization: object keys are sorted recursively so
+ * two objects with identical data but different key-insertion order (e.g.
+ * from a spread, or two independently-constructed classifier responses)
+ * always serialize identically. Array order is preserved — arrays are
+ * ordered data, not a set of fields.
+ */
+export function canonicalJsonStringify(value: unknown): string {
+  return JSON.stringify(sortKeysDeep(value));
+}
+
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortKeysDeep);
+  }
+  if (value !== null && typeof value === "object") {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      sorted[key] = sortKeysDeep((value as Record<string, unknown>)[key]);
+    }
+    return sorted;
+  }
+  return value;
+}
+
 export function payloadHash(payload: unknown): string {
-  return sha256Hex(`gmail-agent-payload-v1\0${JSON.stringify(payload)}`);
+  return sha256Hex(`gmail-agent-payload-v1\0${canonicalJsonStringify(payload)}`);
 }

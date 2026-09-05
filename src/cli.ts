@@ -48,4 +48,18 @@ program
     withExitHandling(() => runAdd(type, category, { yes: opts.yes }));
   });
 
-program.parse();
+// Commander's root `.action()` absorbs ANY unrecognized first argument as
+// if it were plain `gmail` with no subcommand — so `gmail spam "x"` (a
+// plausible typo for `gmail add spam "x"`) or any other typo would
+// otherwise silently run the full mutating pipeline instead of erroring.
+// Since bare `gmail` performs real mailbox mutations, that's a dangerous
+// default; check the first token explicitly before letting Commander parse.
+const KNOWN_SUBCOMMANDS = new Set(["add", "help"]);
+const firstArg = process.argv[2];
+if (firstArg !== undefined && !firstArg.startsWith("-") && !KNOWN_SUBCOMMANDS.has(firstArg)) {
+  console.error(pc.red(`Unknown command: ${firstArg}`));
+  console.error("Run 'gmail --help' to see available commands.");
+  process.exitCode = EXIT_CODES.invalidOrAuthRequired;
+} else {
+  program.parse();
+}

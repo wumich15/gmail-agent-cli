@@ -28,6 +28,17 @@ export function logDir(env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform): str
   return join(appDataDir(env, platform), "logs");
 }
 
-export function lockFilePath(env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform): string {
-  return join(appDataDir(env, platform), "gmail.lock");
+/**
+ * Per-account lock file so two different signed-in accounts (a future
+ * multi-account state) don't serialize behind one shared OS-user-wide
+ * lock. Pass the account hash once it's known; omitting it is only for
+ * call sites that genuinely predate account resolution.
+ */
+export function lockFilePath(
+  accountHash?: string,
+  env?: NodeJS.ProcessEnv,
+  platform?: NodeJS.Platform
+): string {
+  const fileName = accountHash ? `gmail-${accountHash.slice(0, 16)}.lock` : "gmail.lock";
+  return join(appDataDir(env, platform), fileName);
 }

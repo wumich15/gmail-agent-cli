@@ -95,7 +95,7 @@ export async function runDoctor(): Promise<number> {
     const accountsRepo = new AccountsRepository(ctx.db);
     const rows = ctx.db.prepare("SELECT account_hash FROM accounts").all() as { account_hash: string }[];
     if (rows.length === 0) {
-      results.push({ name: "Google account", status: "warn", detail: "not signed in; run `gmail auth login`" });
+      results.push({ name: "Google account", status: "warn", detail: "not signed in; run `gmail` to sign in" });
     }
     for (const { account_hash: accountHash } of rows) {
       const account = accountsRepo.get(accountHash);

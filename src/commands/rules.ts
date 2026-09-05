@@ -15,7 +15,7 @@ export async function rulesList(options: { json: boolean }): Promise<number> {
   }
 
   if (groups.length === 0) {
-    console.log("No rules yet. Create one with `gmail spam <category>` or `gmail important <category>`.");
+    console.log("No rules yet. Create one with `gmail add spam <category>` or `gmail add important <category>`.");
     return EXIT_CODES.ok;
   }
 

@@ -110,6 +110,16 @@ export function headersFromMessage(message: gmail_v1.Schema$Message) {
   return headerMapFromList(message.payload?.headers ?? undefined);
 }
 
+/**
+ * Gmail history IDs are decimal numbers encoded as strings and can exceed
+ * Number.MAX_SAFE_INTEGER, so comparing them requires BigInt, not string
+ * comparison (which is wrong once digit counts differ, e.g. "99" > "100")
+ * and not Number (which can silently lose precision).
+ */
+export function historyIdGreaterThan(a: string, b: string): boolean {
+  return BigInt(a) > BigInt(b);
+}
+
 export interface HistorySyncResult {
   changedMessageIds: Set<string>;
   deletedMessageIds: Set<string>;
@@ -143,7 +153,7 @@ export async function listHistorySince(
       });
 
       for (const record of data.history ?? []) {
-        if (record.id && record.id > latestHistoryId) {
+        if (record.id && historyIdGreaterThan(record.id, latestHistoryId)) {
           latestHistoryId = record.id;
         }
         for (const m of record.messagesAdded ?? []) {
@@ -160,7 +170,7 @@ export async function listHistorySince(
         }
       }
       pageToken = data.nextPageToken ?? undefined;
-      if (data.historyId && data.historyId > latestHistoryId) {
+      if (data.historyId && historyIdGreaterThan(data.historyId, latestHistoryId)) {
         latestHistoryId = data.historyId;
       }
     } while (pageToken);

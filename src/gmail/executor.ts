@@ -15,15 +15,25 @@ function mutationKey(mutation: LabelMutation): string {
   });
 }
 
+export interface GroupedMutationResult {
+  succeededMessageIds: string[];
+  /** One entry per message in a chunk whose batchModify call threw. */
+  failedMessageIds: string[];
+}
+
 /**
  * Groups message IDs by their exact validated label mutation and issues
  * batchModify calls of at most 1,000 IDs each. Callers must not assume
- * batches execute in order or save quota units.
+ * batches execute in order or save quota units. A chunk that fails does
+ * not stop the remaining chunks/groups — each is independent, matching
+ * the design's "continue independent actions after an isolated failure"
+ * requirement — so the caller gets back exactly which message IDs
+ * actually succeeded versus failed.
  */
 export async function applyGroupedLabelMutations(
   client: GmailClient,
   items: readonly { messageId: string; mutation: LabelMutation }[]
-): Promise<void> {
+): Promise<GroupedMutationResult> {
   const groups = new Map<string, { mutation: LabelMutation; ids: string[] }>();
   for (const item of items) {
     const key = mutationKey(item.mutation);
@@ -35,19 +45,29 @@ export async function applyGroupedLabelMutations(
     }
   }
 
+  const succeededMessageIds: string[] = [];
+  const failedMessageIds: string[] = [];
+
   for (const { mutation, ids } of groups.values()) {
     for (let i = 0; i < ids.length; i += BATCH_MODIFY_MAX_IDS) {
       const chunk = ids.slice(i, i + BATCH_MODIFY_MAX_IDS);
-      await client.users.messages.batchModify({
-        userId: "me",
-        requestBody: {
-          ids: chunk,
-          addLabelIds: [...mutation.addLabelIds],
-          removeLabelIds: [...mutation.removeLabelIds]
-        }
-      });
+      try {
+        await client.users.messages.batchModify({
+          userId: "me",
+          requestBody: {
+            ids: chunk,
+            addLabelIds: [...mutation.addLabelIds],
+            removeLabelIds: [...mutation.removeLabelIds]
+          }
+        });
+        succeededMessageIds.push(...chunk);
+      } catch {
+        failedMessageIds.push(...chunk);
+      }
     }
   }
+
+  return { succeededMessageIds, failedMessageIds };
 }
 
 /** Trash a single message. Never calls delete/batchDelete. */

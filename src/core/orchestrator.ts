@@ -105,6 +105,13 @@ async function processMessage(
   const ruleMatches = findMatchingRuleGroups(deps.ruleGroups, normalized);
   const matched = ruleMatches.find((r) => r.result === "matched");
   const explicitRule = matched ? { action: matched.ruleGroup.action, ruleGroupId: matched.ruleGroup.id } : null;
+  // A structurally-matching important rule whose stored DKIM/DMARC binding
+  // failed to verify must not be silently ignored — that's exactly the
+  // spoofed-sender case the binding exists to catch — so it forces Review
+  // rather than letting the message fall through to ordinary handling.
+  const authFailedImportantRule = ruleMatches.some(
+    (r) => r.result === "auth_failed" && r.ruleGroup.action === "important"
+  );
 
   const appAttributed = deps.appAttributedLabelsByMessageId?.get(stub.id) ?? new Set<"STARRED" | "IMPORTANT">();
   const isProtected =
@@ -161,6 +168,13 @@ async function processMessage(
         reviewReason: rawDecision.reviewReason ?? `event_validation_failed_${validation.reason}`
       };
     }
+  }
+
+  if (authFailedImportantRule) {
+    // Surfaces even over an existing review reason (e.g. "assessment
+    // unavailable") — a spoofed sender tripping an important-rule auth
+    // binding is a more specific, actionable signal than a generic one.
+    decision = { ...decision, needsReview: true, reviewReason: "important_rule_auth_failed" };
   }
 
   return {

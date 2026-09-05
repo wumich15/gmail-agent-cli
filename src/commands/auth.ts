@@ -17,7 +17,7 @@ import { EXIT_CODES } from "../core/errors.js";
 
 export async function authLogin(): Promise<number> {
   const ctx = bootstrap();
-  p.intro("gmail auth login");
+  p.intro("Sign in to Google");
 
   p.log.message(
     "This app can, on your account: move spam/promotions/low-value mail to Trash (never permanently\n" +
@@ -79,7 +79,7 @@ export async function authLogin(): Promise<number> {
     p.outro(
       `Signed in as ${profile.emailAddress}.\n` +
         `Granted scopes: ${OAUTH_SCOPES.join(", ")}\n` +
-        `Run 'gmail work --dry-run' to preview what this account would do.`
+        `Run 'gmail --dry-run' to preview what this account would do.`
     );
     return EXIT_CODES.ok;
   } catch (error) {
@@ -97,7 +97,7 @@ export async function authStatus(): Promise<number> {
   const accountsRepo = new AccountsRepository(ctx.db);
 
   if (!ctx.config) {
-    console.log(pc.yellow("Not configured. Run `gmail auth login` first."));
+    console.log(pc.yellow("Not configured. Run `gmail` first to sign in."));
     return EXIT_CODES.invalidOrAuthRequired;
   }
 
@@ -105,7 +105,7 @@ export async function authStatus(): Promise<number> {
   // for a single-account v1, report every account we know about.
   const rows = ctx.db.prepare("SELECT account_hash FROM accounts").all() as { account_hash: string }[];
   if (rows.length === 0) {
-    console.log(pc.yellow("No account is signed in. Run `gmail auth login`."));
+    console.log(pc.yellow("No account is signed in. Run `gmail` to sign in."));
     return EXIT_CODES.invalidOrAuthRequired;
   }
 

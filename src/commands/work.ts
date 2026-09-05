@@ -27,6 +27,7 @@ import {
 import { buildEventInsertPlan, insertIdempotentEvent } from "../calendar/idempotency.js";
 import { contentHash } from "../core/ids.js";
 import type { PolicyActionIntent } from "../core/policy.js";
+import type { ActionType, PlannedAction } from "../core/models.js";
 
 const RANDOM_CLASSIFIER_WARNING =
   pc.yellow("⚠ AI classification is a RANDOM placeholder in this build.\n") +
@@ -76,11 +77,12 @@ export async function runWork(options: WorkOptions): Promise<number> {
   const ctx = bootstrap();
   const { account, gmailClient, calendarClient } = await resolveAccountSigningInIfNeeded(ctx);
 
-  if (!options.json) {
-    console.error(RANDOM_CLASSIFIER_WARNING);
-  }
+  // Always goes to stderr, even in --json mode: it never touches stdout,
+  // so it can't corrupt a piped JSON summary, and this warning is too
+  // important to hide from a human who happens to be running --json.
+  console.error(RANDOM_CLASSIFIER_WARNING);
 
-  const lock = options.dryRun ? null : new ProcessLock(lockFilePath());
+  const lock = options.dryRun ? null : new ProcessLock(lockFilePath(account.accountHash));
   lock?.acquire();
 
   try {
@@ -97,6 +99,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
     });
 
     let runId: string | undefined;
+    let failureCount = 0;
 
     if (!options.dryRun) {
       runId = newRunId();
@@ -129,6 +132,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
 
       const trashTargets: string[] = [];
       const labelTargets: { messageId: string; mutation: ReturnType<typeof mutationForActions> }[] = [];
+      const actionsByMessageId = new Map<string, PlannedAction[]>();
 
       for (const outcome of outcomes) {
         const isTrash = outcome.decision.actions.some((a) => a.type === "trash");
@@ -142,6 +146,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
         });
         if (planned.length > 0) {
           actionsRepo.upsertPlanned(planned);
+          actionsByMessageId.set(outcome.gmailMessageId, planned);
         }
         if (isTrash) {
           trashTargets.push(outcome.gmailMessageId);
@@ -153,27 +158,68 @@ export async function runWork(options: WorkOptions): Promise<number> {
         }
       }
 
+      // Moves this message's action-ledger rows of the given type(s) to a
+      // new status. A row already reconciled to a terminal status by
+      // upsertPlanned's own guard is simply re-set here, which is fine
+      // since this function is the one actually executing right now.
+      const markActions = (
+        messageId: string,
+        types: readonly ActionType[],
+        status: PlannedAction["status"],
+        errorClass: string | null = null
+      ): void => {
+        for (const row of actionsByMessageId.get(messageId) ?? []) {
+          if (types.includes(row.type)) {
+            actionsRepo.updateStatus(row.actionKey, status, ctx.clock.nowIso(), errorClass);
+          }
+        }
+      };
+
       // Immediately before mutating, re-fetch current label state so a
       // change the user made after the snapshot (e.g. starring a message)
       // is respected rather than overwritten.
       const survivingTrash: string[] = [];
       for (const messageId of trashTargets) {
-        const { data } = await gmailClient.users.messages.get({
-          userId: "me",
-          id: messageId,
-          format: "minimal"
-        });
-        const labels = data.labelIds ?? [];
-        if (labels.includes("STARRED") || labels.includes("IMPORTANT")) {
-          continue; // user protected it after the snapshot; skip this trash.
+        try {
+          const { data } = await gmailClient.users.messages.get({
+            userId: "me",
+            id: messageId,
+            format: "minimal"
+          });
+          const labels = data.labelIds ?? [];
+          if (labels.includes("STARRED") || labels.includes("IMPORTANT")) {
+            markActions(messageId, ["trash"], "skipped_conflict");
+            continue; // user protected it after the snapshot; skip this trash.
+          }
+          survivingTrash.push(messageId);
+        } catch {
+          markActions(messageId, ["trash"], "failed_retryable", "precondition_check_failed");
+          failureCount += 1;
         }
-        survivingTrash.push(messageId);
       }
 
       for (const messageId of survivingTrash) {
-        await trashMessage(gmailClient, messageId);
+        markActions(messageId, ["trash"], "applying");
+        try {
+          await trashMessage(gmailClient, messageId);
+          markActions(messageId, ["trash"], "applied");
+        } catch {
+          markActions(messageId, ["trash"], "failed_retryable", "gmail_api_error");
+          failureCount += 1;
+        }
       }
-      await applyGroupedLabelMutations(gmailClient, labelTargets);
+
+      for (const { messageId } of labelTargets) {
+        markActions(messageId, ["star", "mark_important", "archive"], "applying");
+      }
+      const labelResult = await applyGroupedLabelMutations(gmailClient, labelTargets);
+      for (const messageId of labelResult.succeededMessageIds) {
+        markActions(messageId, ["star", "mark_important", "archive"], "applied");
+      }
+      for (const messageId of labelResult.failedMessageIds) {
+        markActions(messageId, ["star", "mark_important", "archive"], "failed_retryable", "gmail_api_error");
+        failureCount += 1;
+      }
 
       // Calendar creation: only for outcomes whose event candidate already
       // passed real-code date/shape validation (see orchestrator.ts). The
@@ -185,6 +231,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
         if (!outcome.validatedEvent || survivingTrash.includes(outcome.gmailMessageId)) {
           continue;
         }
+        markActions(outcome.gmailMessageId, ["calendar_create"], "applying");
         const plan = buildEventInsertPlan({
           accountHash: account.accountHash,
           gmailMessageId: outcome.gmailMessageId,
@@ -193,50 +240,73 @@ export async function runWork(options: WorkOptions): Promise<number> {
           candidateIndex: 0,
           event: outcome.validatedEvent
         });
-        const insertResult = await insertIdempotentEvent(calendarClient, plan);
-        if (insertResult.kind === "inserted" || insertResult.kind === "already_applied_by_this_app") {
-          calendarLinksRepo.upsert({
-            accountHash: account.accountHash,
-            gmailMessageId: outcome.gmailMessageId,
-            candidateIndex: 0,
-            calendarEventId: plan.eventId,
-            payloadHash: plan.provenance.payloadHash,
-            etag: insertResult.event.etag ?? null,
-            status: "applied",
-            createdAt: ctx.clock.nowIso()
-          });
-          calendarCreated += 1;
-        } else if (insertResult.kind === "collision") {
-          calendarLinksRepo.upsert({
-            accountHash: account.accountHash,
-            gmailMessageId: outcome.gmailMessageId,
-            candidateIndex: 0,
-            calendarEventId: plan.eventId,
-            payloadHash: plan.provenance.payloadHash,
-            etag: null,
-            status: "failed",
-            createdAt: ctx.clock.nowIso()
-          });
+        try {
+          const insertResult = await insertIdempotentEvent(calendarClient, plan);
+          if (insertResult.kind === "inserted" || insertResult.kind === "already_applied_by_this_app") {
+            calendarLinksRepo.upsert({
+              accountHash: account.accountHash,
+              gmailMessageId: outcome.gmailMessageId,
+              candidateIndex: 0,
+              calendarEventId: plan.eventId,
+              payloadHash: plan.provenance.payloadHash,
+              etag: insertResult.event.etag ?? null,
+              status: "applied",
+              createdAt: ctx.clock.nowIso()
+            });
+            markActions(outcome.gmailMessageId, ["calendar_create"], "applied");
+            calendarCreated += 1;
+          } else if (insertResult.kind === "collision") {
+            calendarLinksRepo.upsert({
+              accountHash: account.accountHash,
+              gmailMessageId: outcome.gmailMessageId,
+              candidateIndex: 0,
+              calendarEventId: plan.eventId,
+              payloadHash: plan.provenance.payloadHash,
+              etag: null,
+              status: "failed",
+              createdAt: ctx.clock.nowIso()
+            });
+            // A different app-owned event already holds this deterministic
+            // ID with different provenance: needs human review, not a retry.
+            markActions(outcome.gmailMessageId, ["calendar_create"], "failed_terminal", "calendar_id_collision");
+            failureCount += 1;
+          } else {
+            // ambiguous_retry: the remote result genuinely cannot be known
+            // from this response. Never guess; the same deterministic ID is
+            // safe to retry on a later run.
+            markActions(outcome.gmailMessageId, ["calendar_create"], "unknown_no_retry", "ambiguous_insert_result");
+          }
+        } catch {
+          markActions(outcome.gmailMessageId, ["calendar_create"], "failed_retryable", "calendar_api_error");
+          failureCount += 1;
         }
-        // "ambiguous_retry" (network timeout with an unknown outcome) is
-        // deliberately left unrecorded: the same deterministic ID will be
-        // retried safely on the next run rather than guessed at now.
       }
 
       const finishedAt = ctx.clock.nowIso();
-      runsRepo.finish(runId, "completed", finishedAt, {
-        trashed: survivingTrash.length,
-        labelMutations: labelTargets.length,
-        calendarCreated
-      }, null);
+      runsRepo.finish(
+        runId,
+        failureCount > 0 ? "partial_failure" : "completed",
+        finishedAt,
+        {
+          trashed: survivingTrash.length,
+          labelMutations: labelResult.succeededMessageIds.length,
+          calendarCreated,
+          failures: failureCount
+        },
+        failureCount > 0 ? `${failureCount} action(s) failed; see the actions table for run ${runId}` : null
+      );
     }
 
+    const finalSummary = { ...summary, failureCount };
+
     if (options.json) {
-      console.log(JSON.stringify({ ...renderJsonSummary(summary, { dryRun: options.dryRun }), runId: runId ?? null }));
+      console.log(
+        JSON.stringify({ ...renderJsonSummary(finalSummary, { dryRun: options.dryRun }), runId: runId ?? null })
+      );
     } else {
-      console.log(renderHumanSummary(summary, { dryRun: options.dryRun, ...(runId ? { runId } : {}) }));
+      console.log(renderHumanSummary(finalSummary, { dryRun: options.dryRun, ...(runId ? { runId } : {}) }));
     }
-    return EXIT_CODES.ok;
+    return failureCount > 0 ? EXIT_CODES.operationalFailure : EXIT_CODES.ok;
   } finally {
     lock?.release();
   }

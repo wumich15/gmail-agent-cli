@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  canonicalJsonStringify,
   deterministicActionKey,
   deterministicCalendarEventId,
+  payloadHash,
   toBase32Hex
 } from "../../src/core/ids.js";
 
@@ -64,6 +66,23 @@ describe("deterministicActionKey", () => {
       payloadHash: "h"
     });
     expect(key1).not.toBe(key2);
+  });
+});
+
+describe("canonicalJsonStringify / payloadHash", () => {
+  it("produces the same hash regardless of object key order", () => {
+    const a = { reasonCode: "x", event: { title: "T", confidence: 0.9 } };
+    const b = { event: { confidence: 0.9, title: "T" }, reasonCode: "x" };
+    expect(canonicalJsonStringify(a)).toBe(canonicalJsonStringify(b));
+    expect(payloadHash(a)).toBe(payloadHash(b));
+  });
+
+  it("preserves array order (arrays are ordered data, not sorted)", () => {
+    expect(canonicalJsonStringify([3, 1, 2])).toBe("[3,1,2]");
+  });
+
+  it("still distinguishes genuinely different payloads", () => {
+    expect(payloadHash({ a: 1 })).not.toBe(payloadHash({ a: 2 }));
   });
 });
 

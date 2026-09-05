@@ -153,7 +153,7 @@ export async function runInstalledAppLogin(
 
   if (!tokens.refresh_token) {
     throw new AuthRequiredError(
-      "Google did not return a refresh token. Re-run `gmail auth login`; if this keeps " +
+      "Google did not return a refresh token. Re-run `gmail` to sign in again; if this keeps " +
         "happening, revoke the app's access at https://myaccount.google.com/permissions and retry."
     );
   }

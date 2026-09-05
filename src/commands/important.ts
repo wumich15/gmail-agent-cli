@@ -13,6 +13,8 @@ import { normalizeAddress, normalizeListId } from "../rules/matcher.js";
 import { newRuleGroupId } from "../core/ids.js";
 import { EXIT_CODES, RuleConflictError } from "../core/errors.js";
 import { applyGroupedLabelMutations, starAndImportantMutation } from "../gmail/executor.js";
+import { ProcessLock } from "../core/lock.js";
+import { lockFilePath } from "../config/paths.js";
 import type { NormalizedMessage, RuleMatcher } from "../core/models.js";
 import type { GmailClient } from "../gmail/client.js";
 
@@ -62,7 +64,7 @@ export async function runImportant(category: string | undefined, options: Import
     console.error(
       pc.yellow(
         "An interactive message/sender picker isn't implemented in this build. Run " +
-          '`gmail important "<category>"` with an explicit category.'
+          '`gmail add important "<category>"` with an explicit category.'
       )
     );
     return EXIT_CODES.invalidOrAuthRequired;
@@ -70,6 +72,23 @@ export async function runImportant(category: string | undefined, options: Import
 
   const ctx = bootstrap();
   const { account, gmailClient } = await resolveAccount(ctx);
+  const lock = new ProcessLock(lockFilePath(account.accountHash));
+  lock.acquire();
+
+  try {
+    return await runImportantLocked(category, options, ctx, account, gmailClient);
+  } finally {
+    lock.release();
+  }
+}
+
+async function runImportantLocked(
+  category: string,
+  options: ImportantOptions,
+  ctx: ReturnType<typeof bootstrap>,
+  account: Awaited<ReturnType<typeof resolveAccount>>["account"],
+  gmailClient: GmailClient
+): Promise<number> {
   const ruleGroupsRepo = new RuleGroupsRepository(ctx.db);
   const existingGroups = ruleGroupsRepo.list(account.accountHash);
 
@@ -156,11 +175,15 @@ export async function runImportant(category: string | undefined, options: Import
     return boundIdentityKeys.has(key);
   });
 
-  await applyGroupedLabelMutations(
+  const result = await applyGroupedLabelMutations(
     gmailClient,
     targets.map((c) => ({ messageId: c.gmailMessageId, mutation: starAndImportantMutation() }))
   );
-  console.log(`Starred and marked important: ${targets.length} current message(s).`);
+  console.log(`Starred and marked important: ${result.succeededMessageIds.length} current message(s).`);
+  if (result.failedMessageIds.length > 0) {
+    console.error(pc.red(`Failed to label ${result.failedMessageIds.length} message(s); rule was still created.`));
+    return EXIT_CODES.operationalFailure;
+  }
 
   return EXIT_CODES.ok;
 }
