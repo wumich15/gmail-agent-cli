@@ -26,6 +26,8 @@ export interface RunSummary {
   reviewCount: number;
   reviewSamples: { subject: string; sender: string; reason: string }[];
   failureCount: number;
+  /** Set when --limit capped the scan; states what was skipped. */
+  scanNote: string | null;
 }
 
 const MAX_REVIEW_SAMPLES = 5;
@@ -84,6 +86,7 @@ export function buildRunSummary(inboxCountBefore: number, outcomes: readonly Mes
     calendarCreatedCount,
     reviewCount,
     reviewSamples,
-    failureCount: 0
+    failureCount: 0,
+    scanNote: null
   };
 }

@@ -1,6 +1,7 @@
 import type { gmail_v1 } from "googleapis";
 import type { GmailClient } from "./client.js";
 import { headerMapFromList } from "./normalize.js";
+import { googleApiErrorStatus, withGoogleApiRetry } from "../core/google-api-retry.js";
 
 export const REQUIRED_METADATA_HEADERS = [
   "From",
@@ -24,7 +25,7 @@ export interface MailboxProfile {
 }
 
 export async function fetchProfile(client: GmailClient): Promise<MailboxProfile> {
-  const { data } = await client.users.getProfile({ userId: "me" });
+  const { data } = await withGoogleApiRetry(() => client.users.getProfile({ userId: "me" }));
   if (!data.emailAddress || !data.historyId) {
     throw new Error("Gmail profile response is missing emailAddress or historyId.");
   }
@@ -46,9 +47,17 @@ export interface ListMessagesParams {
 export interface ListMessagesResult {
   messages: MessageStub[];
   truncated: boolean;
+  /** Gmail's own (approximate) count of total matching messages, from the first page. */
+  estimatedTotal: number | null;
 }
 
-/** Fully paginates users.messages.list; never silently truncates. */
+/**
+ * Fully paginates users.messages.list; never silently truncates unless
+ * `safetyCapCount` is set, in which case the returned list is trimmed to
+ * exactly that many IDs (not just "stop fetching more pages") — the point
+ * of a cap is to bound how many subsequent messages.get calls happen, so
+ * an over-full last page must not leak through uncapped.
+ */
 export async function listAllMessageIds(
   client: GmailClient,
   params: ListMessagesParams
@@ -56,15 +65,21 @@ export async function listAllMessageIds(
   const messages: MessageStub[] = [];
   let pageToken: string | undefined;
   let truncated = false;
+  let estimatedTotal: number | null = null;
 
   do {
-    const { data } = await client.users.messages.list({
-      userId: "me",
-      labelIds: params.labelIds,
-      includeSpamTrash: params.includeSpamTrash,
-      maxResults: 500,
-      ...(pageToken !== undefined ? { pageToken } : {})
-    });
+    const { data } = await withGoogleApiRetry(() =>
+      client.users.messages.list({
+        userId: "me",
+        labelIds: params.labelIds,
+        includeSpamTrash: params.includeSpamTrash,
+        maxResults: 500,
+        ...(pageToken !== undefined ? { pageToken } : {})
+      })
+    );
+    if (estimatedTotal === null && typeof data.resultSizeEstimate === "number") {
+      estimatedTotal = data.resultSizeEstimate;
+    }
     for (const m of data.messages ?? []) {
       if (m.id && m.threadId) {
         messages.push({ id: m.id, threadId: m.threadId });
@@ -73,24 +88,27 @@ export async function listAllMessageIds(
     pageToken = data.nextPageToken ?? undefined;
 
     if (params.safetyCapCount !== undefined && messages.length >= params.safetyCapCount) {
-      truncated = pageToken !== undefined;
+      truncated = pageToken !== undefined || messages.length > params.safetyCapCount;
+      messages.length = params.safetyCapCount;
       break;
     }
   } while (pageToken);
 
-  return { messages, truncated };
+  return { messages, truncated, estimatedTotal };
 }
 
 export async function fetchMessageMetadata(
   client: GmailClient,
   messageId: string
 ): Promise<gmail_v1.Schema$Message> {
-  const { data } = await client.users.messages.get({
-    userId: "me",
-    id: messageId,
-    format: "metadata",
-    metadataHeaders: [...REQUIRED_METADATA_HEADERS]
-  });
+  const { data } = await withGoogleApiRetry(() =>
+    client.users.messages.get({
+      userId: "me",
+      id: messageId,
+      format: "metadata",
+      metadataHeaders: [...REQUIRED_METADATA_HEADERS]
+    })
+  );
   return data;
 }
 
@@ -98,11 +116,13 @@ export async function fetchMessageFull(
   client: GmailClient,
   messageId: string
 ): Promise<gmail_v1.Schema$Message> {
-  const { data } = await client.users.messages.get({
-    userId: "me",
-    id: messageId,
-    format: "full"
-  });
+  const { data } = await withGoogleApiRetry(() =>
+    client.users.messages.get({
+      userId: "me",
+      id: messageId,
+      format: "full"
+    })
+  );
   return data;
 }
 
@@ -145,12 +165,14 @@ export async function listHistorySince(
 
   try {
     do {
-      const { data } = await client.users.history.list({
-        userId: "me",
-        startHistoryId,
-        ...(pageToken !== undefined ? { pageToken } : {}),
-        historyTypes: ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"]
-      });
+      const { data } = await withGoogleApiRetry(() =>
+        client.users.history.list({
+          userId: "me",
+          startHistoryId,
+          ...(pageToken !== undefined ? { pageToken } : {}),
+          historyTypes: ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"]
+        })
+      );
 
       for (const record of data.history ?? []) {
         if (record.id && historyIdGreaterThan(record.id, latestHistoryId)) {
@@ -190,10 +212,5 @@ export async function listHistorySince(
 }
 
 function isNotFoundError(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: number }).code === 404
-  );
+  return googleApiErrorStatus(error) === 404;
 }

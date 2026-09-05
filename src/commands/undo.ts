@@ -5,6 +5,7 @@ import { resolveAccount } from "./shared.js";
 import { RunsRepository, ActionsRepository } from "../state/repositories/runs.js";
 import { EXIT_CODES } from "../core/errors.js";
 import { GMAIL_LABELS } from "../gmail/labels.js";
+import { withGoogleApiRetry } from "../core/google-api-retry.js";
 
 export async function runUndo(runId: string, options: { yes: boolean }): Promise<number> {
   const ctx = bootstrap();
@@ -42,44 +43,54 @@ export async function runUndo(runId: string, options: { yes: boolean }): Promise
   for (const action of reversible) {
     if (!action.targetGmailMessageId) continue;
     try {
-      const { data } = await gmailClient.users.messages.get({
-        userId: "me",
-        id: action.targetGmailMessageId,
-        format: "minimal"
-      });
+      const { data } = await withGoogleApiRetry(() =>
+        gmailClient.users.messages.get({
+          userId: "me",
+          id: action.targetGmailMessageId!,
+          format: "minimal"
+        })
+      );
       const currentLabels = data.labelIds ?? [];
 
       switch (action.type) {
         case "trash":
-          await gmailClient.users.messages.untrash({ userId: "me", id: action.targetGmailMessageId });
+          await withGoogleApiRetry(() =>
+            gmailClient.users.messages.untrash({ userId: "me", id: action.targetGmailMessageId! })
+          );
           undone += 1;
           break;
         case "archive":
           if (currentLabels.includes(GMAIL_LABELS.inbox)) {
             skipped += 1; // user already has it back in Inbox or re-archived differently; nothing to do.
           } else {
-            await gmailClient.users.messages.modify({
-              userId: "me",
-              id: action.targetGmailMessageId,
-              requestBody: { addLabelIds: [GMAIL_LABELS.inbox] }
-            });
+            await withGoogleApiRetry(() =>
+              gmailClient.users.messages.modify({
+                userId: "me",
+                id: action.targetGmailMessageId!,
+                requestBody: { addLabelIds: [GMAIL_LABELS.inbox] }
+              })
+            );
             undone += 1;
           }
           break;
         case "star":
-          await gmailClient.users.messages.modify({
-            userId: "me",
-            id: action.targetGmailMessageId,
-            requestBody: { removeLabelIds: [GMAIL_LABELS.starred] }
-          });
+          await withGoogleApiRetry(() =>
+            gmailClient.users.messages.modify({
+              userId: "me",
+              id: action.targetGmailMessageId!,
+              requestBody: { removeLabelIds: [GMAIL_LABELS.starred] }
+            })
+          );
           undone += 1;
           break;
         case "mark_important":
-          await gmailClient.users.messages.modify({
-            userId: "me",
-            id: action.targetGmailMessageId,
-            requestBody: { removeLabelIds: [GMAIL_LABELS.important] }
-          });
+          await withGoogleApiRetry(() =>
+            gmailClient.users.messages.modify({
+              userId: "me",
+              id: action.targetGmailMessageId!,
+              requestBody: { removeLabelIds: [GMAIL_LABELS.important] }
+            })
+          );
           undone += 1;
           break;
         default:

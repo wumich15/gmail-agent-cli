@@ -1,5 +1,6 @@
 import type { calendar_v3 } from "googleapis";
 import { deterministicCalendarEventId, payloadHash } from "../core/ids.js";
+import { googleApiErrorStatus, withGoogleApiRetry } from "../core/google-api-retry.js";
 import type { ValidatedEvent } from "./event-policy.js";
 
 export const CALENDAR_PROVENANCE_APP_ID = "gmail-agent-cli";
@@ -86,20 +87,24 @@ export async function insertIdempotentEvent(
   plan: EventInsertPlan
 ): Promise<InsertOutcome> {
   try {
-    const { data } = await client.events.insert({
-      calendarId: "primary",
-      sendUpdates: "none",
-      requestBody: plan.requestBody
-    });
+    const { data } = await withGoogleApiRetry(() =>
+      client.events.insert({
+        calendarId: "primary",
+        sendUpdates: "none",
+        requestBody: plan.requestBody
+      })
+    );
     return { kind: "inserted", event: data };
   } catch (error: unknown) {
     if (!isConflictError(error)) {
       throw error;
     }
-    const { data: existing } = await client.events.get({
-      calendarId: "primary",
-      eventId: plan.eventId
-    });
+    const { data: existing } = await withGoogleApiRetry(() =>
+      client.events.get({
+        calendarId: "primary",
+        eventId: plan.eventId
+      })
+    );
     const existingProvenance = existing.extendedProperties?.private?.["payloadHash"];
     if (existingProvenance === plan.provenance.payloadHash) {
       return { kind: "already_applied_by_this_app", event: existing };
@@ -114,10 +119,5 @@ export async function insertIdempotentEvent(
 }
 
 function isConflictError(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: number }).code === 409
-  );
+  return googleApiErrorStatus(error) === 409;
 }

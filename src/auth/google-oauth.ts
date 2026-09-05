@@ -84,6 +84,13 @@ export async function runInstalledAppLogin(
 
   const { code, redirectUri } = await new Promise<{ code: string; redirectUri: string }>(
     (resolve, reject) => {
+      // Captured once the server starts listening. Reading it again from
+      // server.address() after server.close() (called by finish() below)
+      // returns null — close() clears the listening address immediately,
+      // before the 'close' event even fires — so the callback handler
+      // reuses this instead of re-deriving it post-close.
+      let redirectUri = "";
+
       const server = createServer((req, res) => {
         const url = new URL(req.url ?? "/", "http://127.0.0.1");
         if (url.pathname !== "/callback") {
@@ -110,8 +117,7 @@ export async function runInstalledAppLogin(
           return;
         }
         finish("<html><body>Signed in. You can close this tab and return to the terminal.</body></html>");
-        const address = server.address() as AddressInfo;
-        resolve({ code: returnedCode, redirectUri: `http://127.0.0.1:${address.port}/callback` });
+        resolve({ code: returnedCode, redirectUri });
       });
 
       server.on("error", reject);
@@ -124,7 +130,7 @@ export async function runInstalledAppLogin(
 
       server.listen(0, "127.0.0.1", () => {
         const address = server.address() as AddressInfo;
-        const redirectUri = `http://127.0.0.1:${address.port}/callback`;
+        redirectUri = `http://127.0.0.1:${address.port}/callback`;
         const oauth2Client = new OAuth2Client({
           clientId: credentials.clientId,
           clientSecret: credentials.clientSecret,

@@ -11,6 +11,7 @@ export interface JsonSummaryOutput {
   calendarCreatedCount: number;
   reviewCount: number;
   failureCount: number;
+  scanNote: string | null;
 }
 
 /** One stable JSON object to stdout. Never includes message bodies, tokens, or unsubscribe URLs. */
@@ -26,6 +27,7 @@ export function renderJsonSummary(summary: RunSummary, options: { dryRun: boolea
     markedImportantCount: summary.markedImportantCount,
     calendarCreatedCount: summary.calendarCreatedCount,
     reviewCount: summary.reviewCount,
-    failureCount: summary.failureCount
+    failureCount: summary.failureCount,
+    scanNote: summary.scanNote
   };
 }

@@ -24,6 +24,14 @@ export interface OrchestratorDeps {
   userTimezone: string;
   clock: Clock;
   concurrency: { gmailReads: number };
+  /**
+   * Caps the Inbox scan and the native-Spam scan to this many messages
+   * each (most recent first — Gmail returns messages.list results newest
+   * first when unsorted by a query). Applied before any per-message
+   * messages.get call, since that's what actually drives Gmail API quota
+   * usage, not just how many list pages get fetched.
+   */
+  limit?: number;
   policyThresholds?: PolicyThresholds;
   /** Message IDs the app's own ledger has starred/marked-important, for protection detection. */
   appAttributedLabelsByMessageId?: ReadonlyMap<string, ReadonlySet<"STARRED" | "IMPORTANT">>;
@@ -33,6 +41,8 @@ export interface WorkScanResult {
   summary: RunSummary;
   outcomes: MessageOutcome[];
   historyIdAtSnapshot: string;
+  /** Set when --limit capped the Inbox and/or Spam scan; states what was skipped, per CLAUDE.md's "state exactly how many remain" requirement. */
+  scanNote: string | null;
 }
 
 function dedupeStubs(stubs: readonly MessageStub[]): MessageStub[] {
@@ -60,8 +70,16 @@ export async function runWorkScan(deps: OrchestratorDeps): Promise<WorkScanResul
   const profile = await fetchProfile(deps.gmailClient);
 
   const [spamResult, inboxResult] = await Promise.all([
-    listAllMessageIds(deps.gmailClient, { labelIds: [GMAIL_LABELS.spam], includeSpamTrash: true }),
-    listAllMessageIds(deps.gmailClient, { labelIds: [GMAIL_LABELS.inbox], includeSpamTrash: false })
+    listAllMessageIds(deps.gmailClient, {
+      labelIds: [GMAIL_LABELS.spam],
+      includeSpamTrash: true,
+      ...(deps.limit !== undefined ? { safetyCapCount: deps.limit } : {})
+    }),
+    listAllMessageIds(deps.gmailClient, {
+      labelIds: [GMAIL_LABELS.inbox],
+      includeSpamTrash: false,
+      ...(deps.limit !== undefined ? { safetyCapCount: deps.limit } : {})
+    })
   ]);
 
   const stubs = dedupeStubs([...spamResult.messages, ...inboxResult.messages]);
@@ -75,7 +93,31 @@ export async function runWorkScan(deps: OrchestratorDeps): Promise<WorkScanResul
   }
 
   const summary = buildRunSummary(inboxResult.messages.length, outcomes);
-  return { summary, outcomes, historyIdAtSnapshot: profile.historyId };
+  return { summary, outcomes, historyIdAtSnapshot: profile.historyId, scanNote: buildScanNote(inboxResult, spamResult) };
+}
+
+function buildScanNote(
+  inboxResult: { truncated: boolean; messages: readonly unknown[]; estimatedTotal: number | null },
+  spamResult: { truncated: boolean; messages: readonly unknown[]; estimatedTotal: number | null }
+): string | null {
+  const parts: string[] = [];
+  if (inboxResult.truncated) {
+    const total = inboxResult.estimatedTotal;
+    parts.push(
+      `Inbox: scanned the ${inboxResult.messages.length} most recent message(s)` +
+        (total !== null ? ` of an estimated ~${total} total` : "") +
+        "."
+    );
+  }
+  if (spamResult.truncated) {
+    const total = spamResult.estimatedTotal;
+    parts.push(
+      `Spam: scanned the ${spamResult.messages.length} most recent message(s)` +
+        (total !== null ? ` of an estimated ~${total} total` : "") +
+        "."
+    );
+  }
+  return parts.length > 0 ? `--limit applied. ${parts.join(" ")}` : null;
 }
 
 async function processMessage(

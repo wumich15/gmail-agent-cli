@@ -1,5 +1,6 @@
 import type { GmailClient } from "./client.js";
 import { GMAIL_LABELS } from "./labels.js";
+import { withGoogleApiRetry } from "../core/google-api-retry.js";
 
 const BATCH_MODIFY_MAX_IDS = 1000;
 
@@ -52,14 +53,16 @@ export async function applyGroupedLabelMutations(
     for (let i = 0; i < ids.length; i += BATCH_MODIFY_MAX_IDS) {
       const chunk = ids.slice(i, i + BATCH_MODIFY_MAX_IDS);
       try {
-        await client.users.messages.batchModify({
-          userId: "me",
-          requestBody: {
-            ids: chunk,
-            addLabelIds: [...mutation.addLabelIds],
-            removeLabelIds: [...mutation.removeLabelIds]
-          }
-        });
+        await withGoogleApiRetry(() =>
+          client.users.messages.batchModify({
+            userId: "me",
+            requestBody: {
+              ids: chunk,
+              addLabelIds: [...mutation.addLabelIds],
+              removeLabelIds: [...mutation.removeLabelIds]
+            }
+          })
+        );
         succeededMessageIds.push(...chunk);
       } catch {
         failedMessageIds.push(...chunk);
@@ -72,7 +75,7 @@ export async function applyGroupedLabelMutations(
 
 /** Trash a single message. Never calls delete/batchDelete. */
 export async function trashMessage(client: GmailClient, messageId: string): Promise<void> {
-  await client.users.messages.trash({ userId: "me", id: messageId });
+  await withGoogleApiRetry(() => client.users.messages.trash({ userId: "me", id: messageId }));
 }
 
 /** Restores a trashed message and, if safe, its recorded prior labels. */
@@ -81,13 +84,15 @@ export async function untrashMessage(
   messageId: string,
   restoreLabelIds: readonly string[] = []
 ): Promise<void> {
-  await client.users.messages.untrash({ userId: "me", id: messageId });
+  await withGoogleApiRetry(() => client.users.messages.untrash({ userId: "me", id: messageId }));
   if (restoreLabelIds.length > 0) {
-    await client.users.messages.modify({
-      userId: "me",
-      id: messageId,
-      requestBody: { addLabelIds: [...restoreLabelIds] }
-    });
+    await withGoogleApiRetry(() =>
+      client.users.messages.modify({
+        userId: "me",
+        id: messageId,
+        requestBody: { addLabelIds: [...restoreLabelIds] }
+      })
+    );
   }
 }
 

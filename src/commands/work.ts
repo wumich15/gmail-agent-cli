@@ -25,6 +25,7 @@ import {
   trashMessage
 } from "../gmail/executor.js";
 import { buildEventInsertPlan, insertIdempotentEvent } from "../calendar/idempotency.js";
+import { withGoogleApiRetry } from "../core/google-api-retry.js";
 import { contentHash } from "../core/ids.js";
 import type { PolicyActionIntent } from "../core/policy.js";
 import type { ActionType, PlannedAction } from "../core/models.js";
@@ -40,6 +41,8 @@ const RANDOM_CLASSIFIER_WARNING =
 export interface WorkOptions {
   dryRun: boolean;
   json: boolean;
+  /** Caps the Inbox and native-Spam scans to this many most-recent messages each, to bound Gmail API quota usage. */
+  limit?: number;
 }
 
 function mutationForActions(actions: readonly PolicyActionIntent[]) {
@@ -88,14 +91,15 @@ export async function runWork(options: WorkOptions): Promise<number> {
   try {
     const ruleGroups = new RuleGroupsRepository(ctx.db).listEnabled(account.accountHash);
 
-    const { summary, outcomes } = await runWorkScan({
+    const { summary, outcomes, scanNote } = await runWorkScan({
       gmailClient,
       classifier: new RandomClassifier(),
       ruleGroups,
       userEmail: account.emailDisplay ?? "",
       userTimezone: account.timezone,
       clock: ctx.clock,
-      concurrency: { gmailReads: 5 }
+      concurrency: { gmailReads: 5 },
+      ...(options.limit !== undefined ? { limit: options.limit } : {})
     });
 
     let runId: string | undefined;
@@ -181,11 +185,13 @@ export async function runWork(options: WorkOptions): Promise<number> {
       const survivingTrash: string[] = [];
       for (const messageId of trashTargets) {
         try {
-          const { data } = await gmailClient.users.messages.get({
-            userId: "me",
-            id: messageId,
-            format: "minimal"
-          });
+          const { data } = await withGoogleApiRetry(() =>
+            gmailClient.users.messages.get({
+              userId: "me",
+              id: messageId,
+              format: "minimal"
+            })
+          );
           const labels = data.labelIds ?? [];
           if (labels.includes("STARRED") || labels.includes("IMPORTANT")) {
             markActions(messageId, ["trash"], "skipped_conflict");
@@ -297,7 +303,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
       );
     }
 
-    const finalSummary = { ...summary, failureCount };
+    const finalSummary = { ...summary, failureCount, scanNote };
 
     if (options.json) {
       console.log(

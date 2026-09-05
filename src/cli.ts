@@ -1,9 +1,17 @@
 #!/usr/bin/env node
-import { Command } from "commander";
+import { Command, InvalidArgumentError } from "commander";
 import pc from "picocolors";
 import { runWork } from "./commands/work.js";
 import { runAdd } from "./commands/add.js";
 import { GmailAgentError, EXIT_CODES } from "./core/errors.js";
+
+function parsePositiveInt(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new InvalidArgumentError("must be a positive whole number.");
+  }
+  return parsed;
+}
 
 // MVP command surface: just `gmail` (scan + clean up, with inline sign-in
 // on first run) and `gmail add` (create a spam/important rule). The other
@@ -18,7 +26,12 @@ program
   .description("Local terminal agent that cleans up Gmail and creates Calendar events from actionable mail.")
   .version("0.1.0")
   .option("--dry-run", "preview without making changes", false)
-  .option("--json", "emit a single JSON summary to stdout", false);
+  .option("--json", "emit a single JSON summary to stdout", false)
+  .option(
+    "--limit <n>",
+    "cap the Inbox and native-Spam scans to the N most recent messages each (reduces Gmail API quota usage)",
+    parsePositiveInt
+  );
 
 function withExitHandling(fn: () => Promise<number>): void {
   fn()
@@ -36,8 +49,10 @@ function withExitHandling(fn: () => Promise<number>): void {
     });
 }
 
-program.action((opts: { dryRun: boolean; json: boolean }) => {
-  withExitHandling(() => runWork({ dryRun: opts.dryRun, json: opts.json }));
+program.action((opts: { dryRun: boolean; json: boolean; limit?: number }) => {
+  withExitHandling(() =>
+    runWork({ dryRun: opts.dryRun, json: opts.json, ...(opts.limit !== undefined ? { limit: opts.limit } : {}) })
+  );
 });
 
 program

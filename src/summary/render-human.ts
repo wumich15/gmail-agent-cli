@@ -11,6 +11,9 @@ export function renderHumanSummary(
 
   lines.push(pc.bold(options.dryRun ? "Dry run — no changes were made" : "Run complete"));
   lines.push("");
+  if (summary.scanNote) {
+    lines.push(pc.yellow(summary.scanNote));
+  }
   lines.push(`Inbox: ${summary.inboxCountBefore} before -> ${inboxAfter} after`);
   lines.push("");
 

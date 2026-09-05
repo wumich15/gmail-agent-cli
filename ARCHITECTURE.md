@@ -225,10 +225,15 @@ fields are currently inert; no classifier reads them yet.
 By product decision, the CLI currently exposes only two commands, to keep
 the MVP surface small:
 
-- **`gmail`** (with `--dry-run` / `--json`) — the whole product: scans,
-  classifies, decides, and acts, exactly as `CLAUDE.md` describes for
-  `gmail work`. Also performs sign-in inline the first time it's run —
-  there is no separate `gmail auth login` command in this build.
+- **`gmail`** (with `--dry-run` / `--json` / `--limit <n>`) — the whole
+  product: scans, classifies, decides, and acts, exactly as `CLAUDE.md`
+  describes for `gmail work`. Also performs sign-in inline the first time
+  it's run — there is no separate `gmail auth login` command in this
+  build. `--limit` caps the Inbox and native-Spam scans to the N most
+  recent messages *each*, applied before any per-message `messages.get`
+  call (via `listAllMessageIds`'s `safetyCapCount`, in
+  `src/gmail/scanner.ts`) — that's what actually bounds Gmail API quota
+  usage, not just how many list pages get fetched.
 - **`gmail add <spam|important> <category>`** — a single unified entry
   point over what `CLAUDE.md` specifies as two separate commands
   (`gmail spam` / `gmail important`); it dispatches to the same
@@ -244,6 +249,13 @@ sign-in flow, so that logic isn't duplicated.
 
 ## Known deviations from the full design (as of this writing)
 
+- `src/core/google-api-retry.ts` now retries Gmail/Calendar 429 (quota
+  exceeded) and 5xx responses with exponential backoff and jitter,
+  honoring `Retry-After` — but there's still no bound on total *retried*
+  request volume across a whole run, so a sustained per-minute quota
+  exhaustion (as opposed to a transient spike) will still exhaust the
+  retry budget per call and eventually surface as a failure. `--limit`
+  is the practical mitigation for that case.
 - No automated RFC 8058 DKIM-verified one-click HTTPS unsubscribe yet —
   `add spam` falls back to manual/`mailto:` handling, which is the spec's
   own safe default when DKIM coverage can't be verified.
