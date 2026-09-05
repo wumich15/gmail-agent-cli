@@ -1,4 +1,5 @@
 import type { PolicyDecision } from "../core/policy.js";
+import type { ValidatedEvent } from "../calendar/event-policy.js";
 
 export interface MessageOutcome {
   gmailMessageId: string;
@@ -9,6 +10,10 @@ export interface MessageOutcome {
   bypassReason: "explicit_spam_rule" | "explicit_important_rule" | "native_spam" | null;
   /** Label snapshot at scan time, used to hash the before-state for the action ledger. */
   labelIdsAtSnapshot: readonly string[];
+  /** Present only when decision.actions contains a calendar_create that passed real-code date validation. */
+  validatedEvent: ValidatedEvent | null;
+  /** The classifier version that produced this message's assessment, if any (for Calendar provenance). */
+  classifierVersion: string | null;
 }
 
 export interface RunSummary {

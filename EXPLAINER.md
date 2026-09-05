@@ -176,14 +176,21 @@ from across messages. This limits how much damage a single adversarial
 email can do: it can lie about itself, but it can't build up an attack
 across multiple messages.
 
-> **Current status of this repository:** the AI step described above is
-> designed but not yet wired up to a real AI provider. Right now, this
-> step always reports "no answer available" for every message. The rest
-> of the pipeline treats that exactly the same way it would treat the AI
-> refusing to answer or timing out: no AI-based action happens, and the
-> message is set aside for you to review. The system still works — it
-> just relies only on your explicit rules and safe defaults until AI is
-> connected.
+> **Current status of this repository:** the real AI step described above
+> isn't wired up to an actual AI provider yet. In its place is a
+> placeholder that answers every message with a **uniformly random**
+> (but correctly-shaped) judgment — not a real opinion at all, just
+> something that exercises every branch of the pipeline described below
+> so it can be built and tested before a real filter exists. Because of
+> that, **running this tool for real right now would make meaningless,
+> random decisions about your actual mail** — it's meant for testing with
+> `--dry-run` or a throwaway test account, not daily use, until a real
+> classifier replaces it. Swapping in a real one is a small, contained
+> change precisely because of the "AI describes, ordinary code decides"
+> boundary: only the small module that produces the AI's answer needs to
+> change; the deterministic decision-maker downstream doesn't know or
+> care whether that answer came from a real model or a random number
+> generator.
 
 ### 5. Deciding (the deterministic policy)
 

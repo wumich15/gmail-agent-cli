@@ -185,16 +185,29 @@ they live only in the OS credential store, addressed via
 
 ## AI status in this build
 
-Per an explicit project decision, the real OpenAI-backed classifier is
-**not implemented**. `src/ai/not-configured-classifier.ts` always returns
-`{ ok: false, unavailable: { reason: "not_configured" } }`. This is a
-first-class, spec-anticipated state — `policy.ts` treats "assessment
-unavailable" the same way it treats a refusal or schema failure: no
-AI-derived Trash/star/important/event mutation, the message is flagged
-for Review, and deterministic read-archiving still proceeds. The Zod
-Structured Outputs schema (`src/ai/schema.ts`) and the `Classifier`
-interface are in place so a real implementation can be dropped in behind
-`ai/openai-classifier.ts` later without touching `core/policy.ts`.
+Per an explicit product decision, the real OpenAI-backed classifier is
+**not implemented**. `work.ts` currently wires in
+`src/ai/random-classifier.ts`, a `Classifier` implementation that returns
+a uniformly random (but correctly-shaped) assessment for every message —
+no network call, no API key. It exists purely to exercise the full
+pipeline (trash/star/archive/Calendar creation) end to end before a real
+filter exists. **It makes meaningless decisions and should never be run
+against a real mailbox** — `work.ts` prints a loud warning every run.
+
+An earlier, more conservative placeholder,
+`src/ai/not-configured-classifier.ts`, always returns
+`{ ok: false, unavailable: { reason: "not_configured" } }` and is kept
+around as the safe default for when random decisions aren't wanted:
+`policy.ts` treats "assessment unavailable" the same way it treats a
+refusal or schema failure — no AI-derived mutation, the message is
+flagged for Review, and deterministic read-archiving still proceeds.
+
+The Zod Structured Outputs schema (`src/ai/schema.ts`) and the
+`Classifier` interface are in place so a real implementation can be
+dropped in — implement `Classifier`, e.g. in a new
+`src/ai/openai-classifier.ts`, and swap the `new RandomClassifier()`
+construction in `commands/work.ts` for it — without touching
+`core/policy.ts` or `core/orchestrator.ts` at all.
 
 ### Pluggable provider (config surface only, not yet wired)
 
@@ -209,19 +222,37 @@ fields are currently inert; no classifier reads them yet.
 
 ## Command surface
 
-See `CLAUDE.md`'s "Command-line contract" section for the authoritative
-flag-by-flag behavior. Implementation status of each command lives in the
-repository's commit history and README, not duplicated here to avoid
-drift.
+By product decision, the CLI currently exposes only two commands, to keep
+the MVP surface small:
+
+- **`gmail`** (with `--dry-run` / `--json`) — the whole product: scans,
+  classifies, decides, and acts, exactly as `CLAUDE.md` describes for
+  `gmail work`. Also performs sign-in inline the first time it's run —
+  there is no separate `gmail auth login` command in this build.
+- **`gmail add <spam|important> <category>`** — a single unified entry
+  point over what `CLAUDE.md` specifies as two separate commands
+  (`gmail spam` / `gmail important`); it dispatches to the same
+  underlying logic in `src/commands/spam.ts` / `src/commands/important.ts`.
+
+The other commands `CLAUDE.md` specifies — `rules`, `summary`, `undo`,
+`auth`, `config`, `doctor` — are **not removed**, just not registered in
+`src/cli.ts` yet. Their implementations still exist under `src/commands/`
+and still work; re-adding them to `cli.ts` is a small, low-risk change
+whenever they're back in scope. `runWork` (`commands/work.ts`) already
+calls into `commands/auth.ts`'s `authLogin` directly for the inline
+sign-in flow, so that logic isn't duplicated.
 
 ## Known deviations from the full design (as of this writing)
 
 - No automated RFC 8058 DKIM-verified one-click HTTPS unsubscribe yet —
-  `spam` falls back to manual/`mailto:` handling, which is the spec's own
-  safe default when DKIM coverage can't be verified.
-- No incremental Gmail `history.list` synchronization yet — `gmail work`
+  `add spam` falls back to manual/`mailto:` handling, which is the spec's
+  own safe default when DKIM coverage can't be verified.
+- No incremental Gmail `history.list` synchronization yet — `gmail`
   does a full snapshot every run (correct, just not optimized).
-- No interactive sender/message pickers — `spam`/`important` require an
+- No interactive sender/message pickers — `gmail add` requires an
   explicit category argument.
-- No first-run onboarding wizard baked into the bare `gmail` invocation —
-  it currently just directs an unauthenticated user to `gmail auth login`.
+- The AI classifier is a random placeholder, not a real filter (see
+  "AI status in this build" above) — do not run this against real mail.
+- Most commands from `CLAUDE.md`'s command-line contract
+  (`rules`/`summary`/`undo`/`auth`/`config`/`doctor`) are implemented but
+  not currently exposed in `cli.ts` (see "Command surface" above).

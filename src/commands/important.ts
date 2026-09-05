@@ -9,6 +9,7 @@ import {
   proposeBoundImportantMatcher
 } from "../rules/resolver.js";
 import { buildNormalizedMessage, headerMapFromList } from "../gmail/normalize.js";
+import { normalizeAddress, normalizeListId } from "../rules/matcher.js";
 import { newRuleGroupId } from "../core/ids.js";
 import { EXIT_CODES, RuleConflictError } from "../core/errors.js";
 import { applyGroupedLabelMutations, starAndImportantMutation } from "../gmail/executor.js";
@@ -146,7 +147,12 @@ export async function runImportant(category: string | undefined, options: Import
       .map((identity) => identity.key)
   );
   const targets = candidates.filter((c) => {
-    const key = c.listId ? `list_id:${c.listId}` : `from:${c.from.address}`;
+    // Must use the same normalization resolver.ts used to build identity.key,
+    // not the raw header value, or a List-ID like "Name <list.example.com>"
+    // never matches its own normalized identity ("list.example.com").
+    const key = c.listId
+      ? `list_id:${normalizeListId(c.listId)}`
+      : `from:${c.from.address ? normalizeAddress(c.from.address) : c.from.address}`;
     return boundIdentityKeys.has(key);
   });
 

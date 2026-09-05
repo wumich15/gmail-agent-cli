@@ -40,7 +40,7 @@ The automation should be aggressive about obvious bulk mail and conservative abo
 | Package | Publish as `gmail-agent-cli`; expose the npm `bin` name `gmail` | The installable package can have an unambiguous name while the terminal command stays exactly `gmail` |
 | CLI | `commander` plus `@clack/prompts` and `picocolors` | Small, testable command surface with accessible interactive setup |
 | Google APIs | Official `googleapis` and `google-auth-library` packages | Supported Gmail/Calendar clients and OAuth refresh behavior |
-| AI | Official `openai` SDK, I'Responses API, Structured Outputs parsed with `zod` | A typed assessment is safer than free-form output or model-selected write tools |
+| AI | Official `openai` SDK, I'Responses API, Structured Outputs parsed with `zod` (maybe) | A typed assessment is safer than free-form output or model-selected write tools |
 | Default model | One centrally configured Structured-Outputs-capable model, initially `gpt-5.6-terra`; override with `GMAIL_AGENT_MODEL` | Avoid model names scattered through business logic and permit controlled upgrades after evaluation |
 | Persistence | Local SQLite through `better-sqlite3`, WAL mode, versioned migrations | Durable action ledger, idempotency, rules, and crash recovery without a server |
 | Secrets | An internal credential-store interface backed by macOS Keychain, Windows Credential Manager, or Linux Secret Service | OAuth refresh tokens and API keys must not live in config, SQLite, logs, or shell history |
@@ -80,7 +80,7 @@ On the first invocation only:
 2. Explain that selected email content may be sent to the configured AI provider, including the provider's retention caveat. Obtain explicit consent before enabling cloud classification.
 3. Complete Google installed-app OAuth in the system browser.
 4. Ask for the user's IANA timezone, defaulting to the detected system timezone.
-5. Store or obtain the AI API key without echoing it. Environment-variable use is supported for automation, but interactive setup stores it in the OS credential store.
+5. Store or obtain the AI API key without echoing it. //or maybe we could somehow find a way to run it without an API key Environment-variable use is supported for automation, but interactive setup stores it in the OS credential store. 
 6. Run a dry scan and show the proposed changes. On a normal first run, ask once whether to apply them. An explicit `--dry-run` never offers or applies changes.
 7. Record `automation_enabled=true` only after the user accepts a normal first-run preview. If they decline, keep automation disabled and ask again on the next normal run.
 

@@ -12,6 +12,7 @@ import { GMAIL_LABELS, hasUnattributedProtectionLabel, isInInbox, isNativeSpam, 
 import { findMatchingRuleGroups } from "../rules/matcher.js";
 import { evaluateMessagePolicy, POLICY_VERSION, type PolicyThresholds } from "./policy.js";
 import { buildRunSummary, type MessageOutcome, type RunSummary } from "../summary/build-summary.js";
+import { validateEventCandidate, type ValidatedEvent } from "../calendar/event-policy.js";
 import type { RuleGroup } from "./models.js";
 import type { Clock } from "./clock.js";
 
@@ -20,6 +21,7 @@ export interface OrchestratorDeps {
   classifier: Classifier;
   ruleGroups: readonly RuleGroup[];
   userEmail: string;
+  userTimezone: string;
   clock: Clock;
   concurrency: { gmailReads: number };
   policyThresholds?: PolicyThresholds;
@@ -121,7 +123,7 @@ async function processMessage(
   const assessment = assessmentResult?.ok ? assessmentResult.assessment : null;
   const assessmentUnavailable = !bypassed && assessmentResult !== null && !assessmentResult.ok;
 
-  const decision = evaluateMessagePolicy(
+  const rawDecision = evaluateMessagePolicy(
     {
       gmailMessageId: stub.id,
       isInInbox: isInInbox(labelIds),
@@ -139,6 +141,28 @@ async function processMessage(
     deps.policyThresholds
   );
 
+  // The policy only checks the event's confidence and intent — it never
+  // validates the date/time shape itself (that's real code's job, not
+  // something to trust from a model's output). Any calendar_create action
+  // must additionally pass validateEventCandidate before it survives;
+  // otherwise it's downgraded to a review item instead of a real Calendar
+  // API call with garbage dates.
+  let validatedEvent: ValidatedEvent | null = null;
+  const calendarAction = rawDecision.actions.find((a) => a.type === "calendar_create");
+  let decision = rawDecision;
+  if (calendarAction && calendarAction.type === "calendar_create") {
+    const validation = validateEventCandidate(calendarAction.event, deps.clock.now(), deps.userTimezone);
+    if (validation.ok) {
+      validatedEvent = validation.event;
+    } else {
+      decision = {
+        actions: rawDecision.actions.filter((a) => a.type !== "calendar_create"),
+        needsReview: true,
+        reviewReason: rawDecision.reviewReason ?? `event_validation_failed_${validation.reason}`
+      };
+    }
+  }
+
   return {
     gmailMessageId: stub.id,
     gmailThreadId: stub.threadId,
@@ -146,6 +170,8 @@ async function processMessage(
     senderForDisplay: normalized.from.displayName ?? normalized.from.address ?? "unknown sender",
     decision,
     bypassReason: explicitRule?.action === "spam" ? "explicit_spam_rule" : nativeSpam ? "native_spam" : explicitRule?.action === "important" ? "explicit_important_rule" : null,
-    labelIdsAtSnapshot: labelIds
+    labelIdsAtSnapshot: labelIds,
+    validatedEvent,
+    classifierVersion: assessment?.classifierVersion ?? null
   };
 }

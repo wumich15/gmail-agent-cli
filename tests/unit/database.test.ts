@@ -1,5 +1,5 @@
 import { describe, expect, it, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, chmodSync, closeSync, openSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDatabase } from "../../src/state/database.js";
@@ -31,6 +31,14 @@ describe("openDatabase", () => {
     expect(tables).toContain("rule_groups");
     expect(tables).toContain("actions");
     db2.close();
+  });
+
+  it("refuses a pre-existing file that is group/world-readable", () => {
+    if (process.platform === "win32") return; // POSIX-only permission model.
+    const path = freshDbPath();
+    closeSync(openSync(path, "w"));
+    chmodSync(path, 0o644); // world-readable
+    expect(() => openDatabase(path)).toThrow(/group\/world-accessible/);
   });
 
   it("round-trips an account record", () => {

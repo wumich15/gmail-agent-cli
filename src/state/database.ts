@@ -18,19 +18,23 @@ export function openDatabase(filePath: string): GmailAgentDatabase {
   }
 
   const isNewFile = !existsSync(filePath);
+
+  // Check the on-disk permissions of a pre-existing file BEFORE touching
+  // them — chmod'ing first would always "fix" the mode we're about to
+  // inspect, making the refusal below unreachable.
+  if (process.platform !== "win32" && !isNewFile) {
+    const mode = statSync(filePath).mode & 0o777;
+    if (mode & 0o077) {
+      throw new Error(
+        `Refusing to use ${filePath}: permissions ${mode.toString(8)} are group/world-accessible.`
+      );
+    }
+  }
+
   const db = new Database(filePath);
 
   if (process.platform !== "win32") {
     chmodSync(filePath, 0o600);
-    if (!isNewFile) {
-      const mode = statSync(filePath).mode & 0o777;
-      if (mode & 0o077) {
-        db.close();
-        throw new Error(
-          `Refusing to use ${filePath}: permissions ${mode.toString(8)} are group/world-accessible.`
-        );
-      }
-    }
   }
 
   db.pragma("journal_mode = WAL");
