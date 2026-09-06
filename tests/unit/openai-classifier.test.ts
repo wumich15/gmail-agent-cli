@@ -95,6 +95,10 @@ describe("OpenAiClassifier", () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.assessment.kind).toBe("suspicious");
+      // Extracted facts from a suspicious message are never trusted for
+      // either field, symmetrically — not just kind/category.
+      expect(result.assessment.event.intent).toBe("none");
+      expect(result.assessment.category).toBeNull();
     }
   });
 

@@ -264,6 +264,8 @@ Do not request `https://mail.google.com/`, Gmail settings scopes, Drive scopes, 
 
 Store refresh tokens in the OS credential store under a key namespaced by a non-reversible account hash. Keep short-lived access tokens in memory. `gmail auth logout` must revoke the grant when possible, erase local credentials, and retain or remove non-secret history only after asking the user.
 
+v1 supports exactly one signed-in account. A fresh sign-in as a different Google account must remove every other account's local row and stored credential rather than leaving a stale one behind — an ambiguous "which account is current" is exactly the kind of state a mutating command must never have to guess about.
+
 Request `access_type=offline`. If Google returns no refresh token, keep any previously stored refresh token; if none exists, repeat authorization with explicit consent instead of pretending login is durable. Give the loopback callback a short timeout, close the listener on success/error/interrupt, and validate state before exchanging the code. On `invalid_grant`, erase the unusable token, explain that reauthorization is required, and restart the installed-app flow once—never loop indefinitely.
 
 ## Gmail scan and normalization

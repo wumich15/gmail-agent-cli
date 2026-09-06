@@ -38,7 +38,9 @@ export interface MessageStub {
 }
 
 export interface ListMessagesParams {
-  labelIds: string[];
+  labelIds?: string[];
+  /** A Gmail search query, usable together with or instead of labelIds (e.g. `gmail add`'s category search). */
+  q?: string;
   includeSpamTrash: boolean;
   /** Stop paginating after this many results and report truncation, rather than looping forever. */
   safetyCapCount?: number;
@@ -71,7 +73,8 @@ export async function listAllMessageIds(
     const { data } = await withApiRetry(() =>
       client.users.messages.list({
         userId: "me",
-        labelIds: params.labelIds,
+        ...(params.labelIds !== undefined ? { labelIds: params.labelIds } : {}),
+        ...(params.q !== undefined ? { q: params.q } : {}),
         includeSpamTrash: params.includeSpamTrash,
         maxResults: 500,
         ...(pageToken !== undefined ? { pageToken } : {})
@@ -175,6 +178,11 @@ export async function listHistorySince(
   let latestHistoryId = startHistoryId;
 
   const record = (id: string | null | undefined, threadId: string | null | undefined): void => {
+    // The `threadId ?? id` fallback only matters transiently: it seeds the
+    // MessageStub used to fetch the message, and orchestrator.ts's
+    // fetchAndNormalize always re-derives the real threadId from that
+    // fetch response afterward, so a wrong guess here never survives past
+    // the fetch that immediately follows.
     if (id) changedMessages.set(id, threadId ?? id);
   };
 

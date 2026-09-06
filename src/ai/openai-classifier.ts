@@ -58,7 +58,13 @@ export class OpenAiClassifier implements Classifier {
       options.client ??
       new OpenAI({
         ...(options.apiKey !== undefined ? { apiKey: options.apiKey } : {}),
-        ...(options.baseURL !== undefined ? { baseURL: options.baseURL } : {})
+        ...(options.baseURL !== undefined ? { baseURL: options.baseURL } : {}),
+        // The SDK's own default retry (maxRetries: 2) would otherwise stack
+        // with withApiRetry's outer retry loop below — up to 3x as many
+        // real HTTP attempts, each on its own independently-scheduled
+        // backoff, as the "3 attempts" this code documents and relies on
+        // for a bounded worst-case latency per message.
+        maxRetries: 0
       });
     this.model = options.model;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -140,29 +146,35 @@ function mapFlagsToAssessment(flags: EmailFlags, message: NormalizedMessage, mod
     importanceConfidence: flags.important ? HIGH_CONFIDENCE : LOW_CONFIDENCE,
     summary: buildDeterministicSummary(message),
     reasonCodes: [],
-    event: flags.hasEvent
-      ? {
-          intent: "create",
-          confidence: HIGH_CONFIDENCE,
-          title: flags.eventTitle,
-          start: flags.eventStart,
-          end: flags.eventEnd,
-          allDay: flags.eventAllDay,
-          timeZone: null,
-          location: null,
-          sourceEvidence: null
-        }
-      : {
-          intent: "none",
-          confidence: LOW_CONFIDENCE,
-          title: null,
-          start: null,
-          end: null,
-          allDay: false,
-          timeZone: null,
-          location: null,
-          sourceEvidence: null
-        },
+    // A suspicious message's extracted facts are never trusted for either
+    // field — policy.ts's isUnresolvedKind gate already makes this safe
+    // today (no star/event/label ever fires for a suspicious kind), but
+    // enforcing it symmetrically here too means that invariant doesn't
+    // depend entirely on a single downstream gate staying correct forever.
+    event:
+      flags.hasEvent && !flags.suspicious
+        ? {
+            intent: "create",
+            confidence: HIGH_CONFIDENCE,
+            title: flags.eventTitle,
+            start: flags.eventStart,
+            end: flags.eventEnd,
+            allDay: flags.eventAllDay,
+            timeZone: null,
+            location: null,
+            sourceEvidence: null
+          }
+        : {
+            intent: "none",
+            confidence: LOW_CONFIDENCE,
+            title: null,
+            start: null,
+            end: null,
+            allDay: false,
+            timeZone: null,
+            location: null,
+            sourceEvidence: null
+          },
     category: flags.suspicious ? null : normalizeCategoryLabel(flags.category),
     classifierVersion: `openai:${model}`,
     promptVersion: PROMPT_VERSION,

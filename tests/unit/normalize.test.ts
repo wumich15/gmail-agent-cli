@@ -27,6 +27,15 @@ describe("parseEmailAddress", () => {
   it("returns null for null input", () => {
     expect(parseEmailAddress(null)).toBeNull();
   });
+
+  it("does not fall through to the bare-address branch when the display name contains a newline", () => {
+    // Regression: "." in the angle-bracket regex never matches a
+    // newline, so a value with an embedded literal newline before the
+    // address used to skip the angle-bracket branch entirely and treat
+    // the whole raw (bracket-and-all) string as a bare address.
+    const result = parseEmailAddress('"Alice\nExample" <alice@example.com>');
+    expect(result?.address).toBe("alice@example.com");
+  });
 });
 
 describe("parseEmailAddressList", () => {
@@ -66,12 +75,37 @@ describe("htmlToBoundedPlainText", () => {
     expect(text).not.toContain("old content");
     expect(text).toContain("Hi there");
   });
+
+  it("strips an unclosed <script> tag through the rest of the content instead of leaving it raw", () => {
+    const { text } = htmlToBoundedPlainText("<p>Hello</p><script>doEvilThing(); no closing tag here");
+    expect(text).not.toContain("doEvilThing");
+    expect(text).toContain("Hello");
+  });
+
+  it("strips an unclosed <style> tag through the rest of the content instead of leaving it raw", () => {
+    const { text } = htmlToBoundedPlainText("<p>Hello</p><style>.a{color:red} no closing tag here");
+    expect(text).not.toContain("color:red");
+    expect(text).toContain("Hello");
+  });
 });
 
 describe("headerMapFromList", () => {
   it("is case-insensitive on header names", () => {
     const map = headerMapFromList([{ name: "subject", value: "Hello" }]);
     expect(map.subject).toBe("Hello");
+  });
+
+  it("keeps the FIRST occurrence of a duplicated header, not the last", () => {
+    // A message can carry multiple copies of a header (most notably
+    // Authentication-Results, added by each hop) — Gmail preserves
+    // physical order, which places the receiving server's own header
+    // first. Security-relevant matching should use a defined,
+    // deliberate choice, not "whichever happened to be listed last."
+    const map = headerMapFromList([
+      { name: "Authentication-Results", value: "dkim=pass header.i=@trusted.example" },
+      { name: "Authentication-Results", value: "dkim=fail header.i=@attacker.example" }
+    ]);
+    expect(map.authenticationResults).toBe("dkim=pass header.i=@trusted.example");
   });
 });
 
@@ -96,6 +130,28 @@ describe("buildNormalizedMessage", () => {
     const a = buildNormalizedMessage(base);
     const b = buildNormalizedMessage({ ...base });
     expect(a.contentHash).toBe(b.contentHash);
+  });
+
+  it("keeps the same content hash when only labelIds differ (a star/archive/read-state change is not a content change)", () => {
+    const base = {
+      gmailMessageId: "m1",
+      gmailThreadId: "t1",
+      historyId: "1",
+      internalDate: "1000",
+      labelIds: ["INBOX", "UNREAD"],
+      snippet: "snip",
+      headers: headerMapFromList([
+        { name: "From", value: "alice@example.com" },
+        { name: "Subject", value: "Hi" }
+      ]),
+      htmlBody: null,
+      plainBody: "hello world",
+      userEmail: "me@example.com",
+      threadHasUserSentMessage: false
+    };
+    const unread = buildNormalizedMessage(base);
+    const read = buildNormalizedMessage({ ...base, labelIds: ["INBOX"] });
+    expect(unread.contentHash).toBe(read.contentHash);
   });
 
   it("marks isFromUser when the sender matches the account email", () => {

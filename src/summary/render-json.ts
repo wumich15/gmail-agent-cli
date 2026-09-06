@@ -26,11 +26,13 @@ export interface JsonSummaryOutput {
 
 /** One stable JSON object to stdout. Never includes message bodies, tokens, or unsubscribe URLs. */
 export function renderJsonSummary(summary: RunSummary, options: { dryRun: boolean }): JsonSummaryOutput {
-  const totalTrashed = Object.values(summary.trashedByReason).reduce((a, b) => a + b, 0);
   return {
     dryRun: options.dryRun,
     inboxCountBefore: summary.inboxCountBefore,
-    inboxCountAfter: summary.inboxCountBefore - totalTrashed - summary.archivedCount,
+    // Only messages that actually carried INBOX at snapshot time count
+    // against the Inbox total — native-Spam trashes were never part of
+    // inboxCountBefore, so subtracting every trash here would overcount.
+    inboxCountAfter: summary.inboxCountBefore - summary.inboxTrashedCount - summary.archivedCount,
     trashedByReason: summary.trashedByReason,
     trashed: summary.trashed,
     archivedCount: summary.archivedCount,

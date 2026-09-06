@@ -6,6 +6,7 @@ import { openDatabase } from "../../src/state/database.js";
 import { AccountsRepository } from "../../src/state/repositories/accounts.js";
 import { RuleGroupsRepository } from "../../src/state/repositories/rule-groups.js";
 import { MessagesRepository } from "../../src/state/repositories/messages.js";
+import { LabelCandidatesRepository } from "../../src/state/repositories/label-candidates.js";
 
 let dir: string;
 
@@ -176,6 +177,47 @@ describe("openDatabase", () => {
     repo.upsert({ ...base, contentHash: "hash-2", processedAt: "t1" });
     expect(repo.countForAccount("abc")).toBe(1);
     expect(repo.get("abc", "m1")?.contentHash).toBe("hash-2");
+    db.close();
+  });
+
+  it("accumulates a label candidate's pending count across upserts and lists it back", () => {
+    const db = openDatabase(freshDbPath());
+    new AccountsRepository(db).upsert({
+      accountHash: "abc",
+      emailDisplay: null,
+      timezone: "UTC",
+      historyMarker: null,
+      setupComplete: true,
+      automationEnabled: false,
+      createdAt: "now",
+      updatedAt: "now"
+    });
+    const repo = new LabelCandidatesRepository(db);
+    repo.upsert({ accountHash: "abc", normalizedName: "shopping", displayName: "Shopping", pendingCount: 3, updatedAt: "t0" });
+    repo.upsert({ accountHash: "abc", normalizedName: "shopping", displayName: "Shopping", pendingCount: 7, updatedAt: "t1" });
+    const rows = repo.listForAccount("abc");
+    expect(rows).toEqual([
+      { accountHash: "abc", normalizedName: "shopping", displayName: "Shopping", pendingCount: 7, updatedAt: "t1" }
+    ]);
+    db.close();
+  });
+
+  it("removes a label candidate once cleared (the label was actually created)", () => {
+    const db = openDatabase(freshDbPath());
+    new AccountsRepository(db).upsert({
+      accountHash: "abc",
+      emailDisplay: null,
+      timezone: "UTC",
+      historyMarker: null,
+      setupComplete: true,
+      automationEnabled: false,
+      createdAt: "now",
+      updatedAt: "now"
+    });
+    const repo = new LabelCandidatesRepository(db);
+    repo.upsert({ accountHash: "abc", normalizedName: "shopping", displayName: "Shopping", pendingCount: 10, updatedAt: "now" });
+    repo.clear("abc", "shopping");
+    expect(repo.listForAccount("abc")).toEqual([]);
     db.close();
   });
 });

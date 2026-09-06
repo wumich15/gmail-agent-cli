@@ -109,11 +109,14 @@ export async function insertIdempotentEvent(
     if (existingProvenance === plan.provenance.payloadHash) {
       return { kind: "already_applied_by_this_app", event: existing };
     }
-    if (existing.extendedProperties?.private?.["createdBy"] === CALENDAR_PROVENANCE_APP_ID) {
-      // Same app, different payload for the same message/candidate slot: treat
-      // as already applied under different content rather than a foreign collision.
-      return { kind: "already_applied_by_this_app", event: existing };
-    }
+    // Matching payload hash is the ONLY case that means "this exact
+    // attempt already succeeded." Same app, different payload (e.g. the
+    // message got reclassified with a corrected date, so the candidate at
+    // this same message/candidate slot changed) is exactly the case this
+    // function's own contract calls a collision requiring review — a
+    // prior version of this code treated same-createdBy specially and
+    // silently kept serving the stale first event, with no review flag
+    // ever surfaced, whenever content changed between runs.
     return { kind: "collision", existing };
   }
 }

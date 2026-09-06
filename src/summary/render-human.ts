@@ -13,7 +13,12 @@ export function renderHumanSummary(
 ): string {
   const lines: string[] = [];
   const totalTrashed = Object.values(summary.trashedByReason).reduce((a, b) => a + b, 0);
-  const inboxAfter = summary.inboxCountBefore - totalTrashed - summary.archivedCount;
+  // Only trashed messages that actually carried INBOX count against the
+  // Inbox total — native-Spam trashes (the majority of `totalTrashed` on
+  // a typical run) were never part of inboxCountBefore to begin with, so
+  // subtracting the full trash count here would overcount how much the
+  // Inbox actually shrank.
+  const inboxAfter = summary.inboxCountBefore - summary.inboxTrashedCount - summary.archivedCount;
 
   lines.push(pc.bold(options.dryRun ? "Dry run — no changes were made" : "Run complete"));
   lines.push("");

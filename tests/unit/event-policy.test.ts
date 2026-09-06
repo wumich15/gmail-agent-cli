@@ -71,7 +71,61 @@ describe("validateEventCandidate", () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.event.allDay).toBe(true);
+      expect(result.event.startIso).toBe("2099-06-01");
+      // Exclusive end date, one day after the (only) day of the event.
+      expect(result.event.endIso).toBe("2099-06-02");
     }
+  });
+
+  it("stores a multi-day all-day event with the correct exclusive end date, not one day short", () => {
+    // Regression: an explicit end date used to be stored verbatim instead
+    // of bumped to Google Calendar's required exclusive-end convention,
+    // silently dropping the event's last day.
+    const result = validateEventCandidate(
+      candidate({ allDay: true, start: "2099-06-12", end: "2099-06-14" }),
+      NOW,
+      "UTC"
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.event.startIso).toBe("2099-06-12");
+      expect(result.event.endIso).toBe("2099-06-15");
+    }
+  });
+
+  it("accepts a same-day all-day event (start === end) instead of rejecting it as non-positive duration", () => {
+    // Regression: start and end both parsed to midnight of the same day,
+    // making `end <= start` true and rejecting a perfectly ordinary
+    // single-day event expressed with an explicit (equal) end date.
+    const result = validateEventCandidate(
+      candidate({ allDay: true, start: "2099-06-01", end: "2099-06-01" }),
+      NOW,
+      "UTC"
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.event.startIso).toBe("2099-06-01");
+      expect(result.event.endIso).toBe("2099-06-02");
+    }
+  });
+
+  it("accepts an all-day event dated today instead of rejecting it as a past event", () => {
+    // Regression: an all-day candidate parses to midnight of its date,
+    // which is always earlier than the current instant "now" later that
+    // same day, so every same-day deadline was unconditionally rejected.
+    const today = "2099-06-15";
+    const nowLaterThatDay = new Date("2099-06-15T18:30:00Z");
+    const result = validateEventCandidate(candidate({ allDay: true, start: today, end: null }), nowLaterThatDay, "UTC");
+    expect(result.ok).toBe(true);
+  });
+
+  it("still rejects an all-day event dated yesterday as a past event", () => {
+    const result = validateEventCandidate(
+      candidate({ allDay: true, start: "2099-06-14", end: null }),
+      new Date("2099-06-15T00:00:01Z"),
+      "UTC"
+    );
+    expect(result).toEqual({ ok: false, reason: "past_event" });
   });
 });
 

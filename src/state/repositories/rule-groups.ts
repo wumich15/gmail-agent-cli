@@ -114,8 +114,11 @@ export class RuleGroupsRepository {
     transaction();
   }
 
-  remove(id: string): boolean {
-    const result = this.db.prepare("DELETE FROM rule_groups WHERE id = ?").run(id);
+  /** Scoped to `accountHash` so a rule group can never be deleted on behalf of a different account than the one currently resolved. */
+  remove(accountHash: string, id: string): boolean {
+    const result = this.db
+      .prepare("DELETE FROM rule_groups WHERE id = ? AND account_hash = ?")
+      .run(id, accountHash);
     return result.changes > 0;
   }
 

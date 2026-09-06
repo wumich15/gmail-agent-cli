@@ -18,7 +18,13 @@ export interface ResolvedAccount {
 
 /** v1 supports one signed-in account; resolves it and builds authenticated API clients. */
 export async function resolveAccount(ctx: CliContext): Promise<ResolvedAccount> {
-  const rows = ctx.db.prepare("SELECT account_hash FROM accounts LIMIT 1").all() as {
+  // v1 supports exactly one signed-in account, and authLogin removes any
+  // other account row on a fresh sign-in — but ORDER BY here is defense
+  // in depth against that invariant ever being violated (e.g. a crash
+  // mid-login): without it, a bare `LIMIT 1` has no defined ordering and
+  // could resolve to a stale row instead of the one the user most
+  // recently actually authenticated as.
+  const rows = ctx.db.prepare("SELECT account_hash FROM accounts ORDER BY updated_at DESC LIMIT 1").all() as {
     account_hash: string;
   }[];
   const row = rows[0];

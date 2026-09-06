@@ -1,0 +1,78 @@
+import type { GmailAgentDatabase } from "../database.js";
+
+/**
+ * Tracks how many messages (cumulatively, across runs) have proposed a
+ * given AI-guessed topical category that hasn't cleared the
+ * MIN_LABEL_BATCH_SIZE threshold yet (see core/orchestrator.ts). Without
+ * this, incremental Gmail history sync means a normal run only ever sees
+ * a handful of changed messages, so a brand-new category could almost
+ * never accumulate enough occurrences in a single run to actually get
+ * created — this table lets those occurrences accumulate across runs
+ * instead. A row is deleted once the category crosses the threshold and
+ * the label is actually created (see custom-labels.ts): from then on the
+ * label already exists, so `existingLabels` context alone is enough to
+ * keep applying it, with no further counting needed.
+ */
+export interface LabelCandidateRecord {
+  accountHash: string;
+  normalizedName: string;
+  displayName: string;
+  pendingCount: number;
+  updatedAt: string;
+}
+
+interface LabelCandidateRow {
+  account_hash: string;
+  normalized_name: string;
+  display_name: string;
+  pending_count: number;
+  updated_at: string;
+}
+
+function fromRow(row: LabelCandidateRow): LabelCandidateRecord {
+  return {
+    accountHash: row.account_hash,
+    normalizedName: row.normalized_name,
+    displayName: row.display_name,
+    pendingCount: row.pending_count,
+    updatedAt: row.updated_at
+  };
+}
+
+export class LabelCandidatesRepository {
+  constructor(private readonly db: GmailAgentDatabase) {}
+
+  listForAccount(accountHash: string): LabelCandidateRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM label_candidates WHERE account_hash = ?")
+      .all(accountHash) as LabelCandidateRow[];
+    return rows.map(fromRow);
+  }
+
+  /** Overwrites the stored cumulative count/display name for one candidate (the caller already computed the new total). */
+  upsert(record: LabelCandidateRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO label_candidates (account_hash, normalized_name, display_name, pending_count, updated_at)
+         VALUES (@accountHash, @normalizedName, @displayName, @pendingCount, @updatedAt)
+         ON CONFLICT(account_hash, normalized_name) DO UPDATE SET
+           display_name = excluded.display_name,
+           pending_count = excluded.pending_count,
+           updated_at = excluded.updated_at`
+      )
+      .run({
+        accountHash: record.accountHash,
+        normalizedName: record.normalizedName,
+        displayName: record.displayName,
+        pendingCount: record.pendingCount,
+        updatedAt: record.updatedAt
+      });
+  }
+
+  /** Removes a candidate once it crosses the threshold and the label is actually created. */
+  clear(accountHash: string, normalizedName: string): void {
+    this.db
+      .prepare("DELETE FROM label_candidates WHERE account_hash = ? AND normalized_name = ?")
+      .run(accountHash, normalizedName);
+  }
+}

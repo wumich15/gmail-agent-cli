@@ -5,7 +5,8 @@
  * numeric `.status` and a fetch-like `.response.headers` with `.get()`.
  * Note: `.code` is *not* the HTTP status on either SDK — gaxios only sets
  * it for low-level network errors (e.g. `ECONNRESET`); the real status of
- * a response, including 404/409/429, lives on `.status`.
+ * a response, including 404/409/429, lives on `.status`. `.code` is used
+ * below only as the *network-error* retry signal, never as a status.
  */
 
 export function apiErrorStatus(error: unknown): number | undefined {
@@ -16,6 +17,31 @@ export function apiErrorStatus(error: unknown): number | undefined {
   return typeof status === "number" ? status : undefined;
 }
 
+/**
+ * Low-level connection failures below the HTTP layer entirely — no
+ * response, so no `.status` — which `isRetryableStatus` alone would never
+ * catch. These are exactly as transient as a 503, and the module's own
+ * doc comment already treats `.code` as the low-level-network-error
+ * signal, so it's used here (never as a stand-in for HTTP status).
+ */
+const RETRYABLE_NETWORK_ERROR_CODES = new Set([
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EPIPE"
+]);
+
+function isRetryableNetworkError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return false;
+  }
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && RETRYABLE_NETWORK_ERROR_CODES.has(code);
+}
+
+/** Parses RFC 7231 `Retry-After` in either its delta-seconds or HTTP-date form. */
 function retryAfterMs(error: unknown): number | null {
   const headers = (error as { response?: { headers?: unknown } } | undefined)?.response?.headers;
   if (!headers || typeof (headers as { get?: unknown }).get !== "function") {
@@ -24,7 +50,14 @@ function retryAfterMs(error: unknown): number | null {
   const raw = (headers as { get: (name: string) => string | null }).get("retry-after");
   if (!raw) return null;
   const seconds = Number(raw);
-  return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : null;
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return seconds * 1000;
+  }
+  const dateMs = Date.parse(raw);
+  if (Number.isFinite(dateMs)) {
+    return Math.max(0, dateMs - Date.now());
+  }
+  return null;
 }
 
 function isRetryableStatus(status: number | undefined): boolean {
@@ -64,7 +97,7 @@ export async function withApiRetry<T>(fn: () => Promise<T>, options: RetryOption
     } catch (error) {
       attempt += 1;
       const status = apiErrorStatus(error);
-      if (!isRetryableStatus(status) || attempt >= maxAttempts) {
+      if ((!isRetryableStatus(status) && !isRetryableNetworkError(error)) || attempt >= maxAttempts) {
         throw error;
       }
       const exponential = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);

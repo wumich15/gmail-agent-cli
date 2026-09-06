@@ -32,7 +32,12 @@ export function buildDeveloperInstructions(existingLabels: readonly string[]): s
   if (existingLabels.length === 0) {
     return BASE_DEVELOPER_INSTRUCTIONS;
   }
-  return `${BASE_DEVELOPER_INSTRUCTIONS}\n\nExisting labels you can reuse if they fit (exact spelling, case-insensitive): ${existingLabels.join(", ")}.`;
+  // Quoted and comma-separated: a bare comma-joined list would be
+  // ambiguous for a label name that itself contains a comma (Gmail
+  // permits this), e.g. "Family, Kids" reading identically to two
+  // separate labels "Family" and "Kids".
+  const quoted = existingLabels.map((name) => `"${name}"`).join(", ");
+  return `${BASE_DEVELOPER_INSTRUCTIONS}\n\nExisting labels you can reuse if they fit (exact spelling, case-insensitive): ${quoted}.`;
 }
 
 const MAX_CATEGORY_LABEL_CHARS = 30;

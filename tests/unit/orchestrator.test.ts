@@ -315,8 +315,107 @@ describe("runWorkScan", () => {
         schemaVersion: "test"
       }
     });
-    const { outcomes } = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
+    const { outcomes, labelCandidateUpdates } = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
     expect(outcomes.every((o) => !o.decision.actions.some((a) => a.type === "label"))).toBe(true);
+    // The 9 pending occurrences must be reported back so the caller can
+    // persist them and let a later run's occurrences accumulate on top.
+    expect(labelCandidateUpdates).toContainEqual({
+      normalizedName: "shopping",
+      displayName: "Shopping",
+      newCumulativeCount: 9,
+      applied: false
+    });
+  });
+
+  it("applies a category label immediately, with no threshold at all, when it already matches an existing Gmail label", async () => {
+    // A label that already exists isn't a fuzzy one-off guess anymore —
+    // applying it to more mail is just correctly reusing it, so a single
+    // message is enough once the account already has this label.
+    const client = fakeClient([
+      {
+        id: "m1",
+        threadId: "t1",
+        labelIds: ["INBOX", "UNREAD"],
+        headers: [{ name: "From", value: "person@example.com" }]
+      }
+    ]);
+    const classifier = new FixedClassifier({
+      ok: true,
+      assessment: {
+        kind: "personal_routine",
+        confidence: 0,
+        importanceScore: 0,
+        importanceConfidence: 0,
+        summary: "test",
+        reasonCodes: [],
+        event: {
+          intent: "none",
+          confidence: 0,
+          title: null,
+          start: null,
+          end: null,
+          allDay: false,
+          timeZone: null,
+          location: null,
+          sourceEvidence: null
+        },
+        category: "shopping", // different casing than the existing label
+        classifierVersion: "test",
+        promptVersion: "test",
+        schemaVersion: "test"
+      }
+    });
+    const { outcomes } = await runWorkScan(
+      baseDeps({ gmailClient: client, classifier, existingLabels: ["Shopping"] })
+    );
+    expect(outcomes[0]!.decision.actions.some((a) => a.type === "label")).toBe(true);
+  });
+
+  it("applies a category label once cumulative count (prior runs + this run) crosses the threshold, even though this run alone is under 10", async () => {
+    const messages: FakeMessage[] = Array.from({ length: 3 }, (_, i) => ({
+      id: `m-${i}`,
+      threadId: `t-${i}`,
+      labelIds: ["INBOX", "UNREAD"],
+      headers: [{ name: "From", value: `person${i}@example.com` }]
+    }));
+    const client = fakeClient(messages);
+    const classifier = new FixedClassifier({
+      ok: true,
+      assessment: {
+        kind: "personal_routine",
+        confidence: 0,
+        importanceScore: 0,
+        importanceConfidence: 0,
+        summary: "test",
+        reasonCodes: [],
+        event: {
+          intent: "none",
+          confidence: 0,
+          title: null,
+          start: null,
+          end: null,
+          allDay: false,
+          timeZone: null,
+          location: null,
+          sourceEvidence: null
+        },
+        category: "Receipts",
+        classifierVersion: "test",
+        promptVersion: "test",
+        schemaVersion: "test"
+      }
+    });
+    const priorLabelCandidateCounts = new Map([["receipts", { displayName: "Receipts", count: 8 }]]);
+    const { outcomes, labelCandidateUpdates } = await runWorkScan(
+      baseDeps({ gmailClient: client, classifier, priorLabelCandidateCounts })
+    );
+    expect(outcomes.every((o) => o.decision.actions.some((a) => a.type === "label"))).toBe(true);
+    expect(labelCandidateUpdates).toContainEqual({
+      normalizedName: "receipts",
+      displayName: "Receipts",
+      newCumulativeCount: 11,
+      applied: true
+    });
   });
 
   it("applies a category label once 10+ messages agree, normalizing case-insensitive spelling variants to one name", async () => {
@@ -365,6 +464,49 @@ describe("runWorkScan", () => {
     expect(labelActions).toHaveLength(10);
     // Every survivor uses the exact same display name, not a mix of casings.
     expect(new Set(labelActions.map((a) => (a as { labelName: string }).labelName)).size).toBe(1);
+  });
+
+  it("uses the freshly-fetched threadId as authoritative, not the history record's placeholder", async () => {
+    // Regression: fetchAndNormalize used to trust the caller-supplied
+    // stub's threadId unconditionally instead of the real fetch response,
+    // even though the incremental-scan path builds that stub from a
+    // history record (a placeholder, not a real messages.list/get result).
+    const client: GmailClient = {
+      users: {
+        getProfile: async () => ({ data: { emailAddress: "me@example.com", historyId: "200" } }),
+        history: {
+          list: async () => ({
+            data: {
+              // Wrong/placeholder threadId in the history record itself.
+              history: [{ id: "150", labelsAdded: [{ message: { id: "m1", threadId: "wrong-thread" } }] }],
+              historyId: "200"
+            }
+          })
+        },
+        labels: { get: async () => ({ data: { messagesTotal: 1 } }) },
+        messages: {
+          list: async () => ({ data: { messages: [] } }),
+          get: async () => ({
+            data: {
+              id: "m1",
+              threadId: "correct-thread", // the real, authoritative value
+              historyId: "150",
+              internalDate: "5000",
+              labelIds: ["INBOX", "UNREAD"],
+              snippet: "",
+              payload: { headers: [{ name: "From", value: "person@example.com" }] }
+            }
+          })
+        }
+      }
+    } as unknown as GmailClient;
+
+    const classifier = new FixedClassifier({
+      ok: false,
+      unavailable: { reason: "not_configured", detail: null }
+    });
+    const { outcomes } = await runWorkScan(baseDeps({ gmailClient: client, classifier, historyMarker: "100" }));
+    expect(outcomes[0]!.gmailThreadId).toBe("correct-thread");
   });
 
   it("runs an incremental scan when a valid historyMarker is given, never listing the whole Inbox/Spam", async () => {

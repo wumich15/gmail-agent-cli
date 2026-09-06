@@ -31,7 +31,7 @@ export function validateUnsubscribeUrl(rawUrl: string): UrlValidationResult {
   return { ok: true, url };
 }
 
-/** IPv4/IPv6 loopback, private, link-local, multicast, and reserved ranges. */
+/** IPv4/IPv6 loopback, private, link-local, shared-address-space (CGNAT), multicast, and reserved ranges. */
 export function isPrivateOrReservedIp(address: string): boolean {
   if (isIPv4(address)) {
     const octets = address.split(".").map(Number);
@@ -41,6 +41,7 @@ export function isPrivateOrReservedIp(address: string): boolean {
     if (a === 172 && b >= 16 && b <= 31) return true; // private
     if (a === 192 && b === 168) return true; // private
     if (a === 169 && b === 254) return true; // link-local
+    if (a === 100 && b >= 64 && b <= 127) return true; // RFC 6598 shared address space (CGNAT)
     if (a === 0) return true; // "this network"
     if (a >= 224) return true; // multicast + reserved (224-255)
     return false;

@@ -25,6 +25,7 @@ import {
   trashMessage
 } from "../gmail/executor.js";
 import { getOrCreateLabelId, listUserLabels } from "../gmail/custom-labels.js";
+import { LabelCandidatesRepository } from "../state/repositories/label-candidates.js";
 import { buildEventInsertPlan, insertIdempotentEvent } from "../calendar/idempotency.js";
 import { withApiRetry } from "../core/api-retry.js";
 import { contentHash } from "../core/ids.js";
@@ -85,7 +86,21 @@ export async function runWork(options: WorkOptions): Promise<number> {
     const existingLabels = await listUserLabels(gmailClient);
     const labelIdByName = new Map(existingLabels.map((l) => [l.name.trim().toLowerCase(), l.id]));
 
-    const { summary, outcomes, scanNote, newHistoryMarker, usedIncrementalSync } = await runWorkScan({
+    const labelCandidatesRepo = new LabelCandidatesRepository(ctx.db);
+    const priorLabelCandidateCounts = new Map(
+      labelCandidatesRepo
+        .listForAccount(account.accountHash)
+        .map((c) => [c.normalizedName, { displayName: c.displayName, count: c.pendingCount }] as const)
+    );
+
+    const {
+      summary,
+      outcomes,
+      scanNote,
+      newHistoryMarker,
+      usedIncrementalSync,
+      labelCandidateUpdates
+    } = await runWorkScan({
       gmailClient,
       classifier,
       ruleGroups,
@@ -94,6 +109,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
       clock: ctx.clock,
       concurrency: { gmailReads: 5, aiCalls: ctx.config?.concurrency.aiCalls ?? 5 },
       existingLabels: existingLabels.map((l) => l.name),
+      priorLabelCandidateCounts,
       // Incremental sync against Gmail's history API is the main lever for
       // staying under Gmail's API quota on repeat runs — see
       // CLAUDE.md's "Incremental synchronization". Passing null/omitting
@@ -339,6 +355,26 @@ export async function runWork(options: WorkOptions): Promise<number> {
       // the ledger for later reconciliation regardless of this — advancing
       // history only changes which messages a *future* scan looks at.
       new AccountsRepository(ctx.db).updateHistoryMarker(account.accountHash, newHistoryMarker, finishedAt);
+
+      // Persist each category's updated cumulative count: cleared once it
+      // actually crossed the threshold and got applied this run (from then
+      // on the label exists, so `existingLabels` alone keeps applying it —
+      // see applyLabelBatchThreshold), otherwise the new running total so
+      // occurrences keep accumulating across incremental-sync runs instead
+      // of resetting every time.
+      for (const update of labelCandidateUpdates) {
+        if (update.applied) {
+          labelCandidatesRepo.clear(account.accountHash, update.normalizedName);
+        } else {
+          labelCandidatesRepo.upsert({
+            accountHash: account.accountHash,
+            normalizedName: update.normalizedName,
+            displayName: update.displayName,
+            pendingCount: update.newCumulativeCount,
+            updatedAt: finishedAt
+          });
+        }
+      }
     }
 
     const finalSummary = { ...summary, failureCount, scanNote };

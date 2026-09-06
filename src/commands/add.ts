@@ -1,7 +1,7 @@
 import pc from "picocolors";
 import { runSpam } from "./spam.js";
 import { runImportant } from "./important.js";
-import { AuthRequiredError, EXIT_CODES } from "../core/errors.js";
+import { AuthRequiredError, GmailAgentError, EXIT_CODES } from "../core/errors.js";
 
 export interface AddOptions {
   yes: boolean;
@@ -65,6 +65,16 @@ async function runOne(type: RuleType, category: string | undefined, options: Add
     if (error instanceof AuthRequiredError) {
       console.error(pc.red("No account is signed in yet. Run `gmail` once first to sign in."));
       return EXIT_CODES.invalidOrAuthRequired;
+    }
+    // Any other *expected* failure mode this app raises as a typed error
+    // (a rule conflict, a safety-blocked confirmation, etc.) must not
+    // abort the whole multi-category loop above it — only a truly
+    // unexpected exception (not one of this app's own typed errors)
+    // should stop everything, since that's a bug rather than an expected
+    // per-category outcome.
+    if (error instanceof GmailAgentError) {
+      console.error(pc.red(error.message));
+      return error.exitCode;
     }
     throw error;
   }

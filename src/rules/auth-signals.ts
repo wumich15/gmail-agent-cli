@@ -53,12 +53,20 @@ export function selectAuthBindingDomain(
   const entries = parseAuthenticationResults(headerValue);
   const passing = entries.filter((e) => e.result === "pass" && e.domain !== null);
 
-  const dkim = passing.find((e) => e.mechanism === "dkim");
+  // "Aligned" means the passing signature's own domain actually matches
+  // the sender's address domain — not just any passing signature found
+  // anywhere in the header. A message can carry a passing DKIM signature
+  // for an unrelated domain (e.g. a shared ESP that DKIM-signs as its own
+  // domain rather than the customer's), and accepting that as "aligned"
+  // would let anyone else who also sends through that same ESP forge the
+  // sender address and still pass this check — exactly the impersonation
+  // this binding exists to prevent.
+  const dkim = passing.find((e) => e.mechanism === "dkim" && e.domain === senderAddressDomain);
   if (dkim?.domain) {
     return { mechanism: "dkim", domain: dkim.domain };
   }
-  const dmarc = passing.find((e) => e.mechanism === "dmarc");
-  if (dmarc?.domain && dmarc.domain === senderAddressDomain) {
+  const dmarc = passing.find((e) => e.mechanism === "dmarc" && e.domain === senderAddressDomain);
+  if (dmarc?.domain) {
     return { mechanism: "dmarc", domain: dmarc.domain };
   }
   return null;

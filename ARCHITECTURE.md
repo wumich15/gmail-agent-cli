@@ -372,14 +372,27 @@ check as star/important/event — so it's never proposed for a
 trash-eligible or suspicious/unknown message. This is only a *candidate*:
 `core/orchestrator.ts`'s `applyLabelBatchThreshold`, run once after every
 message in the scan has been classified, groups these by
-case-insensitive `labelName`, normalizes each surviving group to one
-exact display name (first-seen casing), and drops any label action whose
-group has fewer than `MIN_LABEL_BATCH_SIZE` (10) messages — a lone AI
-guess never reaches Gmail. A message that gets a validated Calendar event
-separately, unconditionally gets a `calendar_label:Calendar` label action
-and an `archive` action added directly in `finalizeOutcome` (not subject
-to the batch-size check, since it's a deterministic 1:1 consequence of a
-real event, not a guess).
+case-insensitive `labelName` and lets a group through when either (a) its
+name already matches one of the account's `existingLabels` — a label that
+already exists needs no threshold, applying it to more mail is just
+correctly reusing it, not creating clutter — or (b) its *cumulative*
+count (this run's occurrences plus whatever was already accumulated from
+earlier runs, tracked in the `label_candidates` table via
+`LabelCandidatesRepository`) reaches `MIN_LABEL_BATCH_SIZE` (10). Every
+surviving group is normalized to one exact display name. `work.ts`
+persists each run's updated counts afterward (cleared once a category
+crosses the threshold and gets applied — from then on `existingLabels`
+alone keeps applying it). **Fixed bug:** an earlier version only counted
+occurrences within a single run, with no cross-run accumulation — since
+an incremental scan (the common case after the first run) typically only
+reconciles a handful of changed messages at a time, a brand-new category
+could almost never reach 10 in any single run, silently disabling new
+topical labels entirely once an account moved past its first full scan.
+A message that gets a validated Calendar event separately,
+unconditionally gets a `calendar_label:Calendar` label action and an
+`archive` action added directly in `finalizeOutcome` (not subject to the
+batch-size check, since it's a deterministic 1:1 consequence of a real
+event, not a guess).
 
 `gmail/custom-labels.ts` is the only place that talks to Gmail's label
 API: `listUserLabels` (filtered to `type: "user"`, read-only, safe in
@@ -470,16 +483,132 @@ whenever they're back in scope. `runWork` (`commands/work.ts`) already
 calls into `commands/auth.ts`'s `authLogin` directly for the inline
 sign-in flow, so that logic isn't duplicated.
 
+## Bug-fix pass (full-codebase review)
+
+A full-codebase bug-hunt review surfaced and fixed the following, each
+covered by new regression tests:
+
+- **`ProcessLock` TOCTOU race** (`src/core/lock.ts`): `acquire()` used to
+  `existsSync` then separately `writeFileSync`, so two processes launched
+  close together could both observe "no lock" and both proceed. Now uses
+  an atomic exclusive-create write (`flag: "wx"`), handling `EEXIST` by
+  checking the existing PID's liveness and retrying the atomic create if
+  stale.
+- **Multi-account ambiguity**: `resolveAccount`'s account lookup had no
+  `ORDER BY`, and nothing ever enforced v1's "exactly one signed-in
+  account" invariant, so a stale row could linger after a fresh sign-in
+  as a different Google account and `resolveAccount` had no principled
+  way to pick between them. `authLogin` now deletes every other account
+  row (and its stored credential) on a successful sign-in;
+  `resolveAccount` orders by `updated_at DESC` as defense in depth.
+- **`gmail undo`, `auth login`, `auth logout`, `rules remove` never
+  acquired the per-account process lock** despite CLAUDE.md explicitly
+  requiring it for all four (they mutate Gmail, credentials, or rule
+  state). All four now do. `rules remove` is also now scoped to the
+  resolved account (`RuleGroupsRepository.remove(accountHash, id)`) so it
+  can never delete a different account's rule group.
+- **`gmail add`'s multi-category loop aborted on the first conflict**,
+  contradicting its own "continue independent actions" doc comment —
+  `RuleConflictError` and other typed `GmailAgentError`s from one category
+  weren't caught by the loop. Now caught per-category; only a genuinely
+  unexpected (non-`GmailAgentError`) exception still aborts the command.
+- **`gmail undo` never marked a reversed action as reversed** in the
+  ledger — a new `"reversed"` `ActionStatus` is now set on every
+  successful undo.
+- **"Inbox: X before -> Y after" was arithmetically wrong** whenever
+  native-Spam messages were trashed alongside Inbox activity: the
+  subtraction used the *total* trashed count, which includes native-Spam
+  trashes that were never part of the Inbox count to begin with. A new
+  `RunSummary.inboxTrashedCount` (only messages that actually carried
+  `INBOX` at snapshot time) fixes the subtraction in both renderers.
+- **Three all-day Calendar event bugs** (`calendar/event-policy.ts`): an
+  explicit end date wasn't bumped to Google's required *exclusive* end
+  date (a 3-day event was stored as 2 days); a same-day event
+  (`start === end`) was always rejected as non-positive duration; and any
+  all-day event dated *today* was always rejected as a past event (an
+  all-day candidate parses to midnight, which is always earlier than the
+  current instant later that same day). All three fixed by treating
+  `candidate.end` as an inclusive last day (always `+1` for the real,
+  exclusive end) and comparing an all-day start against start-of-today
+  rather than the exact instant.
+- **A changed Calendar event was silently kept stale instead of flagged
+  for review** (`calendar/idempotency.ts`): a 409 from this app's own
+  prior event with a *different* payload hash (e.g. a corrected date
+  after reclassification) used to be treated as `already_applied_by_this_app`
+  rather than the `collision` its own documented contract calls for.
+- **DKIM alignment wasn't actually checked** for important-rule auth
+  bindings (`rules/auth-signals.ts`): the DKIM branch accepted any passing
+  signature's domain, unlike the DMARC branch, which already required it
+  to match the sender's address domain. A message routed through a shared
+  ESP that DKIM-signs as its own domain could pass this and bind a rule
+  to an unrelated (and impersonable) domain. Both branches now require
+  exact alignment.
+- **The redaction-enforcing `pino` logger was constructed but never
+  called anywhere** — every real diagnostic went through raw
+  `console.log`/`console.error`, including `cli.ts`'s top-level
+  catch-all, which could print an unredacted token embedded in an SDK
+  error's message/stack. `logging/logger.ts` now also exports
+  `redactSecrets(text)`, applied to that catch-all's output. Wiring the
+  full `pino` logger through every call site remains unaddressed.
+- **`gmail add spam`'s search never actually searched Spam**: `includeSpamTrash`
+  was never set (Gmail's API default is `false`), so a query built around
+  `in:spam` silently never matched a spam-labeled message regardless of
+  what the query string said. Both `spam.ts` and `important.ts` also had
+  a hardcoded `maxResults: 50` with no pagination and no truncation
+  notice; both now paginate (via `listAllMessageIds`, reused from
+  `gmail/scanner.ts`) up to a 500-message safety cap and print a note
+  when truncated.
+- **`gmail cache` had no safety cap at all** — added an optional
+  `--limit`, printed as a note (never silent) when it truncates.
+- **`contentHash` was contaminated with label state**: it hashed
+  `labelIds` alongside actual content, so a label-only change (by far the
+  most common kind of change surfaced by incremental Gmail history sync)
+  also changed "content changed," defeating the hash's purpose. Labels
+  are already tracked separately as `label_snapshot`; `contentHash` no
+  longer includes them.
+- **Duplicate header handling**: `headerMapFromList` kept whichever
+  occurrence of a repeated header (e.g. `Authentication-Results`) came
+  last; now keeps the first, matching physical header order (a receiving
+  server's own added header is prepended, so it appears first).
+- **Unclosed `<script>`/`<style>` tags bypassed HTML stripping entirely**:
+  the paired-tag regexes simply don't match with no closing tag, letting
+  raw script/style content through as if it were message text.
+  `htmlToBoundedPlainText` now also strips an unclosed opening tag through
+  the rest of the document as a fallback.
+- **`ActionsRepository.updateStatus` double-counted `attempt_count`**: it
+  incremented on every call, so a single successful attempt (one
+  `"applying"` transition, one terminal transition) read as 2. Now only
+  increments on the transition into `"applying"`.
+- **`fetchAndNormalize` trusted the caller-supplied stub's `threadId`**
+  instead of the freshly-fetched response's — harmless for a full scan
+  (where the stub comes from a real `messages.list` result) but wrong in
+  principle for the incremental-scan path, where the stub is built from a
+  `history.list` record. Now always uses `raw.threadId` from the fetch.
+- Minor/low-severity: the OpenAI classifier's `event` fields weren't
+  nulled for a suspicious message (only `category` was) — now symmetric,
+  as defense in depth alongside `policy.ts`'s existing gate; the
+  existing-labels list sent to the model joined names with unescaped
+  commas (a label literally containing a comma could misread as two
+  labels) — now quoted; the unsubscribe SSRF check was missing
+  `100.64.0.0/10` (RFC 6598 carrier-grade NAT); the angle-bracket address
+  regex didn't span an embedded newline in a display name.
+
 ## Known deviations from the full design (as of this writing)
 
 - `src/core/api-retry.ts` (shared by the Gmail/Calendar and OpenAI call
-  sites) retries 429 (quota exceeded) and 5xx responses with
-  exponential backoff and jitter, honoring `Retry-After` — but there's
-  still no bound on total *retried* request volume across a whole run,
-  so a sustained per-minute quota exhaustion (as opposed to a transient
-  spike) will still exhaust the retry budget per call and eventually
+  sites) retries 429 (quota exceeded) and 5xx responses, and (as of this
+  pass) bare network failures with no HTTP status at all (`ECONNRESET`,
+  `ETIMEDOUT`, `ECONNREFUSED`, `ENOTFOUND`, `EAI_AGAIN`, `EPIPE`), with
+  exponential backoff and jitter, honoring `Retry-After` in both its
+  delta-seconds and HTTP-date forms — but there's still no bound on total
+  *retried* request volume across a whole run, so a sustained per-minute
+  quota exhaustion (as opposed to a transient spike or a dropped
+  connection) will still exhaust the retry budget per call and eventually
   surface as a failure. `--limit` is the practical mitigation for that
-  case.
+  case. `OpenAiClassifier` additionally sets `maxRetries: 0` on its own
+  SDK client constructor — the SDK's own default retry used to stack with
+  `withApiRetry`'s outer loop, multiplying real HTTP attempts (and OpenAI
+  billing) per message well beyond what the code's own comments claimed.
 - No automated RFC 8058 DKIM-verified one-click HTTPS unsubscribe yet —
   `add spam` falls back to manual/`mailto:` handling, which is the spec's
   own safe default when DKIM coverage can't be verified.

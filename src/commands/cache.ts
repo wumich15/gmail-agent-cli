@@ -32,7 +32,12 @@ const GMAIL_READ_CONCURRENCY = 5;
  * is recorded in the local `messages` table for future reuse; no
  * assessment fields are set since no classifier ever runs here.
  */
-export async function runCache(): Promise<number> {
+export interface CacheOptions {
+  /** Caps the Inbox and native-Spam scans to this many most-recent messages each. Omit to cache everything. */
+  limit?: number;
+}
+
+export async function runCache(options: CacheOptions = {}): Promise<number> {
   const ctx = bootstrap();
   const { account, gmailClient } = await resolveAccountSigningInIfNeeded(ctx);
 
@@ -42,10 +47,39 @@ export async function runCache(): Promise<number> {
     const profile = await fetchProfile(gmailClient);
 
     const [spamResult, inboxResult] = await Promise.all([
-      listAllMessageIds(gmailClient, { labelIds: [GMAIL_LABELS.spam], includeSpamTrash: true }),
-      listAllMessageIds(gmailClient, { labelIds: [GMAIL_LABELS.inbox], includeSpamTrash: false })
+      listAllMessageIds(gmailClient, {
+        labelIds: [GMAIL_LABELS.spam],
+        includeSpamTrash: true,
+        ...(options.limit !== undefined ? { safetyCapCount: options.limit } : {})
+      }),
+      listAllMessageIds(gmailClient, {
+        labelIds: [GMAIL_LABELS.inbox],
+        includeSpamTrash: false,
+        ...(options.limit !== undefined ? { safetyCapCount: options.limit } : {})
+      })
     ]);
     const stubs = dedupeStubs([...spamResult.messages, ...inboxResult.messages]);
+
+    if (spamResult.truncated || inboxResult.truncated) {
+      // Never truncate silently, even under an explicit --limit: state
+      // exactly how many are being skipped this run, matching the same
+      // transparency `gmail work`'s scanNote already provides.
+      console.error(
+        pc.yellow(
+          "--limit applied: " +
+            [
+              inboxResult.truncated
+                ? `Inbox capped to ${inboxResult.messages.length}${inboxResult.estimatedTotal !== null ? ` of ~${inboxResult.estimatedTotal}` : ""}.`
+                : null,
+              spamResult.truncated
+                ? `Spam capped to ${spamResult.messages.length}${spamResult.estimatedTotal !== null ? ` of ~${spamResult.estimatedTotal}` : ""}.`
+                : null
+            ]
+              .filter(Boolean)
+              .join(" ")
+        )
+      );
+    }
 
     console.error(pc.dim(`Caching ${stubs.length} message(s)...`));
 

@@ -52,6 +52,17 @@ export interface OrchestratorDeps {
   /** The user's current custom Gmail label names, passed to the classifier so it prefers reusing one. */
   existingLabels?: readonly string[];
   /**
+   * Cumulative counts (from previous runs) of AI-guessed categories that
+   * haven't cleared MIN_LABEL_BATCH_SIZE yet, keyed by normalized
+   * (lowercased) name. Needed because incremental Gmail history sync
+   * means a normal run only ever sees a handful of changed messages, so a
+   * brand-new category could otherwise almost never accumulate 10
+   * occurrences in any single run — this lets those occurrences
+   * accumulate across runs instead. See WorkScanResult.labelCandidateUpdates
+   * for what the caller persists back after each run.
+   */
+  priorLabelCandidateCounts?: ReadonlyMap<string, { displayName: string; count: number }>;
+  /**
    * The account's persisted Gmail history marker from the last successful
    * run, if any. When present and still valid, the scan reconciles only
    * the messages `users.history.list` reports as changed since that point
@@ -72,6 +83,16 @@ export interface OrchestratorDeps {
  */
 export const MIN_LABEL_BATCH_SIZE = 10;
 
+/** One category name's cumulative-count bookkeeping to persist after a run — see `priorLabelCandidateCounts`. */
+export interface LabelCandidateUpdate {
+  normalizedName: string;
+  displayName: string;
+  /** The new cumulative total (prior persisted count + this run's count), to store verbatim. */
+  newCumulativeCount: number;
+  /** True once this crossed the threshold and the label was actually applied this run — the caller should clear its stored candidate row rather than keep counting. */
+  applied: boolean;
+}
+
 export interface WorkScanResult {
   summary: RunSummary;
   outcomes: MessageOutcome[];
@@ -81,6 +102,8 @@ export interface WorkScanResult {
   usedIncrementalSync: boolean;
   /** Set when --limit capped the scan, or an incremental scan happened; states what was skipped/reconciled. */
   scanNote: string | null;
+  /** Per-category cumulative-count bookkeeping the caller should persist (or clear) after this run — see `OrchestratorDeps.priorLabelCandidateCounts`. */
+  labelCandidateUpdates: readonly LabelCandidateUpdate[];
 }
 
 export function dedupeStubs(stubs: readonly MessageStub[]): MessageStub[] {
@@ -145,11 +168,16 @@ async function fetchAndNormalizeAll(
   return preprocessed;
 }
 
+interface ClassifyAndFinalizeResult {
+  outcomes: MessageOutcome[];
+  labelCandidateUpdates: readonly LabelCandidateUpdate[];
+}
+
 /** Phases 2-4: classify (bounded at aiCalls concurrency), evaluate policy, then the run-wide label-batch threshold. No further Gmail I/O. */
 async function classifyAndFinalize(
   preprocessed: readonly PreprocessedMessage[],
   deps: OrchestratorDeps
-): Promise<MessageOutcome[]> {
+): Promise<ClassifyAndFinalizeResult> {
   const assessmentResults = await mapWithConcurrency(preprocessed, deps.concurrency.aiCalls, (pre) =>
     pre.bypassed
       ? Promise.resolve(null)
@@ -162,7 +190,8 @@ async function classifyAndFinalize(
         })
   );
   const rawOutcomes = preprocessed.map((pre, i) => finalizeOutcome(pre, assessmentResults[i] ?? null, deps));
-  return applyLabelBatchThreshold(rawOutcomes);
+  const existingLabelNamesLower = new Set((deps.existingLabels ?? []).map((name) => name.trim().toLowerCase()));
+  return applyLabelBatchThreshold(rawOutcomes, existingLabelNamesLower, deps.priorLabelCandidateCounts ?? new Map());
 }
 
 async function runFullScan(deps: OrchestratorDeps, profile: MailboxProfile): Promise<WorkScanResult> {
@@ -181,7 +210,7 @@ async function runFullScan(deps: OrchestratorDeps, profile: MailboxProfile): Pro
 
   const stubs = dedupeStubs([...spamResult.messages, ...inboxResult.messages]);
   const preprocessed = await fetchAndNormalizeAll(stubs, deps, profile.emailAddress);
-  const outcomes = await classifyAndFinalize(preprocessed, deps);
+  const { outcomes, labelCandidateUpdates } = await classifyAndFinalize(preprocessed, deps);
   const summary = buildRunSummary(inboxResult.messages.length, outcomes);
 
   // Catches anything that changed while this full snapshot was being
@@ -197,7 +226,8 @@ async function runFullScan(deps: OrchestratorDeps, profile: MailboxProfile): Pro
     outcomes,
     newHistoryMarker,
     usedIncrementalSync: false,
-    scanNote: buildScanNote(inboxResult, spamResult)
+    scanNote: buildScanNote(inboxResult, spamResult),
+    labelCandidateUpdates
   };
 }
 
@@ -222,7 +252,7 @@ async function runIncrementalScan(
   // would never have appeared in a full listAllMessageIds pass either.
   const preprocessed = preprocessedAll.filter((pre) => isInInbox(pre.labelIds) || isNativeSpam(pre.labelIds));
 
-  const outcomes = await classifyAndFinalize(preprocessed, deps);
+  const { outcomes, labelCandidateUpdates } = await classifyAndFinalize(preprocessed, deps);
   const inboxCountBefore = await fetchInboxMessageCount(deps.gmailClient);
   const summary = buildRunSummary(inboxCountBefore, outcomes);
 
@@ -233,22 +263,31 @@ async function runIncrementalScan(
     outcomes,
     newHistoryMarker: history.endHistoryId,
     usedIncrementalSync: true,
-    scanNote: truncationNote ? `${truncationNote} ${incrementalNote}` : incrementalNote
+    scanNote: truncationNote ? `${truncationNote} ${incrementalNote}` : incrementalNote,
+    labelCandidateUpdates
   };
 }
 
 /**
  * Filters out `label` actions produced from an AI-guessed category
- * (reasonCode `ai_category:...`) unless at least MIN_LABEL_BATCH_SIZE
- * messages in this same run agreed on the same name, case-insensitively.
- * The "Calendar" label added alongside a validated event
- * (`calendar_label:...`) is a deterministic 1:1 link to a real event, not
- * a fuzzy guess, and always passes through untouched. Every surviving
- * category label in a group is normalized to one exact display name (the
- * first-seen casing) so messages that agreed case-insensitively still end
- * up under the exact same Gmail label instead of near-duplicates.
+ * (reasonCode `ai_category:...`) unless the *cumulative* count for that
+ * name (this run's occurrences plus whatever `priorCounts` already
+ * accumulated from earlier runs) reaches MIN_LABEL_BATCH_SIZE, or the name
+ * already matches one of the account's `existingLabelNamesLower` (a label
+ * that already exists needs no threshold at all — applying it to more
+ * mail isn't creating clutter, it's just correctly reusing a label that
+ * already cleared this bar once). The "Calendar" label added alongside a
+ * validated event (`calendar_label:...`) is a deterministic 1:1 link to a
+ * real event, not a fuzzy guess, and always passes through untouched.
+ * Every surviving category label in a group is normalized to one exact
+ * display name so messages that agreed case-insensitively still end up
+ * under the exact same Gmail label instead of near-duplicates.
  */
-function applyLabelBatchThreshold(outcomes: readonly MessageOutcome[]): MessageOutcome[] {
+function applyLabelBatchThreshold(
+  outcomes: readonly MessageOutcome[],
+  existingLabelNamesLower: ReadonlySet<string>,
+  priorCounts: ReadonlyMap<string, { displayName: string; count: number }>
+): ClassifyAndFinalizeResult {
   const groups = new Map<string, { count: number; displayName: string }>();
   for (const outcome of outcomes) {
     for (const action of outcome.decision.actions) {
@@ -264,14 +303,34 @@ function applyLabelBatchThreshold(outcomes: readonly MessageOutcome[]): MessageO
     }
   }
 
-  return outcomes.map((outcome) => {
+  const eligibleKeys = new Set<string>();
+  const labelCandidateUpdates: LabelCandidateUpdate[] = [];
+  for (const [key, group] of groups) {
+    if (existingLabelNamesLower.has(key)) {
+      eligibleKeys.add(key);
+      continue;
+    }
+    const priorCount = priorCounts.get(key)?.count ?? 0;
+    const cumulative = priorCount + group.count;
+    const applied = cumulative >= MIN_LABEL_BATCH_SIZE;
+    if (applied) {
+      eligibleKeys.add(key);
+    }
+    labelCandidateUpdates.push({
+      normalizedName: key,
+      displayName: priorCounts.get(key)?.displayName ?? group.displayName,
+      newCumulativeCount: cumulative,
+      applied
+    });
+  }
+
+  const outcomesWithThreshold = outcomes.map((outcome) => {
     const actions = outcome.decision.actions
       .filter((action) => {
         if (action.type !== "label" || !action.reasonCode.startsWith("ai_category:")) {
           return true;
         }
-        const key = action.labelName.trim().toLowerCase();
-        return (groups.get(key)?.count ?? 0) >= MIN_LABEL_BATCH_SIZE;
+        return eligibleKeys.has(action.labelName.trim().toLowerCase());
       })
       .map((action) => {
         if (action.type === "label" && action.reasonCode.startsWith("ai_category:")) {
@@ -282,6 +341,8 @@ function applyLabelBatchThreshold(outcomes: readonly MessageOutcome[]): MessageO
       });
     return { ...outcome, decision: { ...outcome.decision, actions } };
   });
+
+  return { outcomes: outcomesWithThreshold, labelCandidateUpdates };
 }
 
 function buildScanNote(
@@ -335,10 +396,16 @@ async function fetchAndNormalize(
   const headers = headersFromMessage(raw);
   const labelIds = raw.labelIds ?? [];
   const { plain, html } = extractBodyParts(raw.payload ?? undefined);
+  // The freshly-fetched response is the authoritative source for
+  // threadId — `stub.threadId` is only ever a placeholder in the
+  // incremental-scan path (built from a history record, not a real
+  // messages.list/messages.get result) and only a fallback here in case
+  // Gmail's response were ever missing it.
+  const resolvedStub: MessageStub = { id: stub.id, threadId: raw.threadId ?? stub.threadId };
 
   const normalized = buildNormalizedMessage({
-    gmailMessageId: stub.id,
-    gmailThreadId: stub.threadId,
+    gmailMessageId: resolvedStub.id,
+    gmailThreadId: resolvedStub.threadId,
     historyId: raw.historyId ?? "0",
     internalDate: raw.internalDate ?? "0",
     labelIds,
@@ -367,7 +434,7 @@ async function fetchAndNormalize(
     explicitRule?.action === "important" || hasUnattributedProtectionLabel(labelIds, appAttributed);
 
   return {
-    stub,
+    stub: resolvedStub,
     normalized,
     labelIds,
     nativeSpam,

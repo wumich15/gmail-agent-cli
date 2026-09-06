@@ -100,3 +100,38 @@ describe("ActionsRepository.upsertPlanned", () => {
     db.close();
   });
 });
+
+describe("ActionsRepository.updateStatus", () => {
+  it("increments attempt_count only on the transition into 'applying', not on every status change", () => {
+    // Regression: a lone successful attempt used to read attempt_count: 2
+    // (once for the "applying" transition, again for the terminal
+    // "applied" transition), silently doubling this audit field.
+    const db = freshDb();
+    const repo = new ActionsRepository(db);
+    repo.upsertPlanned([action({ status: "planned" })]);
+    repo.updateStatus("same-key", "applying", "t1");
+    repo.updateStatus("same-key", "applied", "t2");
+
+    const row = db.prepare("SELECT attempt_count FROM actions WHERE action_key = ?").get("same-key") as {
+      attempt_count: number;
+    };
+    expect(row.attempt_count).toBe(1);
+    db.close();
+  });
+
+  it("counts a real second attempt (applying again after a retryable failure) as attempt 2", () => {
+    const db = freshDb();
+    const repo = new ActionsRepository(db);
+    repo.upsertPlanned([action({ status: "planned" })]);
+    repo.updateStatus("same-key", "applying", "t1");
+    repo.updateStatus("same-key", "failed_retryable", "t2");
+    repo.updateStatus("same-key", "applying", "t3");
+    repo.updateStatus("same-key", "applied", "t4");
+
+    const row = db.prepare("SELECT attempt_count FROM actions WHERE action_key = ?").get("same-key") as {
+      attempt_count: number;
+    };
+    expect(row.attempt_count).toBe(2);
+    db.close();
+  });
+});

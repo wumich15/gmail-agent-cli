@@ -12,6 +12,7 @@ import { isOneClickPost, parseListUnsubscribeHeader } from "../unsubscribe/heade
 import { redactUrlForLogging } from "../unsubscribe/safe-http.js";
 import { ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
+import { listAllMessageIds } from "../gmail/scanner.js";
 import type { NormalizedMessage } from "../core/models.js";
 import type { GmailClient } from "../gmail/client.js";
 
@@ -22,21 +23,34 @@ export interface SpamOptions {
   retryUnsubscribe: boolean;
 }
 
+/** Bounds how many search hits get fetched/considered per invocation; --limit-style safety cap, not a design limit. */
+const SEARCH_SAFETY_CAP = 500;
+
+interface SearchResult {
+  messages: NormalizedMessage[];
+  truncated: boolean;
+  estimatedTotal: number | null;
+}
+
 async function searchRecentCandidates(
   gmailClient: GmailClient,
   category: string,
   includeArchived: boolean
-): Promise<NormalizedMessage[]> {
+): Promise<SearchResult> {
   // Default scope is Inbox + native Spam only, per the design's "recent
   // non-Trash mail" default. --all-mail explicitly widens this to
   // archived mail (Gmail's plain search already spans All Mail once you
   // drop the in:inbox/in:spam restriction, so "in:anywhere -in:trash"
   // here is the actually-wider query, not the narrower default).
   const q = includeArchived ? `${category} in:anywhere -in:trash` : `${category} (in:inbox OR in:spam)`;
-  const { data } = await gmailClient.users.messages.list({ userId: "me", q, maxResults: 50 });
+  // includeSpamTrash must be explicit: Gmail's own API default excludes
+  // SPAM/TRASH-labeled messages from search results regardless of what
+  // the `q` string says, so a query built around `in:spam` would silently
+  // never match a single actual spam-labeled message without this.
+  const listResult = await listAllMessageIds(gmailClient, { q, includeSpamTrash: true, safetyCapCount: SEARCH_SAFETY_CAP });
+
   const results: NormalizedMessage[] = [];
-  for (const stub of data.messages ?? []) {
-    if (!stub.id || !stub.threadId) continue;
+  for (const stub of listResult.messages) {
     const { data: full } = await gmailClient.users.messages.get({
       userId: "me",
       id: stub.id,
@@ -66,7 +80,7 @@ async function searchRecentCandidates(
       })
     );
   }
-  return results;
+  return { messages: results, truncated: listResult.truncated, estimatedTotal: listResult.estimatedTotal };
 }
 
 export async function runSpam(category: string | undefined, options: SpamOptions): Promise<number> {
@@ -102,7 +116,19 @@ async function runSpamLocked(
   const ruleGroupsRepo = new RuleGroupsRepository(ctx.db);
   const existingGroups = ruleGroupsRepo.list(account.accountHash);
 
-  const candidates = await searchRecentCandidates(gmailClient, category, options.allMail);
+  const searchResult = await searchRecentCandidates(gmailClient, category, options.allMail);
+  const candidates = searchResult.messages;
+  if (searchResult.truncated) {
+    // CLAUDE.md: "never truncate silently. If a safety cap is configured,
+    // state exactly how many messages remain."
+    console.log(
+      pc.yellow(
+        `Only scanned the ${candidates.length} most recent matching message(s)` +
+          (searchResult.estimatedTotal !== null ? ` of an estimated ~${searchResult.estimatedTotal} total` : "") +
+          " — re-run after handling these to catch the rest."
+      )
+    );
+  }
   const identities = groupBySubscriptionIdentity(candidates);
 
   if (identities.length === 0) {

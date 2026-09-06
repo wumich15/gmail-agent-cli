@@ -34,6 +34,24 @@ describe("buildRunSummary", () => {
     expect(summary.trashedByReason).toEqual({ ai_promotion: 1 });
   });
 
+  it("only counts a trashed message against inboxTrashedCount if it actually carried INBOX at snapshot time", () => {
+    // Regression: native-spam messages are never part of the Inbox count
+    // to begin with (they come from the separate Spam listing), so
+    // trashing them must not be subtracted from the Inbox total.
+    const summary = buildRunSummary(100, [
+      outcome({
+        labelIdsAtSnapshot: ["SPAM"],
+        decision: { actions: [{ type: "trash", reasonCode: "native_spam" }], needsReview: false, reviewReason: null }
+      }),
+      outcome({
+        labelIdsAtSnapshot: ["INBOX", "UNREAD"],
+        decision: { actions: [{ type: "trash", reasonCode: "ai_promotion" }], needsReview: false, reviewReason: null }
+      })
+    ]);
+    expect(summary.trashedByReason).toEqual({ native_spam: 1, ai_promotion: 1 });
+    expect(summary.inboxTrashedCount).toBe(1);
+  });
+
   it("carries details for archive/star/mark_important/calendar_create too", () => {
     const summary = buildRunSummary(1, [
       outcome({
@@ -148,5 +166,31 @@ describe("renderHumanSummary", () => {
     const text = renderHumanSummary(summary, { dryRun: true });
     expect(text).toContain("Win a free prize now");
     expect(text).toContain("spam@example.com");
+  });
+
+  it("computes 'Inbox: X before -> Y after' correctly when native-spam messages are trashed alongside Inbox activity", () => {
+    // Regression: native-spam trashes (never part of the Inbox count) used
+    // to be subtracted from inboxCountBefore anyway, understating "after."
+    const outcomes = [
+      // 20 native-spam messages, never in the Inbox to begin with.
+      ...Array.from({ length: 20 }, (_, i) =>
+        outcome({
+          gmailMessageId: `spam-${i}`,
+          labelIdsAtSnapshot: ["SPAM"],
+          decision: { actions: [{ type: "trash" as const, reasonCode: "native_spam" }], needsReview: false, reviewReason: null }
+        })
+      ),
+      // 10 read Inbox messages get archived, nothing trashed from the Inbox.
+      ...Array.from({ length: 10 }, (_, i) =>
+        outcome({
+          gmailMessageId: `archived-${i}`,
+          labelIdsAtSnapshot: ["INBOX"],
+          decision: { actions: [{ type: "archive" as const, reasonCode: "read_non_trash" }], needsReview: false, reviewReason: null }
+        })
+      )
+    ];
+    const summary = buildRunSummary(100, outcomes);
+    const text = renderHumanSummary(summary, { dryRun: false });
+    expect(text).toContain("Inbox: 100 before -> 90 after");
   });
 });

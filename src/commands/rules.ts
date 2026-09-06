@@ -3,6 +3,8 @@ import { bootstrap } from "../core/bootstrap.js";
 import { resolveAccount } from "./shared.js";
 import { RuleGroupsRepository } from "../state/repositories/rule-groups.js";
 import { EXIT_CODES } from "../core/errors.js";
+import { ProcessLock } from "../core/lock.js";
+import { lockFilePath } from "../config/paths.js";
 
 export async function rulesList(options: { json: boolean }): Promise<number> {
   const ctx = bootstrap();
@@ -30,12 +32,24 @@ export async function rulesList(options: { json: boolean }): Promise<number> {
 
 export async function rulesRemove(ruleGroupId: string): Promise<number> {
   const ctx = bootstrap();
-  await resolveAccount(ctx);
-  const removed = new RuleGroupsRepository(ctx.db).remove(ruleGroupId);
-  if (!removed) {
-    console.error(pc.red(`No rule group with ID ${ruleGroupId}.`));
-    return EXIT_CODES.invalidOrAuthRequired;
+  const { account } = await resolveAccount(ctx);
+
+  // Mutates local rule state, so it needs the same per-account lock as
+  // every other mutating command (CLAUDE.md explicitly names "mutating
+  // rules" in its lock list).
+  const lock = new ProcessLock(lockFilePath(account.accountHash));
+  lock.acquire();
+  try {
+    // Scoped to this account so `gmail rules remove <id>` can never
+    // delete a rule group belonging to a different account.
+    const removed = new RuleGroupsRepository(ctx.db).remove(account.accountHash, ruleGroupId);
+    if (!removed) {
+      console.error(pc.red(`No rule group with ID ${ruleGroupId} for this account.`));
+      return EXIT_CODES.invalidOrAuthRequired;
+    }
+    console.log(pc.green(`Removed rule group ${ruleGroupId}.`));
+    return EXIT_CODES.ok;
+  } finally {
+    lock.release();
   }
-  console.log(pc.green(`Removed rule group ${ruleGroupId}.`));
-  return EXIT_CODES.ok;
 }

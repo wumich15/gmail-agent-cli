@@ -14,6 +14,8 @@ import { fetchProfile } from "../gmail/scanner.js";
 import { accountHashFromEmail } from "../core/ids.js";
 import { loadOrCreateDefaultConfig, saveConfig } from "../config/load.js";
 import { EXIT_CODES } from "../core/errors.js";
+import { ProcessLock } from "../core/lock.js";
+import { lockFilePath } from "../config/paths.js";
 
 export async function authLogin(): Promise<number> {
   const ctx = bootstrap();
@@ -51,37 +53,73 @@ export async function authLogin(): Promise<number> {
     const profile = await fetchProfile(gmailClient);
     const accountHash = accountHashFromEmail(profile.emailAddress);
 
-    await ctx.credentialStore.setSecret(CREDENTIAL_KEYS.oauthRefreshToken(accountHash), result.refreshToken);
+    // Acquire the per-account lock as soon as an account is identified —
+    // CLAUDE.md explicitly names "auth login/logout" among the commands
+    // that must hold it, since everything from here on mutates the
+    // credential store and durable account state.
+    const lock = new ProcessLock(lockFilePath(accountHash));
+    lock.acquire();
+    try {
+      await ctx.credentialStore.setSecret(CREDENTIAL_KEYS.oauthRefreshToken(accountHash), result.refreshToken);
 
-    const detectedTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    const timezoneInput = await p.text({
-      message: "Confirm your IANA timezone",
-      initialValue: detectedTimezone,
-      placeholder: detectedTimezone
-    });
-    const timezone = p.isCancel(timezoneInput) ? detectedTimezone : timezoneInput;
+      // v1 supports exactly one signed-in account. Enforce that
+      // explicitly rather than letting a fresh sign-in as a different
+      // Google account silently leave a stale row (and its stored
+      // credential) behind — resolveAccount would otherwise have no
+      // principled way to know which of two rows is "current."
+      const accountsRepo = new AccountsRepository(ctx.db);
+      const staleRows = ctx.db
+        .prepare("SELECT account_hash FROM accounts WHERE account_hash != ?")
+        .all(accountHash) as { account_hash: string }[];
+      for (const { account_hash: staleHash } of staleRows) {
+        await ctx.credentialStore.deleteSecret(CREDENTIAL_KEYS.oauthRefreshToken(staleHash));
+      }
+      ctx.db.prepare("DELETE FROM accounts WHERE account_hash != ?").run(accountHash);
 
-    const now = ctx.clock.nowIso();
-    new AccountsRepository(ctx.db).upsert({
-      accountHash,
-      emailDisplay: profile.emailAddress,
-      timezone,
-      historyMarker: null,
-      setupComplete: true,
-      automationEnabled: false,
-      createdAt: now,
-      updatedAt: now
-    });
+      const detectedTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const timezoneInput = await p.text({
+        message: "Confirm your IANA timezone",
+        initialValue: detectedTimezone,
+        placeholder: detectedTimezone
+      });
+      const timezone = p.isCancel(timezoneInput) ? detectedTimezone : timezoneInput;
 
-    const config = loadOrCreateDefaultConfig(timezone);
-    saveConfig({ ...config, timezone });
+      const now = ctx.clock.nowIso();
+      accountsRepo.upsert({
+        accountHash,
+        emailDisplay: profile.emailAddress,
+        timezone,
+        historyMarker: null,
+        setupComplete: true,
+        automationEnabled: false,
+        createdAt: now,
+        updatedAt: now
+      });
 
-    p.outro(
-      `Signed in as ${profile.emailAddress}.\n` +
-        `Granted scopes: ${OAUTH_SCOPES.join(", ")}\n` +
-        `Run 'gmail --dry-run' to preview what this account would do.`
-    );
-    return EXIT_CODES.ok;
+      const config = loadOrCreateDefaultConfig(timezone);
+      saveConfig({ ...config, timezone });
+
+      // Report what Google actually granted, not merely what was
+      // requested — a Workspace admin policy can restrict a scope (most
+      // plausibly Calendar) even when the OAuth consent screen showed it,
+      // and silently claiming it was granted means the first real
+      // failure the user sees is an unexplained Calendar API error much
+      // later, with no link back to the actual cause.
+      const missingScopes = OAUTH_SCOPES.filter((scope) => !result.scopes.includes(scope));
+      p.outro(
+        `Signed in as ${profile.emailAddress}.\n` +
+          `Granted scopes: ${result.scopes.length > 0 ? result.scopes.join(", ") : "(none reported by Google)"}\n` +
+          (missingScopes.length > 0
+            ? pc.yellow(
+                `Warning: Google did not report granting: ${missingScopes.join(", ")}. Related features (e.g. Calendar) will fail until this is resolved.\n`
+              )
+            : "") +
+          "Run 'gmail --dry-run' to preview what this account would do."
+      );
+      return EXIT_CODES.ok;
+    } finally {
+      lock.release();
+    }
   } catch (error) {
     spinner.stop("Sign-in failed.");
     if (authorizeUrl) {
@@ -132,30 +170,47 @@ export async function authLogout(): Promise<number> {
   }
 
   for (const { account_hash: accountHash } of rows) {
-    const account = accountsRepo.get(accountHash);
-    const secretKey = CREDENTIAL_KEYS.oauthRefreshToken(accountHash);
-    const refreshToken = await ctx.credentialStore.getSecret(secretKey);
-
-    if (refreshToken) {
-      try {
-        const credentials = loadDevOAuthClientCredentials();
-        const oauthClient = oauthClientFromRefreshToken(credentials, refreshToken);
-        await oauthClient.revokeToken(refreshToken);
-      } catch (error) {
-        p.log.warn(`Could not revoke the Google grant remotely: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-    await ctx.credentialStore.deleteSecret(secretKey);
-
-    const keepHistory = await p.confirm({
-      message: `Keep local non-secret run/rule history for ${account?.emailDisplay ?? accountHash}?`,
-      initialValue: true
-    });
-    if (!p.isCancel(keepHistory) && !keepHistory) {
-      ctx.db.prepare("DELETE FROM accounts WHERE account_hash = ?").run(accountHash);
+    // Locked per-account: logout mutates credentials and account state
+    // CLAUDE.md requires the lock for, and must not race a concurrent
+    // gmail/gmail work run against this same account.
+    const lock = new ProcessLock(lockFilePath(accountHash));
+    lock.acquire();
+    try {
+      await logoutOneAccount(ctx, accountsRepo, accountHash);
+    } finally {
+      lock.release();
     }
   }
 
   console.log(pc.green("Signed out. Local credentials removed."));
   return EXIT_CODES.ok;
+}
+
+async function logoutOneAccount(
+  ctx: ReturnType<typeof bootstrap>,
+  accountsRepo: AccountsRepository,
+  accountHash: string
+): Promise<void> {
+  const account = accountsRepo.get(accountHash);
+  const secretKey = CREDENTIAL_KEYS.oauthRefreshToken(accountHash);
+  const refreshToken = await ctx.credentialStore.getSecret(secretKey);
+
+  if (refreshToken) {
+    try {
+      const credentials = loadDevOAuthClientCredentials();
+      const oauthClient = oauthClientFromRefreshToken(credentials, refreshToken);
+      await oauthClient.revokeToken(refreshToken);
+    } catch (error) {
+      p.log.warn(`Could not revoke the Google grant remotely: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  await ctx.credentialStore.deleteSecret(secretKey);
+
+  const keepHistory = await p.confirm({
+    message: `Keep local non-secret run/rule history for ${account?.emailDisplay ?? accountHash}?`,
+    initialValue: true
+  });
+  if (!p.isCancel(keepHistory) && !keepHistory) {
+    ctx.db.prepare("DELETE FROM accounts WHERE account_hash = ?").run(accountHash);
+  }
 }

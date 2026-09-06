@@ -69,4 +69,32 @@ describe("withApiRetry", () => {
     expect(Date.now() - start).toBeLessThan(1000);
     expect(result).toBe("ok");
   });
+
+  it("honors a Retry-After header in the HTTP-date form, not just delta-seconds", async () => {
+    const soon = new Date(Date.now() + 1).toUTCString();
+    const error = {
+      status: 429,
+      response: { headers: { get: () => soon } }
+    };
+    const fn = vi.fn().mockRejectedValueOnce(error).mockResolvedValue("ok");
+    const start = Date.now();
+    const result = await withApiRetry(fn, { baseDelayMs: 10_000, maxDelayMs: 20_000 });
+    expect(Date.now() - start).toBeLessThan(1000);
+    expect(result).toBe("ok");
+  });
+
+  it("retries a bare network error (no HTTP status) like ECONNRESET", async () => {
+    const networkError = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+    const fn = vi.fn().mockRejectedValueOnce(networkError).mockResolvedValue("ok");
+    const result = await withApiRetry(fn, { baseDelayMs: 1, maxDelayMs: 2 });
+    expect(result).toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not treat an unrelated .code (not a known network error code) as retryable", async () => {
+    const error = Object.assign(new Error("boom"), { code: "SOME_OTHER_CODE" });
+    const fn = vi.fn().mockRejectedValue(error);
+    await expect(withApiRetry(fn, { baseDelayMs: 1, maxDelayMs: 2 })).rejects.toBeDefined();
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
 });

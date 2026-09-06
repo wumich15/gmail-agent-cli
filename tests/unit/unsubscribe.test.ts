@@ -89,6 +89,15 @@ describe("isPrivateOrReservedIp", () => {
     expect(isPrivateOrReservedIp("93.184.216.34")).toBe(false);
   });
 
+  it("flags RFC 6598 shared address space (carrier-grade NAT), a common SSRF-checklist gap", () => {
+    expect(isPrivateOrReservedIp("100.64.0.1")).toBe(true);
+    expect(isPrivateOrReservedIp("100.100.100.100")).toBe(true);
+    expect(isPrivateOrReservedIp("100.127.255.255")).toBe(true);
+    // Just outside the /10 range on either side must stay unaffected.
+    expect(isPrivateOrReservedIp("100.63.255.255")).toBe(false);
+    expect(isPrivateOrReservedIp("100.128.0.0")).toBe(false);
+  });
+
   it("flags IPv6 loopback and unique-local", () => {
     expect(isPrivateOrReservedIp("::1")).toBe(true);
     expect(isPrivateOrReservedIp("fd00::1")).toBe(true);

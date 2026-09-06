@@ -165,12 +165,22 @@ export class ActionsRepository {
     transaction();
   }
 
+  /**
+   * `attempt_count` only increments on the transition INTO "applying" —
+   * the point a real API call is actually about to be made. Callers
+   * (work.ts's markActions) call this once for that transition and again
+   * for the terminal outcome that follows it; incrementing on every call
+   * unconditionally would count each real attempt twice (a lone
+   * successful first attempt would read attempt_count: 2), silently
+   * corrupting the audit field CLAUDE.md's action ledger exists to keep
+   * accurate.
+   */
   updateStatus(actionKey: string, status: PlannedAction["status"], updatedAt: string, errorClass: string | null = null): void {
     this.db
       .prepare(
-        "UPDATE actions SET status = ?, attempt_count = attempt_count + 1, error_class = ?, updated_at = ? WHERE action_key = ?"
+        "UPDATE actions SET status = ?, attempt_count = attempt_count + ?, error_class = ?, updated_at = ? WHERE action_key = ?"
       )
-      .run(status, errorClass, updatedAt, actionKey);
+      .run(status, status === "applying" ? 1 : 0, errorClass, updatedAt, actionKey);
   }
 
   findApplying(accountHash: string): PlannedAction[] {

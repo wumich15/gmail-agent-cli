@@ -50,19 +50,39 @@ export function validateEventCandidate(
     return { ok: false, reason: "invalid_start" };
   }
 
-  const end = candidate.end
-    ? candidate.allDay
-      ? DateTime.fromISO(candidate.end, { zone })
-      : DateTime.fromISO(candidate.end, { zone, setZone: true })
-    : candidate.allDay
-      ? start.plus({ days: 1 })
-      : start.plus({ hours: 1 });
-  if (!end.isValid) {
-    return { ok: false, reason: "invalid_end" };
+  let end: DateTime;
+  if (candidate.allDay) {
+    // Google Calendar's all-day events use an *exclusive* end date — the
+    // day after the event's actual last day. The model reports a natural
+    // inclusive last day (a single-day event as start === end; a 3-day
+    // event as start=day1, end=day3), so the exclusive end used below is
+    // always that last-inclusive-day plus one — never the raw value —
+    // whether or not the model supplied an explicit end at all. Applying
+    // the +1 only in the no-end-given default (as an earlier version of
+    // this function did) silently stored an explicit multi-day event one
+    // day short and rejected a same-day event outright (start === end
+    // both parsing to the same midnight makes `end <= start` true).
+    const lastInclusiveDay = candidate.end ? DateTime.fromISO(candidate.end, { zone }) : start;
+    if (!lastInclusiveDay.isValid) {
+      return { ok: false, reason: "invalid_end" };
+    }
+    end = lastInclusiveDay.plus({ days: 1 });
+  } else {
+    end = candidate.end ? DateTime.fromISO(candidate.end, { zone, setZone: true }) : start.plus({ hours: 1 });
+    if (!end.isValid) {
+      return { ok: false, reason: "invalid_end" };
+    }
   }
 
-  const nowDt = DateTime.fromJSDate(now);
-  if (start < nowDt) {
+  const nowDt = DateTime.fromJSDate(now).setZone(zone);
+  // An all-day event is a whole-day commitment, so "today" is still a
+  // valid, actionable date even though the precise instant "now" is
+  // necessarily later than midnight of that same day — comparing against
+  // the exact instant (as a timed event must) would reject every same-day
+  // deadline unconditionally, exactly the "due today" case CLAUDE.md calls
+  // out as something this app must be able to act on.
+  const earliestAllowedStart = candidate.allDay ? nowDt.startOf("day") : nowDt;
+  if (start < earliestAllowedStart) {
     return { ok: false, reason: "past_event" };
   }
   if (end <= start) {

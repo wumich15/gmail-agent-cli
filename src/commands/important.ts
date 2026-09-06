@@ -15,6 +15,7 @@ import { EXIT_CODES, RuleConflictError } from "../core/errors.js";
 import { applyGroupedLabelMutations, starAndImportantMutation } from "../gmail/executor.js";
 import { ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
+import { listAllMessageIds } from "../gmail/scanner.js";
 import type { NormalizedMessage, RuleMatcher } from "../core/models.js";
 import type { GmailClient } from "../gmail/client.js";
 
@@ -22,18 +23,24 @@ export interface ImportantOptions {
   yes: boolean;
 }
 
-async function searchRecentCandidates(
-  gmailClient: GmailClient,
-  category: string
-): Promise<NormalizedMessage[]> {
-  const { data } = await gmailClient.users.messages.list({
-    userId: "me",
+/** Bounds how many search hits get fetched/considered per invocation; --limit-style safety cap, not a design limit. */
+const SEARCH_SAFETY_CAP = 500;
+
+interface SearchResult {
+  messages: NormalizedMessage[];
+  truncated: boolean;
+  estimatedTotal: number | null;
+}
+
+async function searchRecentCandidates(gmailClient: GmailClient, category: string): Promise<SearchResult> {
+  const listResult = await listAllMessageIds(gmailClient, {
     q: `${category} in:inbox`,
-    maxResults: 50
+    includeSpamTrash: false,
+    safetyCapCount: SEARCH_SAFETY_CAP
   });
+
   const results: NormalizedMessage[] = [];
-  for (const stub of data.messages ?? []) {
-    if (!stub.id || !stub.threadId) continue;
+  for (const stub of listResult.messages) {
     const { data: full } = await gmailClient.users.messages.get({
       userId: "me",
       id: stub.id,
@@ -56,7 +63,7 @@ async function searchRecentCandidates(
       })
     );
   }
-  return results;
+  return { messages: results, truncated: listResult.truncated, estimatedTotal: listResult.estimatedTotal };
 }
 
 export async function runImportant(category: string | undefined, options: ImportantOptions): Promise<number> {
@@ -92,7 +99,17 @@ async function runImportantLocked(
   const ruleGroupsRepo = new RuleGroupsRepository(ctx.db);
   const existingGroups = ruleGroupsRepo.list(account.accountHash);
 
-  const candidates = await searchRecentCandidates(gmailClient, category);
+  const searchResult = await searchRecentCandidates(gmailClient, category);
+  const candidates = searchResult.messages;
+  if (searchResult.truncated) {
+    console.log(
+      pc.yellow(
+        `Only scanned the ${candidates.length} most recent matching message(s)` +
+          (searchResult.estimatedTotal !== null ? ` of an estimated ~${searchResult.estimatedTotal} total` : "") +
+          " — re-run after handling these to catch the rest."
+      )
+    );
+  }
   const identities = groupBySubscriptionIdentity(candidates);
 
   if (identities.length === 0) {

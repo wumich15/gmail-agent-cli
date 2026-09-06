@@ -6,6 +6,7 @@ import { runAdd } from "./commands/add.js";
 import { runCategory } from "./commands/category.js";
 import { runCache } from "./commands/cache.js";
 import { GmailAgentError, EXIT_CODES } from "./core/errors.js";
+import { redactSecrets } from "./logging/logger.js";
 
 function parsePositiveInt(value: string): number {
   const parsed = Number(value);
@@ -48,7 +49,8 @@ function withExitHandling(fn: () => Promise<number>): void {
         process.exitCode = error.exitCode;
         return;
       }
-      console.error(pc.red(error instanceof Error ? error.stack ?? error.message : String(error)));
+      const raw = error instanceof Error ? error.stack ?? error.message : String(error);
+      console.error(pc.red(redactSecrets(raw)));
       process.exitCode = EXIT_CODES.operationalFailure;
     });
 }
@@ -85,8 +87,13 @@ program
     "Read-only full snapshot of the whole Inbox and Spam, with no AI calls and no mutations, so every " +
       "gmail/gmail work run after it can scan incrementally instead of re-fetching everything"
   )
-  .action(() => {
-    withExitHandling(() => runCache());
+  .option(
+    "--limit <n>",
+    "cap the Inbox and native-Spam scans to the N most recent messages each (default: no cap — caches everything)",
+    parsePositiveInt
+  )
+  .action((opts: { limit?: number }) => {
+    withExitHandling(() => runCache({ ...(opts.limit !== undefined ? { limit: opts.limit } : {}) }));
   });
 
 // Commander's root `.action()` absorbs ANY unrecognized first argument as

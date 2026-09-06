@@ -169,7 +169,8 @@ export type ActionStatus =
   | "failed_retryable"
   | "failed_terminal"
   | "skipped_conflict"
-  | "unknown_no_retry";
+  | "unknown_no_retry"
+  | "reversed";
 
 export interface PlannedAction {
   /** Deterministic key: stable across retries and process restarts. */

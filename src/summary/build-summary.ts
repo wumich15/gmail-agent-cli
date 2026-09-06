@@ -1,5 +1,6 @@
 import type { PolicyDecision } from "../core/policy.js";
 import type { ValidatedEvent } from "../calendar/event-policy.js";
+import { isInInbox } from "../gmail/labels.js";
 
 export interface MessageOutcome {
   gmailMessageId: string;
@@ -31,6 +32,15 @@ export interface RunSummary {
   trashedByReason: Record<string, number>;
   /** Every trashed message's subject/sender, not just the count — full audit trail, never truncated. */
   trashed: ActionDetail[];
+  /**
+   * How many of the trashed messages actually carried INBOX at snapshot
+   * time — the only trash count that's valid to subtract from
+   * `inboxCountBefore`. `trashed`/`trashedByReason` intentionally include
+   * every trash (native Spam included, which was never counted in
+   * inboxCountBefore to begin with), so summing those against the Inbox
+   * count would overcount how much the Inbox actually shrank.
+   */
+  inboxTrashedCount: number;
   archivedCount: number;
   archived: ActionDetail[];
   starredCount: number;
@@ -69,6 +79,7 @@ const MAX_RECENT_UNREAD = 10;
 export function buildRunSummary(inboxCountBefore: number, outcomes: readonly MessageOutcome[]): RunSummary {
   const trashedByReason: Record<string, number> = {};
   const trashed: ActionDetail[] = [];
+  let inboxTrashedCount = 0;
   const archived: ActionDetail[] = [];
   const starred: ActionDetail[] = [];
   const markedImportant: ActionDetail[] = [];
@@ -91,6 +102,9 @@ export function buildRunSummary(inboxCountBefore: number, outcomes: readonly Mes
         case "trash":
           trashedByReason[action.reasonCode] = (trashedByReason[action.reasonCode] ?? 0) + 1;
           trashed.push(detail(action.reasonCode));
+          if (isInInbox(outcome.labelIdsAtSnapshot)) {
+            inboxTrashedCount += 1;
+          }
           break;
         case "archive":
           archived.push(detail(action.reasonCode));
@@ -131,6 +145,7 @@ export function buildRunSummary(inboxCountBefore: number, outcomes: readonly Mes
     inboxCountBefore,
     trashedByReason,
     trashed,
+    inboxTrashedCount,
     archivedCount: archived.length,
     archived,
     starredCount: starred.length,

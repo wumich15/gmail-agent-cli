@@ -59,7 +59,17 @@ export function headerMapFromList(
   const lookup = new Map<string, string>();
   for (const h of headers ?? []) {
     if (h.name && h.value !== undefined && h.value !== null) {
-      lookup.set(h.name.toLowerCase(), h.value);
+      const key = h.name.toLowerCase();
+      // Keep the FIRST occurrence, not the last. A message can carry
+      // multiple copies of a header (e.g. Authentication-Results added by
+      // each hop it passed through); Gmail returns them in the order they
+      // physically appear, which places the receiving server's own most
+      // recently prepended header first. Silently keeping whichever
+      // occurrence happens to be last is an unprincipled choice for a
+      // header that feeds security-relevant DKIM/DMARC matching.
+      if (!lookup.has(key)) {
+        lookup.set(key, h.value);
+      }
     }
   }
   const get = (name: string): string | null => lookup.get(name.toLowerCase()) ?? null;
@@ -86,7 +96,11 @@ export function parseEmailAddress(raw: string | null): EmailAddress | null {
     return null;
   }
   const trimmed = raw.trim();
-  const angleMatch = /^(.*)<([^<>]+)>\s*$/.exec(trimmed);
+  // [\s\S] instead of "." for the display-name capture: "." never matches
+  // a newline, so a header value containing an embedded literal newline
+  // (folded/unfolded oddly) would fall through to the "bare" branch below
+  // and use the whole garbled string — brackets and all — as the address.
+  const angleMatch = /^([\s\S]*)<([^<>]+)>\s*$/.exec(trimmed);
   if (angleMatch) {
     const displayNameRaw = angleMatch[1]!.trim().replace(/^"|"$/g, "");
     const address = angleMatch[2]!.trim();
@@ -139,6 +153,16 @@ export function htmlToBoundedPlainText(html: string, maxChars: number = MAX_BODY
   let text = html
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<style[\s\S]*?<\/style>/gi, "")
+    // A malformed or deliberately adversarial email with an unclosed
+    // <script>/<style> tag would otherwise leave everything after it —
+    // potentially the rest of the message, including raw JS/CSS source —
+    // completely unstripped: the paired regexes above simply don't match
+    // when there's no closing tag, and the generic tag-stripper further
+    // below only removes angle-bracketed fragments, not the plain-text
+    // code between them. Treat a still-open tag as "the remainder of the
+    // document is inside it."
+    .replace(/<script\b[^>]*>[\s\S]*$/gi, "")
+    .replace(/<style\b[^>]*>[\s\S]*$/gi, "")
     .replace(/<!--([\s\S]*?)-->/g, "")
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<\/p>/gi, "\n\n")
@@ -222,12 +246,19 @@ export function buildNormalizedMessage(input: BuildNormalizedMessageInput): Norm
     bodyTruncated = truncated;
   }
 
+  // Deliberately excludes labelIds: label state (read/starred/archived/
+  // etc.) is already tracked separately as its own label_snapshot column
+  // wherever this hash is persisted (see state/repositories/messages.ts).
+  // Folding labels into the content hash meant a label-only change (by
+  // far the most common kind of change surfaced by incremental Gmail
+  // history sync) also changed "content changed," defeating the hash's
+  // entire purpose of answering "does this message's actual content
+  // still match what was last seen."
   const hashInput = JSON.stringify({
     from: input.headers.from,
     subject: input.headers.subject,
     date: input.headers.date,
     messageId: input.headers.messageId,
-    labelIds: [...input.labelIds].sort(),
     bodyText
   });
 
