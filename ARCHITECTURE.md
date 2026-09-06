@@ -493,6 +493,41 @@ whenever they're back in scope. `runWork` (`commands/work.ts`) already
 calls into `commands/auth.ts`'s `authLogin` directly for the inline
 sign-in flow, so that logic isn't duplicated.
 
+## Real-world Gmail quota incidents (post-review)
+
+Two further fixes came from an actual `gmail cache`/`gmail work` crash in
+live use, both in `src/core/api-retry.ts`:
+
+- Google's Service Infrastructure quota error ("Quota exceeded for quota
+  metric 'Total Query Cost' and limit 'Units per minute per user' of
+  service 'gmail.googleapis.com'...") reaches this code as a bare `Error`
+  with no numeric `.status` the existing retry check recognized, so it
+  was retried zero times and crashed whichever call hit it. Added
+  `isRetryableGoogleQuotaMessage`, matching this message shape by text —
+  but only for a per-second/per-minute/per-100-seconds limit; a
+  daily/lifetime quota error with the same shape is deliberately left
+  alone since it won't clear within one process's retry budget.
+- Separately, the *default* retry budget (`maxAttempts: 5`) only ever
+  accumulated ~15s of total backoff (1+2+4+8s across the four waits
+  before the fifth and final attempt throws immediately) — nowhere near
+  long enough for a "per minute" quota to actually clear. Raised to
+  `maxAttempts: 7` (~61s of accumulated backoff: 1+2+4+8+16+30s),
+  comfortably spanning a full minute. This is the shared default every
+  Gmail/Calendar call uses unless it passes its own `RetryOptions`
+  (`OpenAiClassifier` still overrides with its own tighter budget,
+  unaffected by this change).
+- The crash itself also exposed a design gap, independently fixed:
+  `runFullScan`'s and `gmail cache`'s post-scan `listHistorySince`
+  reconciliation call (see "Incremental Gmail history synchronization"
+  above) had no error handling at all — a failure there (even after
+  retries are exhausted) crashed the whole command *after* already
+  paying for the entire expensive message-fetching traversal, with no
+  history marker ever persisted, so the next run would pay the same cost
+  again. `resolvePostScanHistoryMarker()` now wraps that call and falls
+  back to the pre-scan fence historyId on any failure, letting the run
+  complete and its results (a `gmail cache` run's already-cached
+  messages, a `gmail work` run's classify/policy results) survive.
+
 ## Bug-fix pass (full-codebase review)
 
 A full-codebase bug-hunt review surfaced and fixed the following, each

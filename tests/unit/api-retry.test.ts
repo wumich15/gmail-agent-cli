@@ -61,6 +61,26 @@ describe("withApiRetry", () => {
     expect(fn).toHaveBeenCalledTimes(3);
   });
 
+  it("with no options override, retries 7 times and accumulates ~61s of backoff — enough to span a per-minute quota window", async () => {
+    // Regression: the previous default (maxAttempts: 5) only ever
+    // accumulated ~15s of total backoff, nowhere near long enough for a
+    // Gmail "Units per minute per user" quota error (a real one observed
+    // in production) to actually clear before the retry budget gave up.
+    vi.useFakeTimers();
+    try {
+      const fn = vi.fn().mockRejectedValue(gaxiosLikeError(429));
+      const promise = withApiRetry(fn);
+      const assertion = expect(promise).rejects.toBeDefined();
+      // Drain every pending backoff sleep; jitter adds up to +25% on top
+      // of the nominal 1+2+4+8+16+30 = 61s, so advance well past that.
+      await vi.advanceTimersByTimeAsync(90_000);
+      await assertion;
+      expect(fn).toHaveBeenCalledTimes(7);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("honors a Retry-After header instead of the computed backoff", async () => {
     const fn = vi.fn().mockRejectedValueOnce(gaxiosLikeError(429, 0)).mockResolvedValue("ok");
     const start = Date.now();

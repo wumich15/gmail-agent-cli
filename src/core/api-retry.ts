@@ -92,8 +92,18 @@ export interface RetryOptions {
   maxDelayMs?: number;
 }
 
+/**
+ * `maxAttempts: 5` only ever accumulates ~15s of total backoff (1+2+4+8s
+ * across the 4 waits before the 5th and final attempt throws immediately)
+ * — nowhere near enough for a Gmail "Units per minute per user" quota
+ * error to actually clear, since that bucket is refilled on roughly a
+ * one-minute cadence. `maxAttempts: 7` accumulates ~61s (1+2+4+8+16+30s
+ * across 6 waits), comfortably spanning a full minute so a genuinely
+ * transient per-minute quota exhaustion has a real chance of clearing
+ * within one call's retry budget instead of failing the whole command.
+ */
 const DEFAULT_OPTIONS: Required<RetryOptions> = {
-  maxAttempts: 5,
+  maxAttempts: 7,
   baseDelayMs: 1000,
   maxDelayMs: 30_000
 };
