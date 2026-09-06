@@ -77,7 +77,8 @@ gmail work [--dry-run] [--json]
 gmail spam [CATEGORY...] [--yes] [--all-mail] [--allow-mailto] [--retry-unsubscribe]
 gmail important [CATEGORY...] [--yes]
 gmail category <NAME...>
-gmail cache
+gmail cache [--limit N]
+gmail uncache [--yes]
 gmail rules list [--json]
 gmail rules remove <RULE_GROUP_ID>
 gmail summary [RUN_ID] [--json]
@@ -405,6 +406,8 @@ Label actions are recorded in the action ledger like any other mutation (see "Lo
 `gmail category <NAME...>` is the explicit, no-threshold counterpart: it creates (or reuses, case-insensitively) one or more real Gmail labels immediately, with no message search and no 10-message batch requirement — it exists purely so a user can pre-create a category they want the AI to start reusing on the very next `gmail`/`gmail work` run, rather than waiting for the AI to invent one from scratch and clear the batch threshold.
 
 `gmail cache` performs a full, read-only Inbox+Spam snapshot with no AI calls and no Gmail/Calendar mutations, purely to (re)establish a fresh Gmail history-marker baseline — see "Incremental synchronization" above. Run it once (e.g. under Gmail API quota pressure) and every `gmail`/`gmail work` run afterward scans incrementally instead of re-listing and re-fetching the whole mailbox.
+
+`gmail uncache` is the inverse: it clears this account's local scan cache (the `messages` table's per-message projections, pending topical-label candidate counts) and resets the history marker to null — again with zero Gmail/Calendar calls, purely local state. The next `gmail`/`gmail work`/`gmail cache` run afterward falls back to a full snapshot, the same recovery path an expired history marker already triggers, just invoked deliberately. Requires confirmation unless `--yes` is passed.
 
 ## Deterministic action policy
 

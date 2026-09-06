@@ -5,6 +5,7 @@ import { runWork } from "./commands/work.js";
 import { runAdd } from "./commands/add.js";
 import { runCategory } from "./commands/category.js";
 import { runCache } from "./commands/cache.js";
+import { runUncache } from "./commands/uncache.js";
 import { GmailAgentError, EXIT_CODES } from "./core/errors.js";
 import { redactSecrets } from "./logging/logger.js";
 
@@ -18,11 +19,12 @@ function parsePositiveInt(value: string): number {
 
 // MVP command surface: `gmail` (scan + clean up, with inline sign-in on
 // first run), `gmail add` (create a spam/important rule), `gmail category`
-// (create a Gmail label directly, on demand), and `gmail cache` (read-only
-// full-inbox snapshot that seeds incremental scanning). The other commands
-// (spam/important/rules/summary/undo/auth/config/doctor) still exist as
-// working code under src/commands/ — they're just not wired up as CLI
-// subcommands yet. Re-add them here when they're back in scope.
+// (create a Gmail label directly, on demand), `gmail cache` (read-only
+// full-inbox snapshot that seeds incremental scanning), and `gmail uncache`
+// (clears that local scan cache/history marker, no Gmail/Calendar changes).
+// The other commands (spam/important/rules/summary/undo/auth/config/doctor)
+// still exist as working code under src/commands/ — they're just not wired
+// up as CLI subcommands yet. Re-add them here when they're back in scope.
 
 const program = new Command();
 
@@ -96,13 +98,24 @@ program
     withExitHandling(() => runCache({ ...(opts.limit !== undefined ? { limit: opts.limit } : {}) }));
   });
 
+program
+  .command("uncache")
+  .description(
+    "Clear this account's local scan cache and history marker (no Gmail/Calendar changes) — the inverse of " +
+      "gmail cache. The next gmail/gmail work/gmail cache run afterward does a full snapshot again."
+  )
+  .option("--yes", "skip the confirmation prompt", false)
+  .action((opts: { yes: boolean }) => {
+    withExitHandling(() => runUncache({ yes: opts.yes }));
+  });
+
 // Commander's root `.action()` absorbs ANY unrecognized first argument as
 // if it were plain `gmail` with no subcommand — so `gmail spam "x"` (a
 // plausible typo for `gmail add spam "x"`) or any other typo would
 // otherwise silently run the full mutating pipeline instead of erroring.
 // Since bare `gmail` performs real mailbox mutations, that's a dangerous
 // default; check the first token explicitly before letting Commander parse.
-const KNOWN_SUBCOMMANDS = new Set(["add", "category", "cache", "help"]);
+const KNOWN_SUBCOMMANDS = new Set(["add", "category", "cache", "uncache", "help"]);
 const firstArg = process.argv[2];
 if (firstArg !== undefined && !firstArg.startsWith("-") && !KNOWN_SUBCOMMANDS.has(firstArg)) {
   console.error(pc.red(`Unknown command: ${firstArg}`));

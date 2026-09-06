@@ -75,4 +75,9 @@ export class LabelCandidatesRepository {
       .prepare("DELETE FROM label_candidates WHERE account_hash = ? AND normalized_name = ?")
       .run(accountHash, normalizedName);
   }
+
+  /** `gmail uncache`: drops every pending candidate for this account. Returns how many rows were removed. */
+  clearForAccount(accountHash: string): number {
+    return this.db.prepare("DELETE FROM label_candidates WHERE account_hash = ?").run(accountHash).changes;
+  }
 }

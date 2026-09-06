@@ -60,7 +60,8 @@ export class AccountsRepository {
       });
   }
 
-  updateHistoryMarker(accountHash: string, historyMarker: string, updatedAt: string): void {
+  /** Pass null to reset the marker (e.g. `gmail uncache`), forcing the next scan to do a full snapshot. */
+  updateHistoryMarker(accountHash: string, historyMarker: string | null, updatedAt: string): void {
     this.db
       .prepare("UPDATE accounts SET history_marker = ?, updated_at = ? WHERE account_hash = ?")
       .run(historyMarker, updatedAt, accountHash);

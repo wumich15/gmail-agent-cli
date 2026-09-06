@@ -463,6 +463,16 @@ the MVP surface small:
   Gmail API quota pressure can pay the expensive full-traversal cost once,
   explicitly, and have every subsequent `gmail`/`gmail work` run scan
   incrementally instead.
+- **`gmail uncache`** (`src/commands/uncache.ts`) — the inverse: deletes
+  this account's rows from `messages` and `label_candidates`
+  (`MessagesRepository.clearForAccount` /
+  `LabelCandidatesRepository.clearForAccount`, both new) and resets
+  `accounts.history_marker` to `null`
+  (`AccountsRepository.updateHistoryMarker` now accepts `null`). Zero
+  Gmail/Calendar API calls — purely local state, so it's exactly as safe
+  to run as it is to skip. Requires confirmation unless `--yes`. The next
+  scan afterward takes the same `runFullScan` path as an account's
+  first-ever run or an expired marker.
 
 Every `gmail` run's summary (`src/summary/build-summary.ts`) carries,
 in addition to the per-action-type detail lists, two sections built

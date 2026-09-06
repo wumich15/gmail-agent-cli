@@ -81,6 +81,11 @@ export class MessagesRepository {
     return row.n;
   }
 
+  /** `gmail uncache`'s counterpart to `gmail cache`'s population of this table. Returns how many rows were removed. */
+  clearForAccount(accountHash: string): number {
+    return this.db.prepare("DELETE FROM messages WHERE account_hash = ?").run(accountHash).changes;
+  }
+
   upsert(record: CachedMessageRecord): void {
     this.db
       .prepare(

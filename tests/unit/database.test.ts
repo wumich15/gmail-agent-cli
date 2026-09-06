@@ -220,4 +220,48 @@ describe("openDatabase", () => {
     expect(repo.listForAccount("abc")).toEqual([]);
     db.close();
   });
+
+  it("gmail uncache: clears every cached message record and label candidate for an account, and resets the history marker", () => {
+    const db = openDatabase(freshDbPath());
+    const accountsRepo = new AccountsRepository(db);
+    accountsRepo.upsert({
+      accountHash: "abc",
+      emailDisplay: null,
+      timezone: "UTC",
+      historyMarker: "12345",
+      setupComplete: true,
+      automationEnabled: false,
+      createdAt: "now",
+      updatedAt: "now"
+    });
+    const messagesRepo = new MessagesRepository(db);
+    messagesRepo.upsert({
+      accountHash: "abc",
+      gmailMessageId: "m1",
+      gmailThreadId: "t1",
+      contentHash: "hash-1",
+      labelSnapshot: ["INBOX"],
+      classifierVersion: null,
+      promptVersion: null,
+      schemaVersion: null,
+      policyVersion: null,
+      assessmentKind: null,
+      assessmentConfidence: null,
+      importanceScore: null,
+      importanceConfidence: null,
+      reasonCodes: null,
+      processedAt: "now"
+    });
+    const candidatesRepo = new LabelCandidatesRepository(db);
+    candidatesRepo.upsert({ accountHash: "abc", normalizedName: "shopping", displayName: "Shopping", pendingCount: 3, updatedAt: "now" });
+
+    expect(messagesRepo.clearForAccount("abc")).toBe(1);
+    expect(candidatesRepo.clearForAccount("abc")).toBe(1);
+    accountsRepo.updateHistoryMarker("abc", null, "later");
+
+    expect(messagesRepo.countForAccount("abc")).toBe(0);
+    expect(candidatesRepo.listForAccount("abc")).toEqual([]);
+    expect(accountsRepo.get("abc")?.historyMarker).toBeNull();
+    db.close();
+  });
 });
