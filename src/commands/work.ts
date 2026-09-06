@@ -27,7 +27,7 @@ import {
 import { getOrCreateLabelId, listUserLabels } from "../gmail/custom-labels.js";
 import { LabelCandidatesRepository } from "../state/repositories/label-candidates.js";
 import { buildEventInsertPlan, insertIdempotentEvent } from "../calendar/idempotency.js";
-import { withApiRetry } from "../core/api-retry.js";
+import { withGoogleApiRetry } from "../core/api-retry.js";
 import { contentHash } from "../core/ids.js";
 import type { PolicyActionIntent } from "../core/policy.js";
 import type { ActionType, PlannedAction } from "../core/models.js";
@@ -232,7 +232,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
       const survivingTrash: string[] = [];
       for (const messageId of trashTargets) {
         try {
-          const { data } = await withApiRetry(() =>
+          const { data } = await withGoogleApiRetry(() =>
             gmailClient.users.messages.get({
               userId: "me",
               id: messageId,

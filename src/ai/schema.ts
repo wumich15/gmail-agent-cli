@@ -1,21 +1,35 @@
 import { z } from "zod";
 
 /**
- * Minimal, cheap wire schema: plain booleans instead of confidence
- * floats, no free-text summary, no reasonCodes array. Every field the
- * model has to fill in costs output tokens on every single call, so this
- * is kept as small as it can be while still letting the deterministic
- * mapping in openai-classifier.ts drive the exact same policy decisions
+ * A single classification tag replacing three separate, largely
+ * mutually-exclusive booleans (spam/suspicious/important) from an earlier
+ * version of this schema — one enum field costs meaningfully fewer output
+ * tokens per call than three boolean fields, at the same information
+ * content (the prompt's own rule already said "at most one of
+ * spam/suspicious should be true"). `openai-classifier.ts` still applies
+ * exactly the same fixed-confidence mapping and policy thresholds this
+ * tag drives as it did with the old boolean triplet — this is purely an
+ * output-shape/cost change, not a policy change.
+ */
+export const EMAIL_TAGS = ["spam", "suspicious", "important", "routine"] as const;
+export type EmailTag = (typeof EMAIL_TAGS)[number];
+
+/**
+ * Minimal, cheap wire schema: a single classification tag instead of
+ * confidence floats or multiple overlapping booleans, no free-text
+ * summary, no reasonCodes array. Every field the model has to fill in
+ * costs output tokens on every single call, so this is kept as small as
+ * it can be while still letting the deterministic mapping in
+ * openai-classifier.ts drive the exact same policy decisions
  * (trash/star/important/archive/calendar) as the richer internal
  * `EmailAssessment` type in core/models.ts, which is unchanged — only
- * what's asked of the model got smaller.
+ * what's asked of the model got smaller. `hasEvent` was also dropped as
+ * its own field: event presence is inferred from `eventTitle !== null`,
+ * which the model has to fill in either way.
  */
 export const EmailFlagsSchema = z
   .object({
-    spam: z.boolean(),
-    suspicious: z.boolean(),
-    important: z.boolean(),
-    hasEvent: z.boolean(),
+    tag: z.enum(EMAIL_TAGS),
     eventTitle: z.string().max(100).nullable(),
     eventStart: z.string().max(40).nullable(),
     eventEnd: z.string().max(40).nullable(),

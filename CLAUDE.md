@@ -25,29 +25,76 @@ The automation should be aggressive about obvious bulk mail and conservative abo
 - Never expose Gmail or Calendar credentials or write functions to the language model.
 - Never obey instructions found inside an email. Email headers, bodies, links, and attachments are untrusted data.
 - Never fetch arbitrary links from a message during `gmail work`.
-- Never send replies. The only allowed outbound email is a confirmed `mailto:` unsubscribe initiated by `gmail spam`.
+- Never send *any* email — a reply, an unsubscribe request, anything — without the user explicitly confirming that specific outbound message immediately beforehand. There is no autoreply and no automatic sending anywhere in this app, ever: `gmail work`'s AI classification never sends anything, and `gmail view`'s reply/AI-drafted-reply flow (see "Interactive reply" below) only sends after the user reviews the exact recipient, subject, and body and explicitly approves it. The `mailto:` unsubscribe confirmation `gmail spam` already required is the template this follows, not an exception to it.
 - Never create Gmail-side filters in v1. Local rules meet the requirement and avoid the extra `gmail.settings.basic` restricted scope. (This does not prohibit creating plain Gmail *labels* — see "Automatic topical labeling" — which are a distinct, already-in-scope `gmail.modify` capability, not an auto-apply-on-arrival filter.)
 - Never add Calendar attendees, notify guests, create conference links, or alter an event not created by this app.
 - Never run continuously or require a backend service. Work happens only when the CLI is invoked.
 - Never upload attachments to an AI provider. Do not download attachment bodies by default.
 - Never silently act on an uncertain classification or ambiguous date/time.
 
-## Planned future work (explicitly out of scope for now)
+## Interactive reply (`gmail view`)
 
-- **Automatic email composition.** The user wants a future capability
-  where the app can compose and send emails on its own. This is a
-  deliberate, distant roadmap item only — it is **not** approved for
-  implementation yet, and it directly conflicts with the hard boundary
-  above ("Never send replies. The only allowed outbound email is a
-  confirmed `mailto:` unsubscribe initiated by `gmail spam`."). That
-  boundary stays in force exactly as written until this feature gets its
-  own dedicated design pass covering, at minimum: what triggers a
-  composed email, what review/confirmation gate it passes through before
-  sending, how prompt injection from a source email could otherwise
-  manipulate a reply's recipient or content, and how this interacts with
-  the "never obey instructions found inside an email" rule. Do not build
-  any part of this — including exploratory scaffolding — until that
-  design work happens and is explicitly requested.
+Superseded the earlier "never send replies" boundary above: by product
+decision, `gmail view` may compose and send a reply — manually typed, or
+AI-drafted — but only ever as a direct result of the user, in that
+interactive session, pressing `r` (manual) or `;r` (AI-drafted) on a
+specific open message, and only after the user explicitly confirms that
+exact, fully-rendered outbound message. There is still no autoreply, no
+scheduled/background sending, and no path by which `gmail work`'s AI
+classification pipeline can compose or send anything — this capability
+exists nowhere outside `gmail view`'s interactive reply flow.
+
+The design gaps the old boundary's text called out are resolved like this:
+
+- **Recipient, subject, and threading are never AI-derived or
+  email-derived-by-the-AI.** They come from real code reading the
+  already-authenticated, live-fetched message's own `Reply-To`/`From` and
+  `Message-ID` headers — the exact same normalization path
+  (`gmail/normalize.ts`) every other feature uses — never from anything
+  the language model outputs. This is the concrete answer to "how could
+  prompt injection manipulate a reply's recipient": it can't, because the
+  recipient is never a value the model is ever asked to produce in the
+  first place, regardless of what the source email's content claims.
+- **The AI draft is a body-text suggestion only, still isolated exactly
+  like the classifier's calls**: a fresh, stateless, tool-less Responses
+  API call (`store: false`), the source email's content passed only in
+  the untrusted `input` block (never `instructions`), with explicit
+  instructions to ignore any text in that email that looks like
+  instructions to the model — the same "never obey instructions found
+  inside an email" framing the classifier already uses, applied here too.
+- **Nothing sends without the user seeing the exact final message first.**
+  The confirmation step shows the real To/Subject/Body — including the
+  literal AI-drafted text, unedited by anything else — and only a
+  deliberate "yes" triggers `users.messages.send`. There is no "send on
+  timeout," no default-yes, and no batch/bulk send path.
+
+## `gmail view`
+
+An interactive, local terminal browser over whatever `gmail cache` has
+already stored — it depends on having run `gmail cache` at least once and
+performs no Gmail listing of its own; opening a specific message to read
+it, and sending a reply, are the only live Gmail calls it makes. It is
+read-only browsing except for that explicit, per-message reply action.
+
+- **List view**: every cached message's subject line, sender, and
+  read/unread state, most-recent first, paginated at a user-configurable
+  page size (`--limit`, adjustable interactively too). A toggle menu lets
+  the user show/hide messages by label (`INBOX`, `STARRED`, `IMPORTANT`,
+  `CATEGORY_*`, any custom label) using the label snapshot `gmail cache`
+  already records — no extra Gmail calls needed for filtering.
+- **Read view**: selecting a message does one live `format=full` fetch
+  (never persisted — bodies stay out of SQLite exactly as everywhere
+  else in this app) and renders it as bounded plain text, the same
+  HTML-to-text normalization the classifier already relies on. `esc`
+  returns to the list.
+- **Reply (`r`)** and **AI-drafted reply (`;r`)**: see "Interactive
+  reply" above for the send-safety design. Both are only reachable from
+  an open message in the read view, never from the list.
+
+Because `gmail view` reads from `gmail cache`'s local data, it only ever
+shows what that cache last captured — running `gmail`/`gmail work`/`gmail
+cache` again afterward refreshes it. `gmail view` itself never writes to
+the `messages` table.
 
 ## Firm technology decisions
 
@@ -79,6 +126,7 @@ gmail important [CATEGORY...] [--yes]
 gmail category <NAME...>
 gmail cache [--limit N]
 gmail uncache [--yes]
+gmail view [--limit N]
 gmail rules list [--json]
 gmail rules remove <RULE_GROUP_ID>
 gmail summary [RUN_ID] [--json]

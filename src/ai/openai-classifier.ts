@@ -21,7 +21,7 @@ import {
 import type { ClassifyContext, Classifier } from "./classifier.js";
 import type { AssessmentResult, AssessmentUnavailable, EmailAssessment, NormalizedMessage } from "../core/models.js";
 
-export const SCHEMA_VERSION = "schema-v3";
+export const SCHEMA_VERSION = "schema-v4";
 const DEFAULT_TIMEOUT_MS = 20_000;
 
 /** Clearly above/below the 0.90 policy thresholds — the flags themselves are the decision; these just satisfy the existing threshold-based policy engine. */
@@ -127,23 +127,29 @@ function buildInputWithExamples(message: NormalizedMessage) {
 }
 
 /**
- * Deterministically maps the model's cheap boolean flags onto the richer
- * internal EmailAssessment shape core/policy.ts already knows how to
- * consume, at fixed confidence values that clearly clear or miss its
- * 0.90 thresholds — the flags *are* the decision; these numbers only
- * exist to satisfy a policy engine built around graded confidence.
- * `suspicious` maps to a kind policy.ts already treats as "no AI-derived
- * mutation, route to Review" regardless of the other flags, so a
- * contradictory combination (e.g. suspicious+important both true) is
- * still safe by construction.
+ * Deterministically maps the model's cheap `tag` (replacing the earlier
+ * spam/suspicious/important boolean triplet — see schema.ts) onto the
+ * richer internal EmailAssessment shape core/policy.ts already knows how
+ * to consume, at fixed confidence values that clearly clear or miss its
+ * 0.90 thresholds — the tag *is* the decision; these numbers only exist
+ * to satisfy a policy engine built around graded confidence. `suspicious`
+ * maps to a kind policy.ts already treats as "no AI-derived mutation,
+ * route to Review," so a model output that also set event/category
+ * fields for a suspicious tag is still safe by construction (and this
+ * function additionally zeroes both out below, defense in depth).
+ * `hasEvent` is inferred from `eventTitle !== null` rather than being its
+ * own field, since the model has to fill in eventTitle either way.
  */
 function mapFlagsToAssessment(flags: EmailFlags, message: NormalizedMessage, model: string): EmailAssessment {
-  const kind = flags.suspicious ? "suspicious" : flags.spam ? "promotion" : "personal_routine";
+  const kind =
+    flags.tag === "suspicious" ? "suspicious" : flags.tag === "spam" ? "promotion" : "personal_routine";
+  const hasEvent = flags.eventTitle !== null;
+  const isSuspicious = flags.tag === "suspicious";
   return {
     kind,
-    confidence: flags.suspicious || flags.spam ? HIGH_CONFIDENCE : LOW_CONFIDENCE,
-    importanceScore: flags.important ? HIGH_CONFIDENCE : LOW_CONFIDENCE,
-    importanceConfidence: flags.important ? HIGH_CONFIDENCE : LOW_CONFIDENCE,
+    confidence: isSuspicious || flags.tag === "spam" ? HIGH_CONFIDENCE : LOW_CONFIDENCE,
+    importanceScore: flags.tag === "important" ? HIGH_CONFIDENCE : LOW_CONFIDENCE,
+    importanceConfidence: flags.tag === "important" ? HIGH_CONFIDENCE : LOW_CONFIDENCE,
     summary: buildDeterministicSummary(message),
     reasonCodes: [],
     // A suspicious message's extracted facts are never trusted for either
@@ -152,7 +158,7 @@ function mapFlagsToAssessment(flags: EmailFlags, message: NormalizedMessage, mod
     // enforcing it symmetrically here too means that invariant doesn't
     // depend entirely on a single downstream gate staying correct forever.
     event:
-      flags.hasEvent && !flags.suspicious
+      hasEvent && !isSuspicious
         ? {
             intent: "create",
             confidence: HIGH_CONFIDENCE,
@@ -175,7 +181,7 @@ function mapFlagsToAssessment(flags: EmailFlags, message: NormalizedMessage, mod
             location: null,
             sourceEvidence: null
           },
-    category: flags.suspicious ? null : normalizeCategoryLabel(flags.category),
+    category: isSuspicious ? null : normalizeCategoryLabel(flags.category),
     classifierVersion: `openai:${model}`,
     promptVersion: PROMPT_VERSION,
     schemaVersion: SCHEMA_VERSION

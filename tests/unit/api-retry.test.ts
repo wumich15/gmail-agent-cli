@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { apiErrorStatus, withApiRetry } from "../../src/core/api-retry.js";
+import { apiErrorStatus, GoogleApiRateLimiter, withApiRetry, withGoogleApiRetry } from "../../src/core/api-retry.js";
 
 function gaxiosLikeError(status: number, retryAfterSeconds?: number): unknown {
   return {
@@ -140,6 +140,69 @@ describe("withApiRetry", () => {
     const error = Object.assign(new Error("boom"), { code: "SOME_OTHER_CODE" });
     const fn = vi.fn().mockRejectedValue(error);
     await expect(withApiRetry(fn, { baseDelayMs: 1, maxDelayMs: 2 })).rejects.toBeDefined();
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("GoogleApiRateLimiter", () => {
+  it("paces successive acquire() calls to no faster than the configured rate", async () => {
+    vi.useFakeTimers();
+    try {
+      const limiter = new GoogleApiRateLimiter(10); // 100ms between requests
+      const first = limiter.acquire();
+      await vi.advanceTimersByTimeAsync(0);
+      await first;
+      const start = Date.now();
+      const second = limiter.acquire();
+      await vi.advanceTimersByTimeAsync(100);
+      await second;
+      expect(Date.now() - start).toBeGreaterThanOrEqual(100);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("halves its rate (doubles the interval) on reportQuotaPressure, up to the ceiling", () => {
+    const limiter = new GoogleApiRateLimiter(10, 8_000); // starts at 100ms interval
+    expect(limiter.currentRequestsPerSecond).toBeCloseTo(10);
+    limiter.reportQuotaPressure();
+    expect(limiter.currentRequestsPerSecond).toBeCloseTo(5);
+    limiter.reportQuotaPressure();
+    expect(limiter.currentRequestsPerSecond).toBeCloseTo(2.5);
+  });
+
+  it("never backs off past its configured ceiling interval", () => {
+    const limiter = new GoogleApiRateLimiter(10, 500); // ceiling: 500ms interval = 2 req/s floor speed
+    for (let i = 0; i < 10; i++) limiter.reportQuotaPressure();
+    expect(limiter.currentRequestsPerSecond).toBeCloseTo(2);
+  });
+
+  it("creeps back toward the original rate after a sustained streak of successes", () => {
+    const limiter = new GoogleApiRateLimiter(10, 8_000);
+    limiter.reportQuotaPressure(); // now at 5 req/s
+    for (let i = 0; i < 25; i++) limiter.reportSuccess();
+    expect(limiter.currentRequestsPerSecond).toBeGreaterThan(5);
+    expect(limiter.currentRequestsPerSecond).toBeLessThanOrEqual(10);
+  });
+
+  it("never recovers past its original (floor interval) rate", () => {
+    const limiter = new GoogleApiRateLimiter(10, 8_000);
+    for (let i = 0; i < 1000; i++) limiter.reportSuccess();
+    expect(limiter.currentRequestsPerSecond).toBeCloseTo(10);
+  });
+});
+
+describe("withGoogleApiRetry", () => {
+  it("reports quota pressure to the shared limiter and still succeeds after retrying", async () => {
+    const fn = vi.fn().mockRejectedValueOnce(gaxiosLikeError(429)).mockResolvedValue("ok");
+    const result = await withGoogleApiRetry(fn, { baseDelayMs: 1, maxDelayMs: 2 });
+    expect(result).toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it("propagates a non-retryable error without swallowing it", async () => {
+    const fn = vi.fn().mockRejectedValue(gaxiosLikeError(404));
+    await expect(withGoogleApiRetry(fn, { baseDelayMs: 1, maxDelayMs: 2 })).rejects.toBeDefined();
     expect(fn).toHaveBeenCalledTimes(1);
   });
 });

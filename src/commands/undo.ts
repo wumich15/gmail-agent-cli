@@ -5,7 +5,7 @@ import { resolveAccount } from "./shared.js";
 import { RunsRepository, ActionsRepository } from "../state/repositories/runs.js";
 import { EXIT_CODES } from "../core/errors.js";
 import { GMAIL_LABELS } from "../gmail/labels.js";
-import { withApiRetry } from "../core/api-retry.js";
+import { withGoogleApiRetry } from "../core/api-retry.js";
 import { ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 
@@ -65,7 +65,7 @@ async function runUndoLocked(
   for (const action of reversible) {
     if (!action.targetGmailMessageId) continue;
     try {
-      const { data } = await withApiRetry(() =>
+      const { data } = await withGoogleApiRetry(() =>
         gmailClient.users.messages.get({
           userId: "me",
           id: action.targetGmailMessageId!,
@@ -76,7 +76,7 @@ async function runUndoLocked(
 
       switch (action.type) {
         case "trash":
-          await withApiRetry(() =>
+          await withGoogleApiRetry(() =>
             gmailClient.users.messages.untrash({ userId: "me", id: action.targetGmailMessageId! })
           );
           actionsRepo.updateStatus(action.actionKey, "reversed", nowIso);
@@ -86,7 +86,7 @@ async function runUndoLocked(
           if (currentLabels.includes(GMAIL_LABELS.inbox)) {
             skipped += 1; // user already has it back in Inbox or re-archived differently; nothing to do.
           } else {
-            await withApiRetry(() =>
+            await withGoogleApiRetry(() =>
               gmailClient.users.messages.modify({
                 userId: "me",
                 id: action.targetGmailMessageId!,
@@ -98,7 +98,7 @@ async function runUndoLocked(
           }
           break;
         case "star":
-          await withApiRetry(() =>
+          await withGoogleApiRetry(() =>
             gmailClient.users.messages.modify({
               userId: "me",
               id: action.targetGmailMessageId!,
@@ -109,7 +109,7 @@ async function runUndoLocked(
           undone += 1;
           break;
         case "mark_important":
-          await withApiRetry(() =>
+          await withGoogleApiRetry(() =>
             gmailClient.users.messages.modify({
               userId: "me",
               id: action.targetGmailMessageId!,

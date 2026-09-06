@@ -1,6 +1,6 @@
 import type { calendar_v3 } from "googleapis";
 import { deterministicCalendarEventId, payloadHash } from "../core/ids.js";
-import { apiErrorStatus, withApiRetry } from "../core/api-retry.js";
+import { apiErrorStatus, withGoogleApiRetry } from "../core/api-retry.js";
 import type { ValidatedEvent } from "./event-policy.js";
 
 export const CALENDAR_PROVENANCE_APP_ID = "gmail-agent-cli";
@@ -87,7 +87,7 @@ export async function insertIdempotentEvent(
   plan: EventInsertPlan
 ): Promise<InsertOutcome> {
   try {
-    const { data } = await withApiRetry(() =>
+    const { data } = await withGoogleApiRetry(() =>
       client.events.insert({
         calendarId: "primary",
         sendUpdates: "none",
@@ -99,7 +99,7 @@ export async function insertIdempotentEvent(
     if (!isConflictError(error)) {
       throw error;
     }
-    const { data: existing } = await withApiRetry(() =>
+    const { data: existing } = await withGoogleApiRetry(() =>
       client.events.get({
         calendarId: "primary",
         eventId: plan.eventId

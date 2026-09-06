@@ -151,9 +151,8 @@ describe("FEW_SHOT_EXAMPLES", () => {
     }
   });
 
-  it("covers the spam and suspicious cases distinctly", () => {
-    const kinds = FEW_SHOT_EXAMPLES.map((e) => ({ spam: e.output.spam, suspicious: e.output.suspicious }));
-    expect(kinds).toContainEqual({ spam: true, suspicious: false });
-    expect(kinds).toContainEqual({ spam: false, suspicious: true });
+  it("covers every tag at least once", () => {
+    const tags = new Set(FEW_SHOT_EXAMPLES.map((e) => e.output.tag));
+    expect(tags).toEqual(new Set(["spam", "suspicious", "important", "routine"]));
   });
 });

@@ -139,3 +139,103 @@ export async function withApiRetry<T>(fn: () => Promise<T>, options: RetryOption
     }
   }
 }
+
+/**
+ * Adaptive, process-wide pacing for Gmail/Calendar calls specifically
+ * (never OpenAI — a separate rate-limit domain with its own budget in
+ * `OpenAiClassifier`). Rather than guessing a single "safe" requests/second
+ * number up front (real observed per-project quotas have turned out lower
+ * than Google's documented defaults), this starts at a moderate rate,
+ * halves it the moment it sees a quota-shaped failure, and only creeps
+ * back up after a sustained clean streak — the goal named directly:
+ * "use the API to its fullest without getting rate limited," found
+ * adaptively rather than hardcoded.
+ */
+export class GoogleApiRateLimiter {
+  private intervalMs: number;
+  private readonly floorIntervalMs: number;
+  private readonly ceilingIntervalMs: number;
+  private lastRequestAt = 0;
+  private consecutiveSuccesses = 0;
+
+  constructor(initialRequestsPerSecond: number, ceilingIntervalMs = 4000) {
+    this.intervalMs = 1000 / initialRequestsPerSecond;
+    this.floorIntervalMs = this.intervalMs;
+    this.ceilingIntervalMs = ceilingIntervalMs;
+  }
+
+  /** Current pacing, for observability (e.g. a --json summary or debug output). */
+  get currentRequestsPerSecond(): number {
+    return 1000 / this.intervalMs;
+  }
+
+  async acquire(): Promise<void> {
+    const waitUntil = this.lastRequestAt + this.intervalMs;
+    const now = Date.now();
+    if (waitUntil > now) {
+      await sleep(waitUntil - now);
+    }
+    this.lastRequestAt = Date.now();
+  }
+
+  reportQuotaPressure(): void {
+    this.intervalMs = Math.min(this.intervalMs * 2, this.ceilingIntervalMs);
+    this.consecutiveSuccesses = 0;
+  }
+
+  reportSuccess(): void {
+    this.consecutiveSuccesses += 1;
+    if (this.consecutiveSuccesses >= 25 && this.intervalMs > this.floorIntervalMs) {
+      this.intervalMs = Math.max(this.floorIntervalMs, this.intervalMs * 0.85);
+      this.consecutiveSuccesses = 0;
+    }
+  }
+}
+
+const DEFAULT_GOOGLE_REQUESTS_PER_SECOND = 8;
+// Effectively unlimited: real production pacing has no place slowing down
+// a test suite that constructs dozens of fake-client calls per test and
+// never talks to a real Gmail API. Vitest sets this env var in every
+// worker automatically, so this needs no test-file-by-test-file opt-out.
+const TEST_ENV_REQUESTS_PER_SECOND = 1_000_000;
+
+function parsePositiveNumber(raw: string | undefined, fallback: number): number {
+  const parsed = raw !== undefined ? Number(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * One shared limiter for the whole process — concurrent Gmail reads
+ * (`mapWithConcurrency`) all pace through the same instance, so raising
+ * `concurrency.gmailReads` increases parallelism without increasing the
+ * actual request rate beyond what this limiter allows. Override the
+ * starting rate with `GMAIL_AGENT_RATE_LIMIT_RPS` if you know your
+ * project's real per-user quota is higher or lower than the default.
+ */
+export const googleApiRateLimiter = new GoogleApiRateLimiter(
+  process.env["VITEST"] !== undefined
+    ? TEST_ENV_REQUESTS_PER_SECOND
+    : parsePositiveNumber(process.env["GMAIL_AGENT_RATE_LIMIT_RPS"], DEFAULT_GOOGLE_REQUESTS_PER_SECOND)
+);
+
+/**
+ * `withApiRetry`, but for Gmail/Calendar calls specifically: paces every
+ * attempt (including retries) through the shared `googleApiRateLimiter`
+ * first, and feeds that limiter's adaptive backoff from whether each
+ * attempt hit a retryable (quota-shaped) failure or not.
+ */
+export async function withGoogleApiRetry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
+  return withApiRetry(async () => {
+    await googleApiRateLimiter.acquire();
+    try {
+      const result = await fn();
+      googleApiRateLimiter.reportSuccess();
+      return result;
+    } catch (error) {
+      if (isRetryableStatus(apiErrorStatus(error)) || isRetryableGoogleQuotaMessage(error)) {
+        googleApiRateLimiter.reportQuotaPressure();
+      }
+      throw error;
+    }
+  }, options);
+}

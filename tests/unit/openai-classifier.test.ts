@@ -29,10 +29,7 @@ const CONTEXT = { classifierVersion: "x", promptVersion: "x", schemaVersion: "x"
 
 function flags(overrides: Partial<EmailFlags> = {}): EmailFlags {
   return {
-    spam: false,
-    suspicious: false,
-    important: false,
-    hasEvent: false,
+    tag: "routine",
     eventTitle: null,
     eventStart: null,
     eventEnd: null,
@@ -74,8 +71,8 @@ describe("OpenAiClassifier", () => {
     expect(turns[turns.length - 1]!.content).toContain("a@example.com");
   });
 
-  it("maps spam:true to a promotion assessment that clears the trash confidence threshold", async () => {
-    const client = fakeClient(async () => ({ output_parsed: flags({ spam: true }), output: [] }));
+  it("maps tag:spam to a promotion assessment that clears the trash confidence threshold", async () => {
+    const client = fakeClient(async () => ({ output_parsed: flags({ tag: "spam" }), output: [] }));
     const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
     const result = await classifier.assess(message(), CONTEXT);
     expect(result.ok).toBe(true);
@@ -85,9 +82,9 @@ describe("OpenAiClassifier", () => {
     }
   });
 
-  it("maps suspicious:true to a suspicious assessment regardless of other flags (safety override)", async () => {
+  it("maps tag:suspicious to a suspicious assessment regardless of other fields (safety override)", async () => {
     const client = fakeClient(async () => ({
-      output_parsed: flags({ suspicious: true, important: true, hasEvent: true, eventTitle: "x", eventStart: "2099-01-01" }),
+      output_parsed: flags({ tag: "suspicious", eventTitle: "x", eventStart: "2099-01-01" }),
       output: []
     }));
     const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
@@ -102,8 +99,8 @@ describe("OpenAiClassifier", () => {
     }
   });
 
-  it("maps important:true to importance scores that clear the star threshold", async () => {
-    const client = fakeClient(async () => ({ output_parsed: flags({ important: true }), output: [] }));
+  it("maps tag:important to importance scores that clear the star threshold", async () => {
+    const client = fakeClient(async () => ({ output_parsed: flags({ tag: "important" }), output: [] }));
     const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
     const result = await classifier.assess(message(), CONTEXT);
     expect(result.ok).toBe(true);
@@ -113,7 +110,7 @@ describe("OpenAiClassifier", () => {
     }
   });
 
-  it("maps hasEvent:false to a non-create event with sub-threshold confidence", async () => {
+  it("maps a null eventTitle (no event) to a non-create event with sub-threshold confidence", async () => {
     const client = fakeClient(async () => ({ output_parsed: flags(), output: [] }));
     const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
     const result = await classifier.assess(message(), CONTEXT);
@@ -124,9 +121,9 @@ describe("OpenAiClassifier", () => {
     }
   });
 
-  it("maps hasEvent:true to a create-intent event carrying the model's fields through", async () => {
+  it("maps a non-null eventTitle to a create-intent event carrying the model's fields through", async () => {
     const client = fakeClient(async () => ({
-      output_parsed: flags({ hasEvent: true, eventTitle: "Dentist", eventStart: "2099-01-01T10:00:00", eventAllDay: false }),
+      output_parsed: flags({ eventTitle: "Dentist", eventStart: "2099-01-01T10:00:00", eventAllDay: false }),
       output: []
     }));
     const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
@@ -139,6 +136,18 @@ describe("OpenAiClassifier", () => {
         start: "2099-01-01T10:00:00"
       });
       expect(result.assessment.event.confidence).toBeGreaterThanOrEqual(0.9);
+    }
+  });
+
+  it("maps tag:routine to personal_routine with sub-threshold confidence/importance", async () => {
+    const client = fakeClient(async () => ({ output_parsed: flags({ tag: "routine" }), output: [] }));
+    const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });
+    const result = await classifier.assess(message(), CONTEXT);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.assessment.kind).toBe("personal_routine");
+      expect(result.assessment.confidence).toBeLessThan(0.9);
+      expect(result.assessment.importanceScore).toBeLessThan(0.9);
     }
   });
 
@@ -165,7 +174,7 @@ describe("OpenAiClassifier", () => {
 
   it("forces category to null for a suspicious message even if the model set one (safety override)", async () => {
     const client = fakeClient(async () => ({
-      output_parsed: flags({ suspicious: true, category: "Finance" }),
+      output_parsed: flags({ tag: "suspicious", category: "Finance" }),
       output: []
     }));
     const classifier = new OpenAiClassifier({ model: "gpt-5.4-mini", client });

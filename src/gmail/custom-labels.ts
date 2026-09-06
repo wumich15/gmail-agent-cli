@@ -1,5 +1,5 @@
 import type { GmailClient } from "./client.js";
-import { apiErrorStatus, withApiRetry } from "../core/api-retry.js";
+import { apiErrorStatus, withGoogleApiRetry } from "../core/api-retry.js";
 
 export interface UserLabel {
   id: string;
@@ -12,7 +12,7 @@ export interface UserLabel {
  * for AI-assigned topical grouping or the "Calendar" label).
  */
 export async function listUserLabels(client: GmailClient): Promise<UserLabel[]> {
-  const { data } = await withApiRetry(() => client.users.labels.list({ userId: "me" }));
+  const { data } = await withGoogleApiRetry(() => client.users.labels.list({ userId: "me" }));
   const labels: UserLabel[] = [];
   for (const label of data.labels ?? []) {
     if (label.type === "user" && label.id && label.name) {
@@ -40,7 +40,7 @@ export async function getOrCreateLabelId(
     return existing;
   }
   try {
-    const { data } = await withApiRetry(() =>
+    const { data } = await withGoogleApiRetry(() =>
       client.users.labels.create({
         userId: "me",
         requestBody: { name, labelListVisibility: "labelShow", messageListVisibility: "show" }
