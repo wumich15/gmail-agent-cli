@@ -114,7 +114,10 @@ export async function runCache(options: CacheOptions = {}): Promise<number> {
           importanceScore: null,
           importanceConfidence: null,
           reasonCodes: null,
-          processedAt: ctx.clock.nowIso()
+          processedAt: ctx.clock.nowIso(),
+          subject: normalized.subject || null,
+          senderDisplay: normalized.from.displayName ?? normalized.from.address,
+          internalDate: normalized.internalDate
         });
         cached += 1;
       } catch {

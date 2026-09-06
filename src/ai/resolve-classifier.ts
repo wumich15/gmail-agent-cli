@@ -16,26 +16,25 @@ export interface ResolvedClassifier {
   description: string;
 }
 
+export interface ResolvedOpenAiCredentials {
+  apiKey: string;
+  model: string;
+  baseURL: string | null;
+}
+
 /**
- * Resolves which classifier a run should use. A usable API key — checked
- * in the OS credential store first, then the OPENAI_API_KEY environment
- * variable, matching how the OpenAI SDK itself defaults — is both
- * necessary and sufficient to enable real AI classification; this is the
- * practical opt-in signal for a local CLI tool with no separate consent
- * UI yet. Without one, NotConfiguredClassifier keeps the pipeline safe:
- * no AI-derived mutation, deterministic rules and read-archiving only.
+ * Shared credential/model resolution: checked in the OS credential store
+ * first, then the OPENAI_API_KEY environment variable, matching how the
+ * OpenAI SDK itself defaults. Used both by `resolveClassifier` below and
+ * by `gmail view`'s AI-drafted-reply feature, so the two never drift on
+ * which key/model/provider they end up using.
  */
-export async function resolveClassifier(input: ResolveClassifierInput): Promise<ResolvedClassifier> {
+export async function resolveOpenAiCredentials(input: ResolveClassifierInput): Promise<ResolvedOpenAiCredentials | null> {
   const storedKey = await input.credentialStore.getSecret(CREDENTIAL_KEYS.aiApiKey(input.accountHash));
   const apiKey = storedKey ?? process.env["OPENAI_API_KEY"];
-
   if (!apiKey) {
-    return {
-      classifier: new NotConfiguredClassifier(),
-      description: "AI classification is not configured (no API key found) — using rules-only mode."
-    };
+    return null;
   }
-
   // GMAIL_AGENT_MODEL is documented as a live override (CLAUDE.md's
   // "Firm technology decisions" table), so it must win over whatever
   // model got persisted into config.json at an earlier sign-in — a
@@ -44,13 +43,32 @@ export async function resolveClassifier(input: ResolveClassifierInput): Promise<
   const model = process.env["GMAIL_AGENT_MODEL"] || input.config?.model || DEFAULT_MODEL;
   const baseURL =
     input.config?.aiProvider === "openai-compatible" && input.config.aiBaseUrl ? input.config.aiBaseUrl : null;
+  return { apiKey, model, baseURL };
+}
+
+/**
+ * Resolves which classifier a run should use. A usable API key is both
+ * necessary and sufficient to enable real AI classification; this is the
+ * practical opt-in signal for a local CLI tool with no separate consent
+ * UI yet. Without one, NotConfiguredClassifier keeps the pipeline safe:
+ * no AI-derived mutation, deterministic rules and read-archiving only.
+ */
+export async function resolveClassifier(input: ResolveClassifierInput): Promise<ResolvedClassifier> {
+  const credentials = await resolveOpenAiCredentials(input);
+
+  if (!credentials) {
+    return {
+      classifier: new NotConfiguredClassifier(),
+      description: "AI classification is not configured (no API key found) — using rules-only mode."
+    };
+  }
 
   return {
     classifier: new OpenAiClassifier({
-      apiKey,
-      model,
-      ...(baseURL !== null ? { baseURL } : {})
+      apiKey: credentials.apiKey,
+      model: credentials.model,
+      ...(credentials.baseURL !== null ? { baseURL: credentials.baseURL } : {})
     }),
-    description: `Using AI classification via ${baseURL ?? "the OpenAI API"} (model: ${model}).`
+    description: `Using AI classification via ${credentials.baseURL ?? "the OpenAI API"} (model: ${credentials.model}).`
   };
 }

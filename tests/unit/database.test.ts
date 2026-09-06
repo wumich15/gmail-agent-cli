@@ -136,11 +136,16 @@ describe("openDatabase", () => {
       importanceScore: null,
       importanceConfidence: null,
       reasonCodes: null,
-      processedAt: "now"
+      processedAt: "now",
+      subject: "Hello",
+      senderDisplay: "alice@example.com",
+      internalDate: "1000"
     });
     const found = repo.get("abc", "m1");
     expect(found?.contentHash).toBe("hash-1");
     expect(found?.labelSnapshot).toEqual(["INBOX", "UNREAD"]);
+    expect(found?.subject).toBe("Hello");
+    expect(found?.senderDisplay).toBe("alice@example.com");
     expect(repo.countForAccount("abc")).toBe(1);
     db.close();
   });
@@ -171,12 +176,53 @@ describe("openDatabase", () => {
       assessmentConfidence: null,
       importanceScore: null,
       importanceConfidence: null,
-      reasonCodes: null
+      reasonCodes: null,
+      subject: "Hi",
+      senderDisplay: "a@example.com",
+      internalDate: "1000"
     };
     repo.upsert({ ...base, contentHash: "hash-1", processedAt: "t0" });
     repo.upsert({ ...base, contentHash: "hash-2", processedAt: "t1" });
     expect(repo.countForAccount("abc")).toBe(1);
     expect(repo.get("abc", "m1")?.contentHash).toBe("hash-2");
+    db.close();
+  });
+
+  it("listForAccount returns cached messages most-recent-first by internalDate", () => {
+    const db = openDatabase(freshDbPath());
+    new AccountsRepository(db).upsert({
+      accountHash: "abc",
+      emailDisplay: null,
+      timezone: "UTC",
+      historyMarker: null,
+      setupComplete: true,
+      automationEnabled: false,
+      createdAt: "now",
+      updatedAt: "now"
+    });
+    const repo = new MessagesRepository(db);
+    const base = {
+      accountHash: "abc",
+      gmailThreadId: "t1",
+      contentHash: "hash",
+      labelSnapshot: ["INBOX"],
+      classifierVersion: null,
+      promptVersion: null,
+      schemaVersion: null,
+      policyVersion: null,
+      assessmentKind: null,
+      assessmentConfidence: null,
+      importanceScore: null,
+      importanceConfidence: null,
+      reasonCodes: null,
+      processedAt: "now",
+      senderDisplay: "a@example.com"
+    };
+    repo.upsert({ ...base, gmailMessageId: "old", subject: "Old", internalDate: "1000" });
+    repo.upsert({ ...base, gmailMessageId: "new", subject: "New", internalDate: "9000" });
+    repo.upsert({ ...base, gmailMessageId: "mid", subject: "Mid", internalDate: "5000" });
+    const list = repo.listForAccount("abc");
+    expect(list.map((m) => m.gmailMessageId)).toEqual(["new", "mid", "old"]);
     db.close();
   });
 
@@ -250,7 +296,10 @@ describe("openDatabase", () => {
       importanceScore: null,
       importanceConfidence: null,
       reasonCodes: null,
-      processedAt: "now"
+      processedAt: "now",
+      subject: "Hi",
+      senderDisplay: "a@example.com",
+      internalDate: "1000"
     });
     const candidatesRepo = new LabelCandidatesRepository(db);
     candidatesRepo.upsert({ accountHash: "abc", normalizedName: "shopping", displayName: "Shopping", pendingCount: 3, updatedAt: "now" });

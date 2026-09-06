@@ -200,10 +200,11 @@ file is group/world-readable on POSIX platforms).
 | Table | Purpose |
 | --- | --- |
 | `accounts` | Account hash, display email, timezone, Gmail history marker, setup/automation flags |
-| `messages` | Per-message classifier/policy version projection (no bodies, no verbatim evidence) |
+| `messages` | Per-message classifier/policy version projection, plus (migration 003) `subject`/`sender_display`/`internal_date` — low-sensitivity metadata `gmail view`'s list reads from; still never a body |
+| `label_candidates` | (migration 002) Cross-run cumulative counts for AI-guessed topical categories that haven't cleared `MIN_LABEL_BATCH_SIZE` yet |
 | `rule_groups` / `rule_matchers` | User-created spam/important categories and their concrete matchers |
 | `runs` | One row per `gmail work`/`spam`/`important` invocation |
-| `actions` | The durable action ledger — outbox pattern: `planned -> applying -> applied \| failed_* \| skipped_conflict \| unknown_no_retry` |
+| `actions` | The durable action ledger — outbox pattern: `planned -> applying -> applied \| failed_* \| skipped_conflict \| unknown_no_retry \| reversed` |
 | `unsubscribe_attempts` | Per-subscription-identity attempt history (never retried automatically) |
 | `calendar_links` | Account/message/candidate -> Calendar event ID + provenance |
 | `settings` | Non-secret versioned settings only |
@@ -258,9 +259,33 @@ exists purely to let a user pay the expensive full-traversal cost once,
 deliberately, and refresh the history-marker baseline, so every
 `gmail`/`gmail work` run afterward is cheap. It also upserts each visited
 message's non-verbatim projection (`contentHash`, sorted `labelSnapshot`,
-no assessment fields) into the `messages` table via the new
-`MessagesRepository`, laying groundwork for the not-yet-implemented
-assessment-reuse cache described in "Known deviations."
+`subject`/`senderDisplay`/`internalDate`, no assessment fields) into the
+`messages` table via `MessagesRepository`, which `gmail view` reads
+directly (see "gmail view" below) and which also lays groundwork for the
+not-yet-implemented assessment-reuse cache described in "Known
+deviations."
+
+### Adaptive Gmail rate limiting
+
+`src/core/api-retry.ts`'s `GoogleApiRateLimiter` is a shared,
+process-wide token-bucket pacer every Gmail/Calendar call goes through via
+a new `withGoogleApiRetry` (all six Gmail/Calendar call sites —
+`scanner.ts`, `executor.ts`, `custom-labels.ts`, `idempotency.ts`,
+`work.ts`, `undo.ts` — switched from the plain `withApiRetry`; OpenAI
+calls are untouched, a separate quota domain with their own budget in
+`OpenAiClassifier`). Rather than hardcoding one "safe" requests/second
+number — real observed per-project quotas have proven lower than Google's
+documented defaults in live use this session — it starts at a moderate
+rate (`GMAIL_AGENT_RATE_LIMIT_RPS`, default 8/s), halves itself the
+instant it sees a quota-shaped failure (429, a retryable network error, or
+the Service Infrastructure quota-message pattern), and only creeps back up
+after 25 consecutive clean calls. Concurrency (`concurrency.gmailReads`)
+still controls how many requests are *in flight*; this limiter controls
+how *fast* they're allowed to leave regardless of concurrency, so raising
+concurrency no longer risks a burst past whatever rate the account can
+actually sustain. Automatically bypassed under Vitest (`process.env.VITEST`)
+so the test suite doesn't pay real sleep time pacing fake-client calls —
+tests exercise the `GoogleApiRateLimiter` class directly instead.
 
 ## AI status in this build
 
@@ -269,16 +294,22 @@ The real OpenAI-backed classifier is implemented:
 call to OpenAI's Responses API per unresolved message (`store: false`, no
 tools, no `previous_response_id`). By product decision, the model fills
 in a deliberately minimal, cheap wire schema (`src/ai/schema.ts`'s
-`EmailFlagsSchema`) — plain booleans (`spam`, `suspicious`, `important`,
-`hasEvent`) plus a few event fields and one short nullable string
-(`category`), no confidence floats, no free-text summary, no reason-code
-array — parsed via `zodTextFormat`. It never
-receives Gmail/Calendar credentials or the ability to call anything — it
-returns flags, and `openai-classifier.ts` deterministically maps them
-onto the richer internal `EmailAssessment` shape `core/policy.ts` already
-knows how to consume (fixed confidence values that clearly clear or miss
-its 0.90 thresholds; the flags *are* the decision, the policy engine's
-threshold check is satisfied by construction). The `summary` field is no
+`EmailFlagsSchema`) — a single `tag` enum (`spam`/`suspicious`/
+`important`/`routine`, replacing an earlier version's three separate,
+largely mutually-exclusive booleans — the prompt already said "at most
+one of spam/suspicious should be true," so one enum field costs fewer
+output tokens per call at the same information content) plus a few event
+fields (event presence inferred from `eventTitle !== null`, no separate
+`hasEvent` boolean) and one short nullable string (`category`) — no
+confidence floats, no free-text summary, no reason-code array — parsed
+via `zodTextFormat`. It never receives Gmail/Calendar credentials or the
+ability to call anything — it returns the tag+fields, and
+`openai-classifier.ts` deterministically maps them onto the richer
+internal `EmailAssessment` shape `core/policy.ts` already knows how to
+consume (fixed confidence values that clearly clear or miss its 0.90
+thresholds; the tag *is* the decision, the policy engine's threshold
+check is satisfied by construction — this schema change is purely an
+output-shape/cost change, not a policy change). The `summary` field is no
 longer AI-generated at all — `buildDeterministicSummary` in
 `src/ai/prompt.ts` derives it from the subject and first non-blank line
 of content, at zero token cost.
@@ -473,6 +504,51 @@ the MVP surface small:
   to run as it is to skip. Requires confirmation unless `--yes`. The next
   scan afterward takes the same `runFullScan` path as an account's
   first-ever run or an expired marker.
+- **`gmail view`** (`src/commands/view.ts`) — an interactive terminal
+  browser over `gmail cache`'s local data; see "gmail view" below.
+
+### `gmail view`
+
+Reads `MessagesRepository.listForAccount` once at startup — every
+list/page/tag-filter interaction after that is pure in-memory
+filtering/pagination, no Gmail calls. Live Gmail calls happen only for
+two actions: opening a message (`fetchMessageFull`, never persisted) and
+sending a reply.
+
+- **List**: `renderList` prints numbered subject/sender/unread-marker
+  rows for the current page; `t` opens a `@clack/prompts` `multiselect`
+  over every distinct label seen across cached messages (`collectDistinctTags`)
+  to toggle which are hidden; `n`/`p`/`l <n>` handle paging and page size.
+- **Read**: selecting a number does a live `format=full` fetch, normalizes
+  it exactly like every other pipeline (`buildNormalizedMessage`,
+  `extractBodyParts`), and renders it. `src/core/keypress.ts`'s
+  `waitForKeypress` puts stdin into raw mode for exactly one keypress at a
+  time (restoring the prior mode immediately after) — used to detect
+  `esc` (back to list), a bare `r` (manual reply), or `;` followed by `r`
+  within one second (AI-drafted reply), all without pulling in a full TUI
+  framework.
+- **Reply**: `src/gmail/reply.ts`'s `buildReplyTarget` derives recipient
+  (`Reply-To` preferred over `From`), `Re:`-prefixed subject, and
+  `In-Reply-To`/`References` threading headers purely from the
+  already-parsed `NormalizedMessage` — never from AI output, never from
+  body content (see CLAUDE.md's "Interactive reply" for why this is the
+  concrete anti-injection property). `sendReply` builds the raw MIME
+  message and calls `messages.send` with the original `threadId`; nothing
+  calls it without `confirmAndSend` first showing the exact To/Subject/Body
+  and getting an explicit `y` — there is no default-yes and no path that
+  skips this. The process lock is held only around the send call itself,
+  not the whole interactive session (browsing/reading needs no
+  exclusivity; sending a real Gmail mutation does).
+- **AI-drafted reply**: `src/ai/draft-reply.ts`'s `draftReply` is a
+  separate, direct OpenAI Responses call (not through the `Classifier`
+  interface) — stateless, `store: false`, no tools, the source email
+  isolated in `input` with explicit instructions to ignore anything in it
+  that looks like a directive, matching the classifier's own
+  prompt-injection posture. It returns body text only (or `null` on any
+  failure, which the caller treats as "fall back to a manual reply") and
+  is never asked for a recipient/subject — `confirmAndSend` and
+  `buildReplyTarget` are reused unchanged from the manual-reply path, so
+  the AI draft goes through the exact same review-before-send gate.
 
 Every `gmail` run's summary (`src/summary/build-summary.ts`) carries,
 in addition to the per-action-type detail lists, two sections built
@@ -640,6 +716,28 @@ covered by new regression tests:
 
 ## Known deviations from the full design (as of this writing)
 
+- `gmail view`'s "toggles on the side for each tag" is implemented as an
+  on-demand `multiselect` menu (`t`) rather than an always-visible sidebar
+  panel — there's no TUI framework in the stack (`commander`/
+  `@clack/prompts`/`picocolors` only), and adding one (e.g. `blessed` or
+  `ink`) was judged a bigger dependency/architecture decision than this
+  pass should make unilaterally. The filtering capability itself works
+  exactly as requested; only the always-visible-panel presentation is
+  simplified.
+- A manual reply's body is entered via a single `@clack/prompts` `text`
+  prompt (effectively one line/paragraph), not a true multi-line editor —
+  a real "compose an email" text area would need either raw terminal
+  input handling well beyond `waitForKeypress`'s single-keypress scope or
+  shelling out to `$EDITOR`, neither implemented yet.
+- A sent reply (manual or AI-drafted) is not recorded in the `actions`
+  ledger the way `gmail work`'s mutations are — `gmail summary`/`gmail
+  undo` have no visibility into replies sent via `gmail view`, and a sent
+  reply cannot be "undone" (matching email in general: CLAUDE.md already
+  treats unsubscribe the same way, calling it "not reversible").
+- `gmail view`'s list only ever reflects whatever `gmail cache` (or an
+  earlier `gmail view` session, which never writes back) last captured —
+  there's no "refresh from Gmail" action inside `gmail view` itself; the
+  user re-runs `gmail cache` externally.
 - `src/core/api-retry.ts` (shared by the Gmail/Calendar and OpenAI call
   sites) retries 429 (quota exceeded) and 5xx responses, and (as of this
   pass) bare network failures with no HTTP status at all (`ECONNRESET`,
