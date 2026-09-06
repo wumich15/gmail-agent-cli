@@ -6,15 +6,9 @@ import { lockFilePath } from "../config/paths.js";
 import { EXIT_CODES } from "../core/errors.js";
 import { AccountsRepository } from "../state/repositories/accounts.js";
 import { MessagesRepository } from "../state/repositories/messages.js";
-import { dedupeStubs } from "../core/orchestrator.js";
+import { dedupeStubs, resolvePostScanHistoryMarker } from "../core/orchestrator.js";
 import { mapWithConcurrency } from "../core/concurrency.js";
-import {
-  fetchProfile,
-  fetchMessageFull,
-  headersFromMessage,
-  listAllMessageIds,
-  listHistorySince
-} from "../gmail/scanner.js";
+import { fetchProfile, fetchMessageFull, headersFromMessage, listAllMessageIds } from "../gmail/scanner.js";
 import { buildNormalizedMessage, extractBodyParts } from "../gmail/normalize.js";
 import { GMAIL_LABELS } from "../gmail/labels.js";
 
@@ -130,9 +124,14 @@ export async function runCache(options: CacheOptions = {}): Promise<number> {
 
     // Same fence-then-reconcile pattern as a full `gmail work` scan: catch
     // anything that changed during this traversal so the marker we persist
-    // doesn't leave a gap for the very next incremental run to miss.
-    const postScanHistory = await listHistorySince(gmailClient, profile.historyId);
-    const newHistoryMarker = postScanHistory.expiredMarker ? profile.historyId : postScanHistory.endHistoryId;
+    // doesn't leave a gap for the very next incremental run to miss. This
+    // tolerates the reconciliation call itself failing (e.g. a sustained
+    // Gmail quota error from having just fetched thousands of messages) by
+    // falling back to the pre-scan fence — losing that one optimization is
+    // far better than the whole command crashing here and never recording
+    // a marker at all, throwing away the entire point of paying for this
+    // expensive full traversal in the first place.
+    const newHistoryMarker = await resolvePostScanHistoryMarker(gmailClient, profile.historyId);
     new AccountsRepository(ctx.db).updateHistoryMarker(account.accountHash, newHistoryMarker, ctx.clock.nowIso());
 
     console.log(

@@ -91,6 +91,31 @@ describe("withApiRetry", () => {
     expect(fn).toHaveBeenCalledTimes(2);
   });
 
+  it("retries Google's Service Infrastructure quota error even with no numeric .status, for a per-minute limit", async () => {
+    // Regression: this exact error shape (a bare Error with the quota
+    // message but no usable .status) was observed reaching withApiRetry
+    // and failing immediately with zero retries during a large `gmail
+    // cache` run, even though a per-minute quota is exactly as transient
+    // as a 429.
+    const quotaError = new Error(
+      "Quota exceeded for quota metric 'Total Query Cost' and limit 'Units per minute per user' of service " +
+        "'gmail.googleapis.com' for consumer 'project_number:944865497602'."
+    );
+    const fn = vi.fn().mockRejectedValueOnce(quotaError).mockResolvedValue("ok");
+    const result = await withApiRetry(fn, { baseDelayMs: 1, maxDelayMs: 2 });
+    expect(result).toBe("ok");
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry a daily/lifetime Google quota error — it won't clear within this process's retry budget", async () => {
+    const dailyQuotaError = new Error(
+      "Quota exceeded for quota metric 'Total Query Cost' and limit 'Units per day' of service 'gmail.googleapis.com'."
+    );
+    const fn = vi.fn().mockRejectedValue(dailyQuotaError);
+    await expect(withApiRetry(fn, { baseDelayMs: 1, maxDelayMs: 2 })).rejects.toBe(dailyQuotaError);
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
   it("does not treat an unrelated .code (not a known network error code) as retryable", async () => {
     const error = Object.assign(new Error("boom"), { code: "SOME_OTHER_CODE" });
     const fn = vi.fn().mockRejectedValue(error);

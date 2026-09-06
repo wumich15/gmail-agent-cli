@@ -194,6 +194,30 @@ async function classifyAndFinalize(
   return applyLabelBatchThreshold(rawOutcomes, existingLabelNamesLower, deps.priorLabelCandidateCounts ?? new Map());
 }
 
+/**
+ * Resolves the historyId to persist after a full snapshot, tolerating a
+ * failure of the reconciliation call itself (e.g. a sustained Gmail quota
+ * error surviving withApiRetry's whole budget). Falling back to the
+ * pre-scan fence here is strictly safer than letting the exception
+ * propagate: history is only ever an optimization (CLAUDE.md), so a
+ * caller that can't complete this one read-only reconciliation call
+ * should still get to persist *a* valid marker and keep the rest of an
+ * expensive scan's results, rather than the whole command crashing and
+ * losing everything after already paying for the full traversal — the
+ * only cost of falling back to the fence is that the next incremental
+ * scan re-reconciles anything that changed during this scan's own
+ * listing window, which is exactly what it would have done anyway if the
+ * marker had expired.
+ */
+export async function resolvePostScanHistoryMarker(client: GmailClient, fenceHistoryId: string): Promise<string> {
+  try {
+    const postScanHistory = await listHistorySince(client, fenceHistoryId);
+    return postScanHistory.expiredMarker ? fenceHistoryId : postScanHistory.endHistoryId;
+  } catch {
+    return fenceHistoryId;
+  }
+}
+
 async function runFullScan(deps: OrchestratorDeps, profile: MailboxProfile): Promise<WorkScanResult> {
   const [spamResult, inboxResult] = await Promise.all([
     listAllMessageIds(deps.gmailClient, {
@@ -218,8 +242,7 @@ async function runFullScan(deps: OrchestratorDeps, profile: MailboxProfile): Pro
   // incremental run (which starts from the marker persisted below) — see
   // CLAUDE.md's "read historyId before listing... then reconcile every
   // change through the returned ending history ID."
-  const postScanHistory = await listHistorySince(deps.gmailClient, profile.historyId);
-  const newHistoryMarker = postScanHistory.expiredMarker ? profile.historyId : postScanHistory.endHistoryId;
+  const newHistoryMarker = await resolvePostScanHistoryMarker(deps.gmailClient, profile.historyId);
 
   return {
     summary,

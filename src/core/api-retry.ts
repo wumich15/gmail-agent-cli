@@ -41,6 +41,24 @@ function isRetryableNetworkError(error: unknown): boolean {
   return typeof code === "string" && RETRYABLE_NETWORK_ERROR_CODES.has(code);
 }
 
+/**
+ * Google's Service Infrastructure quota errors ("Quota exceeded for quota
+ * metric '...' and limit '...' of service '...'") don't always carry a
+ * `.status` this client library layer preserves — in practice they've been
+ * observed reaching here as a bare `Error` with no numeric `.status` at
+ * all, meaning `isRetryableStatus` alone misses them entirely and they
+ * fail immediately with zero retries despite being exactly as transient as
+ * a 429. Only a per-second/per-minute/per-100-seconds bucket is treated as
+ * retryable here — a daily/lifetime quota error matching the same message
+ * shape would never clear within this process's retry budget, so retrying
+ * it would just waste the budget before falling through to the same
+ * failure anyway.
+ */
+function isRetryableGoogleQuotaMessage(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  return /Quota exceeded for quota metric/i.test(message) && /per (second|minute|100 seconds)/i.test(message);
+}
+
 /** Parses RFC 7231 `Retry-After` in either its delta-seconds or HTTP-date form. */
 function retryAfterMs(error: unknown): number | null {
   const headers = (error as { response?: { headers?: unknown } } | undefined)?.response?.headers;
@@ -82,11 +100,15 @@ const DEFAULT_OPTIONS: Required<RetryOptions> = {
 
 /**
  * Retries an API call with truncated exponential backoff and jitter on
- * 429 (rate limit / quota exceeded) and 5xx responses, honoring
- * `Retry-After` when the server sends one. Every other error (4xx auth/
- * permission/not-found failures) is not transient and is never retried.
- * Works for Google (Gmail/Calendar) and OpenAI calls alike — see the
- * module doc for why the same status-based logic applies to both.
+ * 429 (rate limit / quota exceeded) and 5xx responses, a Google
+ * per-second/per-minute quota-exceeded error regardless of its `.status`
+ * (see `isRetryableGoogleQuotaMessage`), and select low-level network
+ * errors, honoring `Retry-After` when the server sends one. Every other
+ * error (4xx auth/permission/not-found failures, or a daily/lifetime
+ * quota error that won't clear within this process's lifetime) is not
+ * worth retrying. Works for Google (Gmail/Calendar) and OpenAI calls
+ * alike — see the module doc for why the same status-based logic applies
+ * to both.
  */
 export async function withApiRetry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
   const { maxAttempts, baseDelayMs, maxDelayMs } = { ...DEFAULT_OPTIONS, ...options };
@@ -97,7 +119,8 @@ export async function withApiRetry<T>(fn: () => Promise<T>, options: RetryOption
     } catch (error) {
       attempt += 1;
       const status = apiErrorStatus(error);
-      if ((!isRetryableStatus(status) && !isRetryableNetworkError(error)) || attempt >= maxAttempts) {
+      const retryable = isRetryableStatus(status) || isRetryableNetworkError(error) || isRetryableGoogleQuotaMessage(error);
+      if (!retryable || attempt >= maxAttempts) {
         throw error;
       }
       const exponential = Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs);
