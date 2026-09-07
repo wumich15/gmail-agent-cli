@@ -137,6 +137,22 @@ export interface OrchestratorDeps {
    * make the cached backlog permanently invisible to `gmail work`.
    */
   cachedBacklogStubs?: readonly MessageStub[];
+  /**
+   * Thread IDs discovered from one paginated `messages.list(labelIds=[SENT])`
+   * index. When supplied, reply protection is answered locally instead of
+   * issuing a 40-unit `threads.get` for every Trash candidate.
+   */
+  sentThreadIds?: ReadonlySet<string>;
+  /** True when the Sent index could not be built; Trash must be held for review. */
+  sentThreadIndexUnavailable?: boolean;
+  /** Optional progress sink used by the CLI; omitted by library/test callers. */
+  progress?: ClassifierProgress;
+}
+
+export interface ClassifierProgress {
+  onStart(total: number): void;
+  onProgress(completed: number, total: number): void;
+  onFinish(): void;
 }
 
 /** See `OrchestratorDeps.cachedAssessments`. Mirrors the non-verbatim projection `state/repositories/messages.ts` persists — never body text, summaries, or AI sourceEvidence. */
@@ -355,38 +371,52 @@ async function classifyAndFinalize(
   const cachePolicyVersion = deps.cachePolicyVersion ?? POLICY_VERSION;
 
   const classificationStartedAt = performance.now();
-  const assessmentResults = await mapWithConcurrency(preprocessed, deps.concurrency.aiCalls, (pre) => {
-    if (pre.bypassed) {
-      return Promise.resolve(null);
-    }
-    const cached = deps.cachedAssessments?.get(pre.stub.id);
-    if (
-      cached &&
-      cached.contentHash === pre.normalized.contentHash &&
-      cached.classifierVersion === classifierVersion &&
-      cached.promptVersion === promptVersion &&
-      cached.schemaVersion === schemaVersion &&
-      cached.policyVersion === cachePolicyVersion
-    ) {
-      diagnostics.assessmentCacheHits += 1;
-      // Nothing about the classification inputs changed since this exact
-      // assessment was produced (identical content, identical
-      // classifier/prompt/schema/policy versions) — a fresh AI call would
-      // almost certainly reproduce the same verdict, so skip it entirely.
-      // This is what makes a later `gmail work` run actually use `gmail
-      // cache`'s (and a prior run's own) stored data instead of
-      // re-classifying every changed message from scratch.
-      return Promise.resolve<AssessmentResult>({ ok: true, assessment: reconstructAssessment(cached, pre.normalized) });
-    }
-    diagnostics.classifierCalls += 1;
-    return deps.classifier.assess(pre.normalized, {
-      classifierVersion,
-      promptVersion,
-      schemaVersion,
-      policyVersion: POLICY_VERSION,
-      existingLabels: deps.existingLabels ?? []
+  const progressTotal = preprocessed.length;
+  let progressCompleted = 0;
+  deps.progress?.onStart(progressTotal);
+  let assessmentResults: (AssessmentResult | null)[];
+  try {
+    assessmentResults = await mapWithConcurrency(preprocessed, deps.concurrency.aiCalls, async (pre) => {
+      let result: AssessmentResult | null;
+      if (pre.bypassed) {
+        result = null;
+      } else {
+        const cached = deps.cachedAssessments?.get(pre.stub.id);
+        if (
+          cached &&
+          cached.contentHash === pre.normalized.contentHash &&
+          cached.classifierVersion === classifierVersion &&
+          cached.promptVersion === promptVersion &&
+          cached.schemaVersion === schemaVersion &&
+          cached.policyVersion === cachePolicyVersion
+        ) {
+          diagnostics.assessmentCacheHits += 1;
+          // Nothing about the classification inputs changed since this exact
+          // assessment was produced (identical content, identical
+          // classifier/prompt/schema/policy versions) — a fresh AI call would
+          // almost certainly reproduce the same verdict, so skip it entirely.
+          // This is what makes a later `gmail work` run actually use `gmail
+          // cache`'s (and a prior run's own) stored data instead of
+          // re-classifying every changed message from scratch.
+          result = { ok: true, assessment: reconstructAssessment(cached, pre.normalized) };
+        } else {
+          diagnostics.classifierCalls += 1;
+          result = await deps.classifier.assess(pre.normalized, {
+            classifierVersion,
+            promptVersion,
+            schemaVersion,
+            policyVersion: POLICY_VERSION,
+            existingLabels: deps.existingLabels ?? []
+          });
+        }
+      }
+      progressCompleted += 1;
+      deps.progress?.onProgress(progressCompleted, progressTotal);
+      return result;
     });
-  });
+  } finally {
+    deps.progress?.onFinish();
+  }
   diagnostics.classificationMs += performance.now() - classificationStartedAt;
 
   // Bounded at gmailReads concurrency: most messages need no extra Gmail
@@ -894,11 +924,26 @@ async function finalizeOutcome(
   let rawDecision = evaluateMessagePolicy(policyInput, deps.policyThresholds);
 
   if (!pre.isProtected && rawDecision.actions.some((a) => a.type === "trash")) {
-    let threadHasUserSentMessagePromise = threadSentCache.get(stub.threadId);
-    if (!threadHasUserSentMessagePromise) {
-      diagnostics.threadChecks += 1;
-      threadHasUserSentMessagePromise = fetchThreadHasUserSentMessage(deps.gmailClient, stub.threadId);
-      threadSentCache.set(stub.threadId, threadHasUserSentMessagePromise);
+    let threadHasUserSentMessagePromise: Promise<boolean>;
+    if (deps.sentThreadIndexUnavailable) {
+      // An incomplete protection index is not evidence that the thread is
+      // safe. Hold the destructive action for review instead of guessing.
+      threadHasUserSentMessagePromise = Promise.reject(new Error("sent_thread_index_unavailable"));
+    } else if (deps.sentThreadIds !== undefined) {
+      // `messages.list` already supplied every SENT message's threadId for
+      // this run. This is a local set lookup: no per-candidate `threads.get`
+      // call, no 40-unit quota charge, and no extra network round trip.
+      threadHasUserSentMessagePromise = Promise.resolve(deps.sentThreadIds.has(stub.threadId));
+    } else {
+      // Retain the direct lookup as a safe fallback for library callers that
+      // do not provide the run-level Sent index.
+      let cached = threadSentCache.get(stub.threadId);
+      if (!cached) {
+        diagnostics.threadChecks += 1;
+        cached = fetchThreadHasUserSentMessage(deps.gmailClient, stub.threadId);
+        threadSentCache.set(stub.threadId, cached);
+      }
+      threadHasUserSentMessagePromise = cached;
     }
     // A single message's thread-reply check must never crash the whole
     // run (CLAUDE.md: "Continue independent actions after an isolated

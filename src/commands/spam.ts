@@ -217,15 +217,18 @@ async function runSpamLocked(
       // re-encoding just the address/subject into a new URI and
       // reparsing, which silently dropped the original body.
       const mailto = parsed.mailto;
-      await withGoogleApiRetry(() =>
-        gmailClient.users.messages.send({
-          userId: "me",
-          requestBody: {
-            raw: Buffer.from(
-              `To: ${mailto.address}\r\nSubject: ${mailto.subject ?? "Unsubscribe"}\r\n\r\n${mailto.body ?? ""}`
-            ).toString("base64url")
-          }
-        })
+      await withGoogleApiRetry(
+        () =>
+          gmailClient.users.messages.send({
+            userId: "me",
+            requestBody: {
+              raw: Buffer.from(
+                `To: ${mailto.address}\r\nSubject: ${mailto.subject ?? "Unsubscribe"}\r\n\r\n${mailto.body ?? ""}`
+              ).toString("base64url")
+            }
+          }),
+        {},
+        5 // messages.send = 100 quota units
       );
       unsubHandled += 1;
       continue;

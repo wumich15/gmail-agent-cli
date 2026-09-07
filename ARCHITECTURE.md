@@ -237,9 +237,16 @@ from `accounts.history_marker` by `work.ts` and passed straight through):
   reach the classifier — a message that changed for an unrelated reason
   (the user archived/trashed it themselves) is simply not evaluated, the
   same as it would never have appeared in a full `listAllMessageIds` pass
-  either. The Inbox "before" count for the summary comes from one cheap
-  `users.labels.get("INBOX")` call (`fetchInboxMessageCount`, 1 quota
-  unit) instead of a full listing.
+either. The Inbox "before" count for the summary comes from one cheap
+`users.labels.get("INBOX")` call (`fetchInboxMessageCount`, 1 quota
+unit) instead of a full listing.
+
+Reply protection no longer calls `threads.get` for every Trash candidate.
+`work.ts` builds a local set of thread IDs from one paginated
+`messages.list(labelIds=[SENT])` pass, and the policy phase does a set lookup.
+That is 5 quota units per list page instead of 40 units per candidate. If the
+index cannot be read, the destructive action is held for Review; the direct
+thread lookup remains only as a safe fallback for lower-level callers.
 
 Both paths share the same `fetchAndNormalizeAll` (Phase 1) and
 `classifyAndFinalize` (Phases 2-4) functions — history sync only changes
@@ -284,17 +291,20 @@ process-wide pacer every Gmail/Calendar call goes through via
 calls are untouched, a separate quota domain with their own budget in
 `OpenAiClassifier`). Rather than hardcoding one "safe" requests/second
 number — real observed per-project quotas have proven lower than Google's
-documented defaults in live use this session — it starts at 4/s and recovers
-toward 12/s (or the explicit `GMAIL_AGENT_RATE_LIMIT_RPS` value), halves
-itself on a quota-shaped failure (429 or the Service Infrastructure
-quota-message pattern), and only creeps back up after 25 consecutive clean
-calls. Ordinary network errors reset the recovery streak without being
-misclassified as quota pressure, and 5xx responses retry without slowing the
-limiter. Concurrent callers reserve distinct future slots, preventing a
-burst when several reads complete together. Concurrency
-(`concurrency.gmailReads`) still controls how many requests are *in flight*;
-the limiter controls how *fast* they're allowed to leave. It is bypassed
-under Vitest so fake-client tests don't pay production pacing delays.
+documented defaults in live use this session — it starts at 3 baseline-
+equivalent messages/s and recovers toward 4/s (or the explicit
+`GMAIL_AGENT_RATE_LIMIT_RPS` value), halves itself on a quota-shaped failure
+(429 or the Service Infrastructure quota-message pattern), and only creeps
+back up after 25 consecutive clean calls. Calls reserve quota-weighted slots:
+`messages.get` is weight 1, `threads.get` weight 2, `messages.list` weight
+0.25, history weight 0.1, and labels weight 0.05. Ordinary network errors
+reset the recovery streak without being misclassified as quota pressure, and
+5xx responses retry without slowing the limiter. Concurrent callers reserve
+distinct future slots, preventing a burst when several reads complete
+together. Concurrency (`concurrency.gmailReads`) still controls how many
+requests are *in flight*; the limiter controls how *fast* they're allowed to
+leave. It is bypassed under Vitest so fake-client tests don't pay production
+pacing delays.
 
 ## AI status in this build
 
@@ -401,7 +411,7 @@ paths without spending API calls; **never point it at a real mailbox**.
 
 `core/orchestrator.ts`'s `fetchAndNormalize` calls `fetchMessageFull`
 (`format=full`) instead of `fetchMessageMetadata` (`format=metadata`) for
-every message, bypassed or not — Gmail's `messages.get` costs the same 5
+every message, bypassed or not — Gmail's `messages.get` costs the same 20
 quota units regardless of `format`, so this is strictly more information
 (the real body, via `extractBodyParts`) at no extra request-count or
 quota cost, only larger response payloads for messages that turn out to
@@ -576,6 +586,13 @@ whole run) and an `unchanged` list (every message that received no
 action and wasn't flagged for Review either, uncapped — so a message
 can never silently vanish from the summary between "acted on" and
 "needs review").
+
+`gmail work` also renders a live classifier progress bar on stderr, emits a
+plain executive plan before executing Gmail/Calendar mutations, and ends
+every run with one concise plaintext paragraph containing every message
+marked important (or an explicit "none identified" sentence). JSON output
+remains valid on stdout; these human-facing progress/plan/important lines go
+to stderr in `--json` mode.
 
 The other commands `CLAUDE.md` specifies — `rules`, `summary`, `undo`,
 `auth`, `config`, `doctor` — are **not removed**, just not registered in
@@ -1007,6 +1024,30 @@ findings trace directly back to the previous ("Third") fix pass:
     concurrent-burst rounding in `acquire()`'s slot reservation — both
     still overridable via `GMAIL_AGENT_RATE_LIMIT_RPS` for an account
     confirmed to be on Gmail's older, more permissive quota tier.
+
+## Fifth fix pass: quota-aware reply protection and user-visible progress
+
+Google's current [Gmail quota documentation](https://developers.google.com/workspace/gmail/api/reference/quota) confirms a 6,000 quota-unit-per-minute
+per-user limit, with `messages.get` at 20 units, `threads.get` at 40,
+`messages.list` at 5, `history.list` at 2, and labels at 1. It also notes that
+the [HTTP batch facility](https://developers.google.com/workspace/gmail/api/guides/batch) reduces connection overhead but still counts every inner
+call toward quota, and recommends keeping batches at 50 calls or fewer. The
+production strategy therefore avoids unnecessary 40-unit thread reads:
+
+- `work.ts` builds a complete local reply-protection index from one paginated
+  `messages.list(labelIds=[SENT])` pass and `finalizeOutcome` checks the set
+  locally. A failed index holds destructive Trash actions for Review. The
+  lower-level `threads.get` fallback is single-attempt and quota-weighted,
+  so an already-exhausted per-user bucket cannot add another minute of retry
+  delay or crash the run.
+- The shared limiter paces calls by quota weight, including cheap list,
+  history, and label calls plus expensive batch modifications and sends.
+  Concurrent reservations remain globally spaced, and quota errors reduce
+  throughput without allowing repeated retries to amplify the same burst.
+- `gmail work` reports classifier progress continuously, previews the
+  planned actions before mutations, and appends a complete plaintext
+  important-email paragraph after every run. Timing diagnostics remain
+  content-free.
 
 ## Known deviations from the full design (as of this writing)
 

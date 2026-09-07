@@ -85,5 +85,33 @@ export function renderHumanSummary(
     lines.push(pc.dim(`Run ID: ${options.runId} (every action is recorded in the local action ledger).`));
   }
 
+  lines.push("");
+  lines.push(renderImportantEmailsParagraph(summary));
+
   return lines.join("\n");
+}
+
+/** A short, plaintext plan shown before any Gmail/Calendar mutation starts. */
+export function renderExecutiveSummary(summary: RunSummary): string {
+  const trashCount = Object.values(summary.trashedByReason).reduce((total, count) => total + count, 0);
+  const importantCount = summary.markedImportant.length;
+  return [
+    `Executive summary: ${summary.inboxCountBefore} Inbox message(s) scanned; planned actions — ` +
+      `${trashCount} trash, ${summary.archivedCount} archive, ${summary.starredCount} star, ` +
+      `${importantCount} important, ${summary.labeledCount} label, ${summary.calendarCreatedCount} calendar, ` +
+      `${summary.reviewCount} review.`,
+    importantCount > 0
+      ? `Important emails: ${summary.markedImportant.map((item) => `${item.subject} from ${item.sender}`).join("; ")}.`
+      : "Important emails: none identified in this run."
+  ].join(" ");
+}
+
+/** Full, concise, plaintext paragraph of every message marked important this run. */
+export function renderImportantEmailsParagraph(summary: RunSummary): string {
+  if (summary.markedImportant.length === 0) {
+    return "Important emails: none identified in this run.";
+  }
+  return `Important emails: ${summary.markedImportant
+    .map((item) => `${item.subject} from ${item.sender}`)
+    .join("; ")}.`;
 }

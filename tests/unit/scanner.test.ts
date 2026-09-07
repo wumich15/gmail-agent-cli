@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { fetchInboxMessageCount, historyIdGreaterThan, listAllMessageIds, listHistorySince } from "../../src/gmail/scanner.js";
+import {
+  fetchInboxMessageCount,
+  historyIdGreaterThan,
+  listAllMessageIds,
+  listHistorySince,
+  listSentThreadIds
+} from "../../src/gmail/scanner.js";
 import type { GmailClient } from "../../src/gmail/client.js";
 
 function fakeListClient(pages: { messages: { id: string; threadId: string }[]; resultSizeEstimate: number }[]) {
@@ -172,5 +178,17 @@ describe("fetchInboxMessageCount", () => {
   it("defaults to 0 when messagesTotal is absent", async () => {
     const client = { users: { labels: { get: async () => ({ data: {} }) } } } as unknown as GmailClient;
     expect(await fetchInboxMessageCount(client)).toBe(0);
+  });
+});
+
+describe("listSentThreadIds", () => {
+  it("builds a local reply-protection index from cheap message stubs", async () => {
+    const client = fakeListClient([
+      {
+        messages: [stub("sent-1"), { id: "sent-2", threadId: "shared-thread" }],
+        resultSizeEstimate: 2
+      }
+    ]);
+    expect([...await listSentThreadIds(client)]).toEqual(["t-sent-1", "shared-thread"]);
   });
 });

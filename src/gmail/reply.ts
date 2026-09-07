@@ -87,13 +87,16 @@ function buildRawMessage(target: ReplyTarget, body: string): string {
  * and auditable as possible; see CLAUDE.md's "Interactive reply").
  */
 export async function sendReply(client: GmailClient, target: ReplyTarget, body: string): Promise<void> {
-  await withGoogleApiRetry(() =>
-    client.users.messages.send({
-      userId: "me",
-      requestBody: {
-        raw: buildRawMessage(target, body),
-        threadId: target.threadId
-      }
-    })
+  await withGoogleApiRetry(
+    () =>
+      client.users.messages.send({
+        userId: "me",
+        requestBody: {
+          raw: buildRawMessage(target, body),
+          threadId: target.threadId
+        }
+      }),
+    {},
+    5 // messages.send = 100 quota units
   );
 }

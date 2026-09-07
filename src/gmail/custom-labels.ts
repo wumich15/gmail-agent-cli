@@ -6,6 +6,9 @@ export interface UserLabel {
   name: string;
 }
 
+const LABEL_MUTATION_REQUEST_OPTIONS = { timeout: 20_000 } as const;
+const LABEL_MUTATION_RETRY_OPTIONS = { maxAttempts: 2, baseDelayMs: 750, maxDelayMs: 5_000 } as const;
+
 /**
  * Lists only the user's own custom labels (Gmail's system labels like
  * INBOX/STARRED/CATEGORY_* have `type: "system"` and are never candidates
@@ -14,7 +17,8 @@ export interface UserLabel {
 export async function listUserLabels(client: GmailClient): Promise<UserLabel[]> {
   const { data } = await withGoogleApiRetry(
     () => client.users.labels.list({ userId: "me" }, { timeout: 20_000 }),
-    { maxAttempts: 3, baseDelayMs: 750, maxDelayMs: 10_000 }
+    { maxAttempts: 3, baseDelayMs: 750, maxDelayMs: 10_000 },
+    0.05
   );
   const labels: UserLabel[] = [];
   for (const label of data.labels ?? []) {
@@ -43,11 +47,14 @@ export async function getOrCreateLabelId(
     return existing;
   }
   try {
-    const { data } = await withGoogleApiRetry(() =>
-      client.users.labels.create({
-        userId: "me",
-        requestBody: { name, labelListVisibility: "labelShow", messageListVisibility: "show" }
-      })
+    const { data } = await withGoogleApiRetry(
+      () =>
+        client.users.labels.create({
+          userId: "me",
+          requestBody: { name, labelListVisibility: "labelShow", messageListVisibility: "show" }
+        }, LABEL_MUTATION_REQUEST_OPTIONS),
+      LABEL_MUTATION_RETRY_OPTIONS,
+      0.25
     );
     if (!data.id) {
       throw new Error(`Gmail did not return an ID for newly created label "${name}".`);

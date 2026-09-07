@@ -9,7 +9,7 @@ import { RunsRepository, ActionsRepository } from "../state/repositories/runs.js
 import { CalendarLinksRepository } from "../state/repositories/calendar-links.js";
 import { buildPlannedActions } from "../core/action-plan.js";
 import { POLICY_VERSION } from "../core/policy.js";
-import { renderHumanSummary } from "../summary/render-human.js";
+import { renderExecutiveSummary, renderHumanSummary, renderImportantEmailsParagraph } from "../summary/render-human.js";
 import { renderJsonSummary } from "../summary/render-json.js";
 import { EXIT_CODES } from "../core/errors.js";
 import { newRunId } from "../core/ids.js";
@@ -29,8 +29,9 @@ import { LabelCandidatesRepository } from "../state/repositories/label-candidate
 import { MessagesRepository, type CachedMessageRecord } from "../state/repositories/messages.js";
 import { buildEventInsertPlan, insertIdempotentEvent } from "../calendar/idempotency.js";
 import { withGoogleApiRetry } from "../core/api-retry.js";
+import { listSentThreadIds } from "../gmail/scanner.js";
 import { contentHash } from "../core/ids.js";
-import type { CachedAssessmentSnapshot } from "../core/orchestrator.js";
+import type { CachedAssessmentSnapshot, ClassifierProgress } from "../core/orchestrator.js";
 import type { PolicyActionIntent } from "../core/policy.js";
 import type { ActionType, PlannedAction, ReasonCode } from "../core/models.js";
 
@@ -72,6 +73,42 @@ export function selectCachedBacklogStubs(
         (row.assessmentKind !== null && row.assessmentHadEvent !== false)
     )
     .map((row) => ({ id: row.gmailMessageId, threadId: row.gmailThreadId }));
+}
+
+function createClassifierProgress(): ClassifierProgress {
+  let total = 0;
+  let lastReported = -1;
+  const draw = (completed: number): void => {
+    const width = 24;
+    const filled = total > 0 ? Math.round((completed / total) * width) : width;
+    const bar = `${"#".repeat(Math.min(width, filled))}${"-".repeat(Math.max(0, width - filled))}`;
+    const line = `Classifier [${bar}] ${completed}/${total}`;
+    if (process.stderr.isTTY) {
+      process.stderr.write(`\r${line}`);
+    } else if (completed === 0 || completed === total || completed - lastReported >= 10) {
+      console.error(line);
+    }
+    lastReported = completed;
+  };
+  return {
+    onStart(nextTotal) {
+      total = nextTotal;
+      lastReported = -1;
+      if (total === 0) {
+        console.error("Classifier: no messages to evaluate.");
+      } else {
+        draw(0);
+      }
+    },
+    onProgress(completed) {
+      draw(completed);
+    },
+    onFinish() {
+      if (process.stderr.isTTY && total > 0) {
+        process.stderr.write("\n");
+      }
+    }
+  };
 }
 
 /** `labelIdByName` must already hold an entry for every label action's name (lowercased) before this is called. */
@@ -120,7 +157,16 @@ export async function runWork(options: WorkOptions): Promise<number> {
     // what lets the classifier prefer reusing an existing label over
     // inventing a near-duplicate. `labelIdByName` seeds label resolution
     // below for any label actions that survive the run's threshold check.
-    const existingLabels = await listUserLabels(gmailClient);
+    const [existingLabels, sentThreadIndex] = await Promise.all([
+      listUserLabels(gmailClient),
+      listSentThreadIds(gmailClient).then(
+        (threadIds) => ({ threadIds, unavailable: false }),
+        () => ({ threadIds: new Set<string>(), unavailable: true })
+      )
+    ]);
+    if (sentThreadIndex.unavailable) {
+      console.error(pc.yellow("Gmail Sent-thread index unavailable; destructive Trash actions will be held for Review."));
+    }
     const labelIdByName = new Map(existingLabels.map((l) => [l.name.trim().toLowerCase(), l.id]));
     // The AI category prompt depends on the current custom-label set, and
     // deterministic decisions depend on the current enabled rule set.
@@ -235,6 +281,9 @@ export async function runWork(options: WorkOptions): Promise<number> {
       cachePolicyVersion,
       cachedAssessments,
       cachedBacklogStubs,
+      sentThreadIds: sentThreadIndex.threadIds,
+      sentThreadIndexUnavailable: sentThreadIndex.unavailable,
+      progress: createClassifierProgress(),
       // Incremental sync against Gmail's history API is the main lever for
       // staying under Gmail's API quota on repeat runs — see
       // CLAUDE.md's "Incremental synchronization". Passing null/omitting
@@ -265,6 +314,10 @@ export async function runWork(options: WorkOptions): Promise<number> {
       { accountHash: account.accountHash, usedIncrementalSync, scannedCount: outcomes.length, scanNote, ...diagnostics },
       "work_scan_complete"
     );
+
+    // Give the user a decision preview before any Gmail or Calendar mutation
+    // begins. In JSON mode this stays on stderr so stdout remains valid JSON.
+    console.error(pc.dim(renderExecutiveSummary(summary)));
 
     let runId: string | undefined;
     let failureCount = 0;
@@ -597,6 +650,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
     const finalSummary = { ...summary, failureCount, scanNote };
 
     if (options.json) {
+      console.error(renderImportantEmailsParagraph(finalSummary));
       console.log(
         JSON.stringify({ ...renderJsonSummary(finalSummary, { dryRun: options.dryRun }), runId: runId ?? null })
       );

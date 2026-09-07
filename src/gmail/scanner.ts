@@ -7,6 +7,13 @@ import { apiErrorStatus, withGoogleApiRetry } from "../core/api-retry.js";
 const GMAIL_READ_TIMEOUT_MS = 20_000;
 const GMAIL_READ_RETRY_OPTIONS = { maxAttempts: 3, baseDelayMs: 750, maxDelayMs: 10_000 } as const;
 const GMAIL_READ_REQUEST_OPTIONS = { timeout: GMAIL_READ_TIMEOUT_MS } as const;
+const GMAIL_QUOTA_WEIGHT = {
+  list: 0.25, // messages.list = 5 units vs. messages.get = 20
+  history: 0.1, // history.list = 2 units
+  label: 0.05, // labels.get/list = 1 unit
+  message: 1,
+  thread: 2
+} as const;
 
 export const REQUIRED_METADATA_HEADERS = [
   "From",
@@ -32,7 +39,8 @@ export interface MailboxProfile {
 export async function fetchProfile(client: GmailClient): Promise<MailboxProfile> {
   const { data } = await withGoogleApiRetry(
     () => client.users.getProfile({ userId: "me" }, GMAIL_READ_REQUEST_OPTIONS),
-    GMAIL_READ_RETRY_OPTIONS
+    GMAIL_READ_RETRY_OPTIONS,
+    GMAIL_QUOTA_WEIGHT.label
   );
   if (!data.emailAddress || !data.historyId) {
     throw new Error("Gmail profile response is missing emailAddress or historyId.");
@@ -91,7 +99,8 @@ export async function listAllMessageIds(
           },
           GMAIL_READ_REQUEST_OPTIONS
         ),
-      GMAIL_READ_RETRY_OPTIONS
+      GMAIL_READ_RETRY_OPTIONS,
+      GMAIL_QUOTA_WEIGHT.list
     );
     if (estimatedTotal === null && typeof data.resultSizeEstimate === "number") {
       estimatedTotal = data.resultSizeEstimate;
@@ -128,7 +137,8 @@ export async function fetchMessageMetadata(
         },
         GMAIL_READ_REQUEST_OPTIONS
       ),
-    GMAIL_READ_RETRY_OPTIONS
+    GMAIL_READ_RETRY_OPTIONS,
+    GMAIL_QUOTA_WEIGHT.message
   );
   return data;
 }
@@ -141,9 +151,25 @@ export async function fetchMessageMetadata(
 export async function fetchInboxMessageCount(client: GmailClient): Promise<number> {
   const { data } = await withGoogleApiRetry(
     () => client.users.labels.get({ userId: "me", id: "INBOX" }, GMAIL_READ_REQUEST_OPTIONS),
-    GMAIL_READ_RETRY_OPTIONS
+    GMAIL_READ_RETRY_OPTIONS,
+    GMAIL_QUOTA_WEIGHT.label
   );
   return data.messagesTotal ?? 0;
+}
+
+/**
+ * Returns the thread IDs that contain at least one message in Gmail's SENT
+ * label. `messages.list` returns IDs and thread IDs without the 40-unit
+ * `threads.get` cost, so the caller can answer the reply-protection question
+ * with one cheap, paginated index instead of one expensive request per
+ * trash candidate.
+ */
+export async function listSentThreadIds(client: GmailClient): Promise<Set<string>> {
+  const result = await listAllMessageIds(client, {
+    labelIds: [GMAIL_LABELS.sent],
+    includeSpamTrash: false
+  });
+  return new Set(result.messages.map((message) => message.threadId));
 }
 
 export async function fetchMessageFull(
@@ -160,7 +186,8 @@ export async function fetchMessageFull(
         },
         GMAIL_READ_REQUEST_OPTIONS
       ),
-    GMAIL_READ_RETRY_OPTIONS
+    GMAIL_READ_RETRY_OPTIONS,
+    GMAIL_QUOTA_WEIGHT.message
   );
   return data;
 }
@@ -187,8 +214,12 @@ export async function fetchThreadHasUserSentMessage(client: GmailClient, threadI
         { userId: "me", id: threadId, format: "minimal" },
         GMAIL_READ_REQUEST_OPTIONS
       ),
-    GMAIL_READ_RETRY_OPTIONS,
-    2
+    // This is a safety-only lookup. If Gmail is already returning a per-user
+    // quota error, retrying the 40-unit call multiplies the pressure and can
+    // stall the whole run for a minute; the orchestrator treats an
+    // inconclusive answer as Review instead.
+    { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
+    GMAIL_QUOTA_WEIGHT.thread
   );
   return (data.messages ?? []).some((m) => (m.labelIds ?? []).includes(GMAIL_LABELS.sent));
 }
@@ -249,7 +280,8 @@ export async function listHistorySince(
             },
             GMAIL_READ_REQUEST_OPTIONS
           ),
-        GMAIL_READ_RETRY_OPTIONS
+        GMAIL_READ_RETRY_OPTIONS,
+        GMAIL_QUOTA_WEIGHT.history
       );
 
       for (const entry of data.history ?? []) {
