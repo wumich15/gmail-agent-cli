@@ -929,7 +929,9 @@ than tuned away by guessing:
   so the same quota-headroom math that justified `2` now supports a higher
   floor, and the new ceiling lets a run reach further when an account's
   actual quota allows it — both are still overridable via
-  `GMAIL_AGENT_RATE_LIMIT_RPS`.
+  `GMAIL_AGENT_RATE_LIMIT_RPS`. **These specific numbers were themselves
+  wrong and were corrected in the very next fix pass below** — see "Fourth
+  fix pass."
 - **OpenAI classification latency**: `responses.parse` now passes
   `reasoning: { effort: "low" }`. Classification is a small, fixed-schema
   flag decision, not open-ended reasoning, and Structured Outputs already
@@ -948,6 +950,63 @@ than tuned away by guessing:
   classifier calls, cache hits, and deferred thread checks to stderr and the
   structured logger, making a Gmail-side stall distinguishable from AI
   latency without logging message content.
+
+## Fourth fix pass: a real production crash and a rate-limiter miscalculation
+
+Reported symptom: `gmail work` crashed outright with an uncaught
+`Quota exceeded for quota metric 'Total Query Cost' and limit 'Units per
+minute per user'` error thrown from `fetchThreadHasUserSentMessage`, and the
+account reported the tool feeling slower than before, not faster. Both
+findings trace directly back to the previous ("Third") fix pass:
+
+- **A single message's thread-reply check could crash the entire run.**
+  `core/orchestrator.ts`'s `finalizeOutcome` called
+  `fetchThreadHasUserSentMessage` with no error handling; once
+  `withApiRetry`'s bounded retry budget (7 attempts, ~61s of accumulated
+  backoff) was exhausted by a sustained per-minute quota error, the
+  rejection propagated straight out of `mapWithConcurrency` and killed the
+  whole `gmail work` process — discarding every other message's
+  already-completed work in the same run, in direct violation of this
+  project's "continue independent actions after an isolated failure"
+  reliability requirement. `finalizeOutcome` now catches a failure from
+  this one check specifically: since it can no longer tell whether the
+  user actually replied in the thread, it takes the same conservative
+  branch a real "yes" would (never trash on an inconclusive answer) and
+  additionally marks the message `needsReview: true` with reason
+  `thread_reply_check_failed`, so the user sees it flagged rather than the
+  failure being silently swallowed either way. New diagnostics counter:
+  `threadCheckFailures`.
+- **The previous pass's rate-limiter numbers were miscalculated.** The
+  "Third fix pass" set `FASTEST_REQUESTS_PER_SECOND = 12` on the reasoning
+  that a typical run, after making `threads.get` lazy, would be dominated
+  by 20-unit `messages.get` calls — but `12 * 20 = 240` real quota
+  units/second is *more than double* Gmail's published 100 units/second
+  cap, and the pacer had no way to know a `threads.get` call (40 units) was
+  twice as expensive as the `messages.get` baseline it was calibrated
+  against, since every call was paced identically regardless of cost. On
+  any run with a lot of trash-bound mail (each triggering one
+  `threads.get`), real unit consumption ran ahead of what the "requests per
+  second" figure implied, and the adaptive recovery climb (`reportSuccess`)
+  had nothing stopping it from climbing straight past the account's real
+  budget — producing the exact quota error above, then backing off, then
+  climbing back into the same wall again, which is also why the run felt
+  *slower*, not faster, than before this mechanism existed.
+  - Fixed at the root: `GoogleApiRateLimiter.acquire()` and
+    `withGoogleApiRetry` now take an optional `weight` (default 1), which
+    scales how many pacing intervals a call reserves. `messages.get` and
+    every other call site keep the default weight of 1; only
+    `fetchThreadHasUserSentMessage`'s `threads.get` call passes weight 2,
+    matching its real 40-vs-20-unit cost. This makes "requests per second"
+    in this module actually mean "baseline-equivalent quota units per
+    second" for the one call site whose cost differs enough to matter in
+    practice (see `api-retry.ts`'s updated doc comment for why the other,
+    much rarer or much cheaper endpoints were left at the default).
+  - The defaults were also recalculated and lowered: `START_REQUESTS_PER_SECOND`
+    3 and `FASTEST_REQUESTS_PER_SECOND` 4 (60 and 80 real units/second),
+    comfortably under the 100 units/second cap even accounting for
+    concurrent-burst rounding in `acquire()`'s slot reservation — both
+    still overridable via `GMAIL_AGENT_RATE_LIMIT_RPS` for an account
+    confirmed to be on Gmail's older, more permissive quota tier.
 
 ## Known deviations from the full design (as of this writing)
 

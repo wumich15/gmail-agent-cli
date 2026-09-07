@@ -173,9 +173,12 @@ export function headersFromMessage(message: gmail_v1.Schema$Message) {
  * True if any message in the thread carries Gmail's own SENT label — the
  * "thread contains a message sent by the user" protection signal CLAUDE.md
  * requires. Uses `format=minimal` (labelIds only, no headers/body) since
- * that's all this needs; Gmail's per-call quota cost is fixed regardless of
- * format, so this is one extra 5-unit call per message, same as a metadata
- * fetch would have cost.
+ * that's all this needs, but `threads.get` still costs 40 quota units
+ * regardless of format — double a `messages.get` (20 units) — so this is
+ * passed to `withGoogleApiRetry` as weight 2, not the default weight 1, so
+ * the shared rate limiter's pacing reflects its real quota cost instead of
+ * silently under-pacing it (see api-retry.ts's `START_REQUESTS_PER_SECOND`
+ * doc comment for the production incident this under-pacing caused).
  */
 export async function fetchThreadHasUserSentMessage(client: GmailClient, threadId: string): Promise<boolean> {
   const { data } = await withGoogleApiRetry(
@@ -184,7 +187,8 @@ export async function fetchThreadHasUserSentMessage(client: GmailClient, threadI
         { userId: "me", id: threadId, format: "minimal" },
         GMAIL_READ_REQUEST_OPTIONS
       ),
-    GMAIL_READ_RETRY_OPTIONS
+    GMAIL_READ_RETRY_OPTIONS,
+    2
   );
   return (data.messages ?? []).some((m) => (m.labelIds ?? []).includes(GMAIL_LABELS.sent));
 }

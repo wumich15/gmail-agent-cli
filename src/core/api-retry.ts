@@ -204,7 +204,19 @@ export class GoogleApiRateLimiter {
     return 1000 / this.intervalMs;
   }
 
-  async acquire(): Promise<void> {
+  /**
+   * `weight` lets a caller whose Gmail quota-unit cost is a multiple of the
+   * baseline call (baseline = `messages.get` at 20 units) reserve that many
+   * pacing slots instead of one, so the requests/second number this class
+   * is configured with keeps meaning "quota units per second," not "HTTP
+   * calls per second," even when call sites have very different real costs
+   * (e.g. `threads.get` at 40 units is weight 2). Treating every call as
+   * equally expensive was a real bug: a run dominated by weight-2 calls
+   * could consume real quota units twice as fast as the configured rate
+   * assumed, reaching the account's actual per-minute cap despite the
+   * pacer reporting a seemingly-safe requests/second figure throughout.
+   */
+  async acquire(weight = 1): Promise<void> {
     const now = Date.now();
     // Reserve the slot synchronously, before yielding. Multiple callers can
     // enter acquire() in the same event-loop turn; merely updating a
@@ -212,7 +224,7 @@ export class GoogleApiRateLimiter {
     // same timestamp and wake as one burst. Advancing nextRequestAt here
     // gives every concurrent caller its own globally-spaced slot.
     const requestAt = Math.max(now, this.nextRequestAt);
-    this.nextRequestAt = requestAt + this.intervalMs;
+    this.nextRequestAt = requestAt + this.intervalMs * weight;
     if (requestAt > now) {
       await sleep(requestAt - now);
     }
@@ -251,31 +263,44 @@ export class GoogleApiRateLimiter {
  * Grounded in Gmail API's currently-published per-user quota rather than a
  * guess: Google enforces 6,000 quota units per minute per user per project
  * (https://developers.google.com/workspace/gmail/api/reference/quota),
- * i.e. a 100 units/second sustained average, with `messages.get` at 20
- * units and (since this session added the thread-reply protection check)
- * `threads.get` at 40 units — but that check is deferred to only the
- * messages actually about to be trashed (see core/orchestrator.ts), so a
- * typical run is dominated by plain 20-unit `messages.get` calls, not a
- * 20/40 mix.
+ * i.e. a 100 units/second sustained average. `messages.get` (20 units) is
+ * the baseline this "requests/second" number is calibrated against —
+ * `withGoogleApiRetry`'s `weight` parameter scales the pacing interval for
+ * calls that cost a different amount, most notably `threads.get` (40
+ * units = weight 2) — so these two constants can be read directly as
+ * "baseline-equivalent calls per second," not raw HTTP calls per second.
+ *
+ * **Correcting an earlier version of this comment/these numbers**: a prior
+ * pass set FASTEST to 12, i.e. 12 * 20 = 240 real units/second — more than
+ * double the 100 units/second cap above — because at the time `threads.get`
+ * was priced into the "typical run" assumption but never actually weighted
+ * in the pacer itself, so nothing stopped the adaptive recovery climb from
+ * quietly blowing past the account's real budget on any run with a lot of
+ * trash-bound mail (each triggering a `threads.get`). That combination —
+ * an unweighted double-cost call plus a ceiling already over budget on its
+ * own — is what produced real "Quota exceeded ... Units per minute per
+ * user" errors in production. With `threads.get` now correctly weighted,
+ * FASTEST=5 (100 units/second, the full published budget) would still have
+ * zero headroom for the concurrent-burst rounding `acquire()`'s slot
+ * reservation allows, so both constants below stay comfortably under it.
  *
  * Google also changed these unit costs and limits on 2026-05-01; a project
  * that was already using the Gmail API before then keeps its older, more
  * permissive quota "for now" (250 units/second with `messages.get` at 5
  * units — roughly 10x more headroom than the numbers above). Since which
  * regime applies to any given account can't be known from inside this
- * process, START_REQUESTS_PER_SECOND is a cautious guess for a cold
- * process launch (conservative enough to avoid an immediate crash even
- * under the newer, stricter regime), while FASTEST_REQUESTS_PER_SECOND is
- * how far a long-running command (most concretely `gmail cache`'s
- * thousand-plus-message snapshot) is allowed to ramp up to if it turns out
- * the account can sustain it — reached only gradually (15% steps every 25
- * consecutive clean requests) and abandoned immediately on the first real
- * quota-shaped failure. This is what actually answers "use the API to its
- * fullest without getting rate limited": discover the real ceiling
- * empirically per run rather than freezing at either guess forever.
+ * process, these defaults target the newer, stricter regime — an account
+ * still on the legacy quota has an easy, explicit way to go faster
+ * (`GMAIL_AGENT_RATE_LIMIT_RPS`) rather than the reverse (an account on the
+ * stricter regime silently exceeding its real budget with no override to
+ * make the crash stop). FASTEST_REQUESTS_PER_SECOND is how far a
+ * long-running command (most concretely `gmail cache`'s thousand-plus-
+ * message snapshot) is allowed to ramp up to if sustained clean requests
+ * suggest the account can sustain it (15% steps every 25 consecutive clean
+ * requests), abandoned immediately on the first real quota-shaped failure.
  */
-const START_REQUESTS_PER_SECOND = 4;
-const FASTEST_REQUESTS_PER_SECOND = 12;
+const START_REQUESTS_PER_SECOND = 3;
+const FASTEST_REQUESTS_PER_SECOND = 4;
 // Effectively unlimited: real production pacing has no place slowing down
 // a test suite that constructs dozens of fake-client calls per test and
 // never talks to a real Gmail API. Vitest sets this env var in every
@@ -313,10 +338,22 @@ export const googleApiRateLimiter = new GoogleApiRateLimiter(
  * attempt (including retries) through the shared `googleApiRateLimiter`
  * first, and feeds that limiter's adaptive backoff from whether each
  * attempt hit a retryable (quota-shaped) failure or not.
+ *
+ * `weight` is this call's Gmail quota-unit cost relative to the baseline
+ * `messages.get` (20 units = weight 1) the limiter's requests/second
+ * default is calibrated against — pass 2 for `threads.get` (40 units); every
+ * other call site already defaults to 1, which undercounts a handful of
+ * cheaper calls (`labels.list`/`history.list` at 1-2 units) and a few
+ * pricier ones (`batchModify` at 50 units, `messages.send` at 100), but
+ * those are either rare (once per same-mutation group, not per message) or
+ * already cheap enough that leaving them at the conservative default of 1
+ * doesn't risk exceeding quota — unlike `threads.get`, which fires once per
+ * *every* message about to be trashed and was therefore the one omission
+ * that could actually double a typical run's real unit cost.
  */
-export async function withGoogleApiRetry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
+export async function withGoogleApiRetry<T>(fn: () => Promise<T>, options: RetryOptions = {}, weight = 1): Promise<T> {
   return withApiRetry(async () => {
-    await googleApiRateLimiter.acquire();
+    await googleApiRateLimiter.acquire(weight);
     try {
       const result = await fn();
       googleApiRateLimiter.reportSuccess();

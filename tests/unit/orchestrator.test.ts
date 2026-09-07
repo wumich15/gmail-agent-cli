@@ -148,6 +148,58 @@ describe("runWorkScan", () => {
     expect(outcomes[0]!.decision.actions.some((a) => a.type === "trash")).toBe(false);
   });
 
+  it("never crashes the whole run when the thread-reply check itself fails, and conservatively skips Trash", async () => {
+    // Regression: a sustained Gmail quota error from fetchThreadHasUserSentMessage
+    // (exhausting withApiRetry's retry budget) previously propagated
+    // uncaught out of finalizeOutcome/mapWithConcurrency and crashed the
+    // entire `gmail work` invocation instead of degrading just this one
+    // message.
+    const client = fakeClient([
+      {
+        id: "m1",
+        threadId: "t1",
+        labelIds: ["INBOX", "UNREAD"],
+        headers: [{ name: "From", value: "list@example.com" }]
+      }
+    ]);
+    (client.users as unknown as { threads: { get: () => Promise<unknown> } }).threads = {
+      get: async () => {
+        throw new Error("Quota exceeded for quota metric 'Total Query Cost' and limit 'Units per minute per user'.");
+      }
+    };
+    const classifier = new FixedClassifier({
+      ok: true,
+      assessment: {
+        kind: "promotion",
+        confidence: 0.99,
+        importanceScore: 0,
+        importanceConfidence: 0,
+        summary: "test",
+        reasonCodes: [],
+        event: {
+          intent: "none",
+          confidence: 0,
+          title: null,
+          start: null,
+          end: null,
+          allDay: false,
+          timeZone: null,
+          location: null,
+          sourceEvidence: null
+        },
+        category: null,
+        classifierVersion: "test",
+        promptVersion: "test",
+        schemaVersion: "test"
+      }
+    });
+    const { outcomes } = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.decision.actions.some((a) => a.type === "trash")).toBe(false);
+    expect(outcomes[0]!.decision.needsReview).toBe(true);
+    expect(outcomes[0]!.decision.reviewReason).toBe("thread_reply_check_failed");
+  });
+
   it("vetoes AI-derived trash for an authenticated, high-risk-content message instead of trashing it", async () => {
     // Regression: hasAuthenticatedHighRiskSignal was previously hardcoded
     // false, so the safety veto in policy.ts could never fire.

@@ -233,6 +233,27 @@ describe("GoogleApiRateLimiter", () => {
     expect(limiter.currentRequestsPerSecond).toBeCloseTo(10);
   });
 
+  it("acquire(weight) reserves that many pacing intervals, not just one", async () => {
+    vi.useFakeTimers();
+    try {
+      const limiter = new GoogleApiRateLimiter(10); // 100ms between baseline (weight-1) requests
+      const startedAt = Date.now();
+      const first = limiter.acquire(2); // costs 2 baseline slots = 200ms
+      await vi.advanceTimersByTimeAsync(0);
+      await first;
+      const secondTimestamp = (async () => {
+        await limiter.acquire();
+        return Date.now() - startedAt;
+      })();
+      await vi.advanceTimersByTimeAsync(200);
+      // The weight-2 first call reserved through t=200ms, so the very next
+      // (weight-1) call must wait until then, not just 100ms after the first.
+      await expect(secondTimestamp).resolves.toBe(200);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("with an explicit fastest rate, recovers above its cautious start rate after sustained success", () => {
     const limiter = new GoogleApiRateLimiter(4, 8_000, 12);
     expect(limiter.currentRequestsPerSecond).toBeCloseTo(4);

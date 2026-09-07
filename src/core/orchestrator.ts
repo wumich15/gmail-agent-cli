@@ -235,6 +235,7 @@ export interface ScanDiagnostics {
   classifierCalls: number;
   assessmentCacheHits: number;
   threadChecks: number;
+  threadCheckFailures: number;
   cachedBacklogQueued: number;
 }
 
@@ -252,6 +253,7 @@ function emptyScanDiagnostics(): ScanDiagnostics {
     classifierCalls: 0,
     assessmentCacheHits: 0,
     threadChecks: 0,
+    threadCheckFailures: 0,
     cachedBacklogQueued: 0
   };
 }
@@ -898,12 +900,34 @@ async function finalizeOutcome(
       threadHasUserSentMessagePromise = fetchThreadHasUserSentMessage(deps.gmailClient, stub.threadId);
       threadSentCache.set(stub.threadId, threadHasUserSentMessagePromise);
     }
-    if (await threadHasUserSentMessagePromise) {
+    // A single message's thread-reply check must never crash the whole
+    // run (CLAUDE.md: "Continue independent actions after an isolated
+    // failure") — a sustained per-minute quota error here previously
+    // propagated straight out of mapWithConcurrency and killed the entire
+    // `gmail work` invocation, discarding every other message's already-
+    // completed work in the same process. On failure (exhausted retries,
+    // network outage, etc.) this can't know whether the user actually
+    // replied in the thread, so it takes the same conservative branch as
+    // a real "yes" — never trash on an inconclusive answer — and routes
+    // the message to Review instead of silently guessing either way.
+    let threadCheckFailed = false;
+    let threadHasUserSentMessage: boolean;
+    try {
+      threadHasUserSentMessage = await threadHasUserSentMessagePromise;
+    } catch {
+      diagnostics.threadCheckFailures += 1;
+      threadCheckFailed = true;
+      threadHasUserSentMessage = true;
+    }
+    if (threadHasUserSentMessage) {
       // The user has replied in this thread — never trash it, regardless
       // of what triggered the trash decision above (native spam, an
       // explicit spam rule, or a high-confidence AI verdict all reuse this
       // one re-evaluation instead of three separate checks).
       rawDecision = evaluateMessagePolicy({ ...policyInput, isProtected: true }, deps.policyThresholds);
+      if (threadCheckFailed) {
+        rawDecision = { ...rawDecision, needsReview: true, reviewReason: "thread_reply_check_failed" };
+      }
     }
   }
 
