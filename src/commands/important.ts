@@ -16,6 +16,7 @@ import { applyGroupedLabelMutations, starAndImportantMutation } from "../gmail/e
 import { ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 import { listAllMessageIds } from "../gmail/scanner.js";
+import { withGoogleApiRetry } from "../core/api-retry.js";
 import type { NormalizedMessage, RuleMatcher } from "../core/models.js";
 import type { GmailClient } from "../gmail/client.js";
 
@@ -41,12 +42,14 @@ async function searchRecentCandidates(gmailClient: GmailClient, category: string
 
   const results: NormalizedMessage[] = [];
   for (const stub of listResult.messages) {
-    const { data: full } = await gmailClient.users.messages.get({
-      userId: "me",
-      id: stub.id,
-      format: "metadata",
-      metadataHeaders: ["From", "Subject", "List-ID", "Authentication-Results"]
-    });
+    const { data: full } = await withGoogleApiRetry(() =>
+      gmailClient.users.messages.get({
+        userId: "me",
+        id: stub.id,
+        format: "metadata",
+        metadataHeaders: ["From", "Subject", "List-ID", "Authentication-Results"]
+      })
+    );
     results.push(
       buildNormalizedMessage({
         gmailMessageId: stub.id,

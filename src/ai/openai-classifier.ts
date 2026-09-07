@@ -21,7 +21,7 @@ import {
 import type { ClassifyContext, Classifier } from "./classifier.js";
 import type { AssessmentResult, AssessmentUnavailable, EmailAssessment, NormalizedMessage } from "../core/models.js";
 
-export const SCHEMA_VERSION = "schema-v4";
+export const SCHEMA_VERSION = "schema-v5";
 const DEFAULT_TIMEOUT_MS = 20_000;
 
 /** Clearly above/below the 0.90 policy thresholds — the flags themselves are the decision; these just satisfy the existing threshold-based policy engine. */
@@ -86,7 +86,15 @@ export class OpenAiClassifier implements Classifier {
               instructions: buildDeveloperInstructions(context.existingLabels ?? []),
               input: buildInputWithExamples(message),
               store: false,
-              text: { format: zodTextFormat(EmailFlagsSchema, "email_flags") }
+              text: { format: zodTextFormat(EmailFlagsSchema, "email_flags") },
+              // This is a small fixed-schema flag classification, not an
+              // open-ended reasoning task — minimizing reasoning effort cuts
+              // per-call latency substantially on reasoning-tier models
+              // (the whole reason `gpt-5.4-mini` was chosen) without
+              // affecting output shape, since Structured Outputs still
+              // guarantees the schema regardless of effort level. Ignored
+              // harmlessly by any model that doesn't support the field.
+              reasoning: { effort: "low" }
             },
             { timeout: this.timeoutMs }
           ),
@@ -142,7 +150,13 @@ function buildInputWithExamples(message: NormalizedMessage) {
  */
 function mapFlagsToAssessment(flags: EmailFlags, message: NormalizedMessage, model: string): EmailAssessment {
   const kind =
-    flags.tag === "suspicious" ? "suspicious" : flags.tag === "spam" ? "promotion" : "personal_routine";
+    flags.tag === "suspicious"
+      ? "suspicious"
+      : flags.tag === "spam"
+        ? "promotion"
+        : flags.tag === "important"
+          ? "personal_important"
+          : "personal_routine";
   const hasEvent = flags.eventTitle !== null;
   const isSuspicious = flags.tag === "suspicious";
   return {
@@ -168,7 +182,7 @@ function mapFlagsToAssessment(flags: EmailFlags, message: NormalizedMessage, mod
             allDay: flags.eventAllDay,
             timeZone: null,
             location: null,
-            sourceEvidence: null
+            sourceEvidence: flags.eventSourceEvidence
           }
         : {
             intent: "none",

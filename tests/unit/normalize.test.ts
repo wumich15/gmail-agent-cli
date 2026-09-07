@@ -154,6 +154,38 @@ describe("buildNormalizedMessage", () => {
     expect(unread.contentHash).toBe(read.contentHash);
   });
 
+  it("changes the content hash when an actual classifier input changes", () => {
+    const base = {
+      gmailMessageId: "m1",
+      gmailThreadId: "t1",
+      historyId: "1",
+      internalDate: "1000",
+      labelIds: ["INBOX"],
+      snippet: "first preview",
+      headers: headerMapFromList([
+        { name: "From", value: "alice@example.com" },
+        { name: "Subject", value: "Hi" }
+      ]),
+      htmlBody: null,
+      plainBody: null,
+      userEmail: "me@example.com",
+      threadHasUserSentMessage: false
+    };
+    const original = buildNormalizedMessage(base);
+    const changedSnippet = buildNormalizedMessage({ ...base, snippet: "different preview" });
+    const changedBulkSignal = buildNormalizedMessage({
+      ...base,
+      headers: headerMapFromList([
+        { name: "From", value: "alice@example.com" },
+        { name: "Subject", value: "Hi" },
+        { name: "Precedence", value: "bulk" }
+      ])
+    });
+
+    expect(changedSnippet.contentHash).not.toBe(original.contentHash);
+    expect(changedBulkSignal.contentHash).not.toBe(original.contentHash);
+  });
+
   it("marks isFromUser when the sender matches the account email", () => {
     const msg = buildNormalizedMessage({
       gmailMessageId: "m1",

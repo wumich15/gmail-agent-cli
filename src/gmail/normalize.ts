@@ -259,7 +259,17 @@ export function buildNormalizedMessage(input: BuildNormalizedMessageInput): Norm
     subject: input.headers.subject,
     date: input.headers.date,
     messageId: input.headers.messageId,
-    bodyText
+    // These are the remaining values that actually affect
+    // buildClassificationInput: when there is no inline body the Gmail
+    // snippet is the model input, and the three bulk/list headers feed its
+    // derived signal. Leaving them out could turn a materially different
+    // classifier input into a false cache hit.
+    snippetFallback: bodyText === null ? input.snippet : null,
+    listId: input.headers.listId,
+    autoSubmitted: input.headers.autoSubmitted,
+    precedence: input.headers.precedence,
+    bodyText,
+    bodyTruncated
   });
 
   return {

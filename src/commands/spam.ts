@@ -13,6 +13,7 @@ import { redactUrlForLogging } from "../unsubscribe/safe-http.js";
 import { ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 import { listAllMessageIds } from "../gmail/scanner.js";
+import { withGoogleApiRetry } from "../core/api-retry.js";
 import type { NormalizedMessage } from "../core/models.js";
 import type { GmailClient } from "../gmail/client.js";
 
@@ -51,19 +52,21 @@ async function searchRecentCandidates(
 
   const results: NormalizedMessage[] = [];
   for (const stub of listResult.messages) {
-    const { data: full } = await gmailClient.users.messages.get({
-      userId: "me",
-      id: stub.id,
-      format: "metadata",
-      metadataHeaders: [
-        "From",
-        "Subject",
-        "List-ID",
-        "List-Unsubscribe",
-        "List-Unsubscribe-Post",
-        "Authentication-Results"
-      ]
-    });
+    const { data: full } = await withGoogleApiRetry(() =>
+      gmailClient.users.messages.get({
+        userId: "me",
+        id: stub.id,
+        format: "metadata",
+        metadataHeaders: [
+          "From",
+          "Subject",
+          "List-ID",
+          "List-Unsubscribe",
+          "List-Unsubscribe-Post",
+          "Authentication-Results"
+        ]
+      })
+    );
     results.push(
       buildNormalizedMessage({
         gmailMessageId: stub.id,
@@ -214,14 +217,16 @@ async function runSpamLocked(
       // re-encoding just the address/subject into a new URI and
       // reparsing, which silently dropped the original body.
       const mailto = parsed.mailto;
-      await gmailClient.users.messages.send({
-        userId: "me",
-        requestBody: {
-          raw: Buffer.from(
-            `To: ${mailto.address}\r\nSubject: ${mailto.subject ?? "Unsubscribe"}\r\n\r\n${mailto.body ?? ""}`
-          ).toString("base64url")
-        }
-      });
+      await withGoogleApiRetry(() =>
+        gmailClient.users.messages.send({
+          userId: "me",
+          requestBody: {
+            raw: Buffer.from(
+              `To: ${mailto.address}\r\nSubject: ${mailto.subject ?? "Unsubscribe"}\r\n\r\n${mailto.body ?? ""}`
+            ).toString("base64url")
+          }
+        })
+      );
       unsubHandled += 1;
       continue;
     }

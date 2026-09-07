@@ -37,6 +37,10 @@ export async function runView(options: ViewOptions): Promise<number> {
     console.log(pc.yellow("No cached messages yet. Run `gmail cache` first, then `gmail view`."));
     return EXIT_CODES.ok;
   }
+  if (!process.stdin.isTTY) {
+    console.error(pc.red("gmail view is interactive and requires a terminal (stdin is not a TTY)."));
+    return EXIT_CODES.safetyBlocked;
+  }
 
   const allTags = collectDistinctTags(all);
   const hiddenTags = new Set<string>();
@@ -213,7 +217,8 @@ function renderMessage(message: NormalizedMessage, labelIds: readonly string[]):
   }
   console.log(pc.dim(`Read: ${isRead(labelIds) ? "yes" : "no"}`));
   console.log("");
-  console.log(message.bodyText ?? message.snippet ?? pc.dim("(no content)"));
+  const content = message.bodyText ?? message.snippet;
+  console.log(content.length > 0 ? content : pc.dim("(no content)"));
 }
 
 type ViewerAction = "back" | "reply" | "ai_reply";

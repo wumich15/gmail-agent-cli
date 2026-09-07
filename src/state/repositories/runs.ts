@@ -128,6 +128,19 @@ export class ActionsRepository {
    * deterministic action key exists precisely so a later run recognizes
    * "this already happened" instead of silently re-adopting the row into
    * its own run and erasing which run actually did the work.
+   *
+   * `attempt_count` is deliberately NOT in the UPDATE SET list: the caller
+   * (`buildPlannedActions`) always constructs a fresh `PlannedAction` with
+   * `attemptCount: 0`, since it has no way to know the row's real history —
+   * only `updateStatus`'s increment-on-`applying` can see that. Overwriting
+   * it with the incoming 0 here would reset a still-unresolved action's
+   * real attempt history to zero on every single re-plan (i.e. on
+   * essentially every run while the action hasn't reached a terminal
+   * status), so the field could never reflect more than one real attempt
+   * across the action's actual lifetime. `status` is reset to the literal
+   * `'planned'` (not `excluded.status`, which is always `'planned'` anyway
+   * from the same fresh construction) to mark it as re-claimed for this
+   * run, and `error_class` is cleared since a fresh attempt hasn't failed yet.
    */
   upsertPlanned(actions: readonly PlannedAction[]): void {
     const insert = this.db.prepare(
@@ -135,9 +148,8 @@ export class ActionsRepository {
        VALUES (@actionKey, @runId, @accountHash, @type, @targetGmailMessageId, @targetGmailThreadId, @targetCalendarEventId, @reasonCode, @beforeStateHash, @payloadHash, @status, @attemptCount, @errorClass, @createdAt, @updatedAt)
        ON CONFLICT(action_key) DO UPDATE SET
          run_id = excluded.run_id,
-         status = excluded.status,
-         attempt_count = excluded.attempt_count,
-         error_class = excluded.error_class,
+         status = 'planned',
+         error_class = NULL,
          updated_at = excluded.updated_at
        WHERE actions.status NOT IN ('applied', 'failed_terminal', 'skipped_conflict')`
     );

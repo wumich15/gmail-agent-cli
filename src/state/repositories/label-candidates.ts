@@ -69,15 +69,56 @@ export class LabelCandidatesRepository {
       });
   }
 
-  /** Removes a candidate once it crosses the threshold and the label is actually created. */
+  /** Removes a candidate once it crosses the threshold and the label is actually created — also drops its voted-message-ID rows, which no longer serve any purpose once counting for that name stops. */
   clear(accountHash: string, normalizedName: string): void {
     this.db
       .prepare("DELETE FROM label_candidates WHERE account_hash = ? AND normalized_name = ?")
       .run(accountHash, normalizedName);
+    this.db
+      .prepare("DELETE FROM label_candidate_votes WHERE account_hash = ? AND normalized_name = ?")
+      .run(accountHash, normalizedName);
   }
 
-  /** `gmail uncache`: drops every pending candidate for this account. Returns how many rows were removed. */
+  /** `gmail uncache`: drops every pending candidate (and vote record) for this account. Returns how many candidate rows were removed. */
   clearForAccount(accountHash: string): number {
-    return this.db.prepare("DELETE FROM label_candidates WHERE account_hash = ?").run(accountHash).changes;
+    const changes = this.db.prepare("DELETE FROM label_candidates WHERE account_hash = ?").run(accountHash).changes;
+    this.db.prepare("DELETE FROM label_candidate_votes WHERE account_hash = ?").run(accountHash);
+    return changes;
+  }
+
+  /**
+   * Every message ID that has already been counted toward a category's
+   * cumulative count in a previous run, grouped by normalized category
+   * name — used to make sure a message reconciled again by a later
+   * incremental sync (e.g. because it was separately starred) never votes
+   * for the same category twice. See migration 004's doc comment.
+   */
+  listVotedMessageIdsForAccount(accountHash: string): Map<string, Set<string>> {
+    const rows = this.db
+      .prepare("SELECT normalized_name, gmail_message_id FROM label_candidate_votes WHERE account_hash = ?")
+      .all(accountHash) as { normalized_name: string; gmail_message_id: string }[];
+    const result = new Map<string, Set<string>>();
+    for (const row of rows) {
+      const set = result.get(row.normalized_name);
+      if (set) {
+        set.add(row.gmail_message_id);
+      } else {
+        result.set(row.normalized_name, new Set([row.gmail_message_id]));
+      }
+    }
+    return result;
+  }
+
+  /** Records that these messages have now voted for this category, so a later run never double-counts them. */
+  recordVotes(accountHash: string, normalizedName: string, gmailMessageIds: readonly string[]): void {
+    const insert = this.db.prepare(
+      "INSERT OR IGNORE INTO label_candidate_votes (account_hash, normalized_name, gmail_message_id) VALUES (?, ?, ?)"
+    );
+    const insertMany = this.db.transaction((ids: readonly string[]) => {
+      for (const id of ids) {
+        insert.run(accountHash, normalizedName, id);
+      }
+    });
+    insertMany(gmailMessageIds);
   }
 }

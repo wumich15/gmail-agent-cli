@@ -191,7 +191,7 @@ assessment exists — matching the precedence list above and the explicit
 spec language. `POLICY_VERSION` was bumped (`policy-v4`) to invalidate
 any assessment cached under the old behavior.
 
-## Data model (SQLite, `src/state/migrations/001_initial_schema.ts`)
+## Data model (SQLite, ordered migrations under `src/state/migrations/`)
 
 One database per OS user, WAL mode, foreign keys on, `0600` permissions
 enforced at open time (`src/state/database.ts` refuses to proceed if the
@@ -200,8 +200,8 @@ file is group/world-readable on POSIX platforms).
 | Table | Purpose |
 | --- | --- |
 | `accounts` | Account hash, display email, timezone, Gmail history marker, setup/automation flags |
-| `messages` | Per-message classifier/policy version projection, plus (migration 003) `subject`/`sender_display`/`internal_date` — low-sensitivity metadata `gmail view`'s list reads from; still never a body |
-| `label_candidates` | (migration 002) Cross-run cumulative counts for AI-guessed topical categories that haven't cleared `MIN_LABEL_BATCH_SIZE` yet |
+| `messages` | Per-message classifier/policy version projection, plus (migration 003) `subject`/`sender_display`/`internal_date`, migration 005 `category`, and migration 006 `assessment_had_event` — low-sensitivity metadata `gmail view`'s list reads from; still never a body or event payload |
+| `label_candidates` | (migration 002, with migration 004 distinct-vote tracking) Cross-run cumulative counts for AI-guessed topical categories that haven't cleared `MIN_LABEL_BATCH_SIZE` yet |
 | `rule_groups` / `rule_matchers` | User-created spam/important categories and their concrete matchers |
 | `runs` | One row per `gmail work`/`spam`/`important` invocation |
 | `actions` | The durable action ledger — outbox pattern: `planned -> applying -> applied \| failed_* \| skipped_conflict \| unknown_no_retry \| reversed` |
@@ -253,39 +253,48 @@ returned `newHistoryMarker` *after* `runsRepo.finish(...)` — i.e. only
 once the run's plan/ledger is durable — and never in `--dry-run` (which
 must not mutate durable state at all, per CLAUDE.md).
 
-`gmail cache` (`src/commands/cache.ts`) is the explicit, always-full,
-read-only counterpart: no `--limit`, no classifier, no mutations — it
-exists purely to let a user pay the expensive full-traversal cost once,
-deliberately, and refresh the history-marker baseline, so every
-`gmail`/`gmail work` run afterward is cheap. It also upserts each visited
-message's non-verbatim projection (`contentHash`, sorted `labelSnapshot`,
-`subject`/`senderDisplay`/`internalDate`, no assessment fields) into the
-`messages` table via `MessagesRepository`, which `gmail view` reads
-directly (see "gmail view" below) and which also lays groundwork for the
-not-yet-implemented assessment-reuse cache described in "Known
-deviations."
+`gmail cache` (`src/commands/cache.ts`) is the explicit, read-only full
+Inbox/Spam counterpart. It accepts an optional `--limit`, never calls the
+classifier, and makes no Gmail/Calendar mutations. An uncapped, successful
+snapshot refreshes the history-marker baseline; a limited or partially
+failed snapshot leaves the baseline untouched. It upserts each visited
+message's non-verbatim projection (`contentHash`, label snapshot,
+`subject`/`senderDisplay`/`internalDate`, no body or assessment payload) into
+the `messages` table via `MessagesRepository`, which `gmail view` reads
+directly (see "gmail view" below).
+
+On the next `gmail work`, the cached rows are now read: unassessed rows and
+rows whose classifier, prompt, schema, policy, rule, or custom-label context
+is stale are unioned with Gmail history as a targeted backlog. Each such row
+gets one live `messages.get(format="full")` hydration/evaluation pass, then
+drops out of the backlog when its current evaluation is durably recorded.
+Matching event-free assessments can skip the OpenAI call entirely on later
+history changes. Event-bearing assessments are deliberately rehydrated,
+because the event payload and source evidence are not persisted and cannot be
+reconstructed safely. Deleted, inactive, trashed, and successfully archived
+rows are evicted from the working-set cache.
 
 ### Adaptive Gmail rate limiting
 
 `src/core/api-retry.ts`'s `GoogleApiRateLimiter` is a shared,
-process-wide token-bucket pacer every Gmail/Calendar call goes through via
-a new `withGoogleApiRetry` (all six Gmail/Calendar call sites —
+process-wide pacer every Gmail/Calendar call goes through via
+`withGoogleApiRetry` (all Gmail/Calendar call sites —
 `scanner.ts`, `executor.ts`, `custom-labels.ts`, `idempotency.ts`,
 `work.ts`, `undo.ts` — switched from the plain `withApiRetry`; OpenAI
 calls are untouched, a separate quota domain with their own budget in
 `OpenAiClassifier`). Rather than hardcoding one "safe" requests/second
 number — real observed per-project quotas have proven lower than Google's
-documented defaults in live use this session — it starts at a moderate
-rate (`GMAIL_AGENT_RATE_LIMIT_RPS`, default 8/s), halves itself the
-instant it sees a quota-shaped failure (429, a retryable network error, or
-the Service Infrastructure quota-message pattern), and only creeps back up
-after 25 consecutive clean calls. Concurrency (`concurrency.gmailReads`)
-still controls how many requests are *in flight*; this limiter controls
-how *fast* they're allowed to leave regardless of concurrency, so raising
-concurrency no longer risks a burst past whatever rate the account can
-actually sustain. Automatically bypassed under Vitest (`process.env.VITEST`)
-so the test suite doesn't pay real sleep time pacing fake-client calls —
-tests exercise the `GoogleApiRateLimiter` class directly instead.
+documented defaults in live use this session — it starts at 4/s and recovers
+toward 12/s (or the explicit `GMAIL_AGENT_RATE_LIMIT_RPS` value), halves
+itself on a quota-shaped failure (429 or the Service Infrastructure
+quota-message pattern), and only creeps back up after 25 consecutive clean
+calls. Ordinary network errors reset the recovery streak without being
+misclassified as quota pressure, and 5xx responses retry without slowing the
+limiter. Concurrent callers reserve distinct future slots, preventing a
+burst when several reads complete together. Concurrency
+(`concurrency.gmailReads`) still controls how many requests are *in flight*;
+the limiter controls how *fast* they're allowed to leave. It is bypassed
+under Vitest so fake-client tests don't pay production pacing delays.
 
 ## AI status in this build
 
@@ -300,9 +309,16 @@ largely mutually-exclusive booleans — the prompt already said "at most
 one of spam/suspicious should be true," so one enum field costs fewer
 output tokens per call at the same information content) plus a few event
 fields (event presence inferred from `eventTitle !== null`, no separate
-`hasEvent` boolean) and one short nullable string (`category`) — no
-confidence floats, no free-text summary, no reason-code array — parsed
-via `zodTextFormat`. It never receives Gmail/Calendar credentials or the
+`hasEvent` boolean, but `eventSourceEvidence` — a short quote required
+whenever `eventTitle` is non-null — was kept/restored despite the
+cost-driven compression: `core/orchestrator.ts` calls
+`calendar/event-policy.ts`'s `sourceEvidencePresent` to verify that quote
+is actually present in the normalized message before any Calendar event
+is created, so a hallucinated date can't produce a real event just
+because the model asserted one) and one short nullable string
+(`category`) — no confidence floats, no free-text summary, no
+reason-code array — parsed via `zodTextFormat`. It never receives
+Gmail/Calendar credentials or the
 ability to call anything — it returns the tag+fields, and
 `openai-classifier.ts` deterministically maps them onto the richer
 internal `EmailAssessment` shape `core/policy.ts` already knows how to
@@ -356,8 +372,8 @@ return it in.
 renamed from `google-api-retry.ts` once it started being shared by both
 the Google and OpenAI SDKs, both of which expose `.status`/
 `.response.headers.get()` in a compatible shape) with a smaller retry
-budget than the Gmail/Calendar default (3 attempts, 500ms/8s backoff
-vs. Google's 5 attempts/1s/30s) — this call runs once per message, so a
+budget than the generic retry default (3 attempts, 500ms/8s backoff) — this
+call runs once per message, so a
 worst-case full backoff cycle here is directly felt as "the whole run
 is slow," unlike a single Gmail list-page retry.
 
@@ -669,8 +685,14 @@ covered by new regression tests:
   `console.log`/`console.error`, including `cli.ts`'s top-level
   catch-all, which could print an unredacted token embedded in an SDK
   error's message/stack. `logging/logger.ts` now also exports
-  `redactSecrets(text)`, applied to that catch-all's output. Wiring the
-  full `pino` logger through every call site remains unaddressed.
+  `redactSecrets(text)`, applied to that catch-all's output.
+  `bootstrap.ts` now constructs it with `{ toFile: true }` (a dedicated
+  log file, so structured JSON lines don't interleave with the CLI's own
+  human-readable stderr progress output) and `commands/work.ts` calls it
+  at run start, scan completion, and run finish with content-free counts
+  (run ID, account hash, status, trashed/label/calendar/failure counts).
+  Wiring it through every remaining command (`spam`/`important`/`cache`/
+  etc.) remains unaddressed.
 - **`gmail add spam`'s search never actually searched Spam**: `includeSpamTrash`
   was never set (Gmail's API default is `false`), so a query built around
   `in:spam` silently never matched a spam-labeled message regardless of
@@ -713,6 +735,219 @@ covered by new regression tests:
   labels) — now quoted; the unsubscribe SSRF check was missing
   `100.64.0.0/10` (RFC 6598 carrier-grade NAT); the angle-bracket address
   regex didn't span an embedded newline in a display name.
+
+## Second bug-hunt pass: fixes applied
+
+A second full-codebase review (five parallel reviewers covering `gmail
+view`/reply/draft-reply, the Gmail rate limiter and its call sites, the AI
+schema/prompt/classifier, the state layer and label-batch threshold
+wiring, and a general sweep of everything else) found and fixed:
+
+- **Two CLAUDE.md-mandated protection signals were permanently dead**:
+  `threadHasUserSentMessage` was hardcoded `false` everywhere and
+  `isProtected` never even read it, so a thread the user had replied in
+  got no protection from later AI-driven trash; `hasAuthenticatedHighRiskSignal`
+  was hardcoded `false`, so the safety veto in `policy.ts` for
+  authenticated security/financial/travel mail could never fire. Fixed:
+  `gmail/scanner.ts`'s `fetchThreadHasUserSentMessage` (a `threads.get`
+  call checking for Gmail's own `SENT` label on any message in the
+  thread, memoized per run by threadId) now feeds `isProtected` in
+  `core/orchestrator.ts`; a new deterministic `core/high-risk-signal.ts`
+  (aligned-DKIM/DMARC-authenticated sender AND a matched high-risk
+  content pattern — a keyword alone is deliberately never enough) now
+  feeds the veto. Both are evaluated in real code, never from AI output.
+- **CRLF header injection into an outbound reply** (`gmail/reply.ts`):
+  neither the parsed recipient nor the subject/`Message-ID` were checked
+  for embedded `\r`/`\n` before being spliced into the raw RFC 5322
+  header block, so a crafted `Reply-To`/`Subject` could inject an extra
+  header (e.g. `Bcc`) into the user's own reply. `buildReplyTarget` now
+  refuses to build a target at all when the resolved address itself
+  contains CR/LF (matching `unsubscribe/headers.ts`'s existing mailto
+  handling), and every other header value is passed through a
+  `sanitizeSingleLineHeader` helper. The reply body's
+  `Content-Transfer-Encoding` was also missing (defaulting to invalid
+  `7bit` for a non-ASCII body); it's now `base64` (with RFC 2045 76-char
+  line wrapping) whenever the body isn't pure ASCII.
+- **Four real Gmail API calls bypassed both retry and the adaptive rate
+  limiter**: `spam.ts`/`important.ts`'s `searchRecentCandidates` (a
+  `messages.get` loop over up to 500 search hits), `spam.ts`'s `mailto:`
+  unsubscribe send, and `summary.ts`'s per-action `messages.get` were
+  never touched by the earlier `withApiRetry` → `withGoogleApiRetry`
+  migration. All four now go through `withGoogleApiRetry`.
+- **Cross-run label-candidate double-counting**: `label_candidates` only
+  stored a raw running total with no per-message dedup, so a message
+  reclassified again by a later incremental sync (e.g. because it was
+  separately starred, generating its own history event) could vote
+  toward the 10-message threshold more than once. A new
+  `label_candidate_votes` table (migration 004) and
+  `LabelCandidatesRepository.recordVotes`/`listVotedMessageIdsForAccount`
+  now dedup by `(account, category, gmailMessageId)`. The same fix pass
+  also stopped `work.ts` from clearing a candidate row when the count
+  crossed threshold but the actual `getOrCreateLabelId` call failed that
+  run — it now keeps counting instead of silently discarding progress.
+- **`ActionsRepository.upsertPlanned` silently reset `attempt_count` and
+  `status` on every re-plan of a still-unresolved action**: the caller
+  always constructs a fresh `PlannedAction` with `attemptCount: 0`, and
+  the old `ON CONFLICT` clause blindly applied that to the stored row —
+  empirically confirmed to reset a real `attempt_count: 1` back to `0`
+  on the very next run. `attempt_count` is no longer in the `UPDATE SET`
+  list at all; only `run_id`, a literal `status = 'planned'`, and a
+  cleared `error_class` are updated.
+- **AI tag→`kind` mapping collapsed `"important"` and `"routine"` into
+  the same `personal_routine` kind**, producing a self-contradictory
+  reason code (`ai_importance_personal_routine`) on star/important
+  actions. `"important"` now maps to `personal_important`.
+- `core/keypress.ts`'s `waitForKeypress` used to hang forever with no
+  diagnostic when stdin isn't a TTY; it now rejects immediately, and
+  `commands/view.ts` checks `process.stdin.isTTY` up front.
+- `normalizeCategoryLabel` (`ai/prompt.ts`) only stripped `\r\n\t` from
+  the model-controlled category string before it became a real Gmail
+  label and hit the terminal; it now strips all C0/C1 control characters.
+- `sourceEvidencePresent` (`calendar/event-policy.ts`) was dead code —
+  the earlier wire-schema compression stopped asking the model for
+  `sourceEvidence` at all, so CLAUDE.md's required hallucinated-date
+  defense had nothing left to validate against. Restored as
+  `eventSourceEvidence` in the wire schema (required whenever
+  `eventTitle` is non-null; `schema-v5`/`prompt-v5`), and
+  `core/orchestrator.ts` now calls `sourceEvidencePresent` before
+  `validateEventCandidate`, downgrading to Review
+  (`event_validation_failed_missing_source_evidence`) when the model's
+  claimed evidence isn't actually present in the message.
+- The Gmail rate limiter's default (`DEFAULT_GOOGLE_REQUESTS_PER_SECOND`
+  in `core/api-retry.ts`) was an unfounded `8`; this pass changed it to a
+  conservative `2`, grounded in Gmail's currently-published per-user quota
+  (6,000 units/minute = 100 units/second) and this app's dominant
+  per-message calls (`messages.get` at 20 units, `threads.get` —
+  newly added in this same pass for thread-reply protection — at 40
+  units), targeting roughly half that budget for headroom. **This default
+  was itself replaced in the very next pass below** once the
+  `threads.get` call that motivated it was made lazy instead of
+  unconditional.
+- Minor/low-severity: a dead `message.snippet` fallback in `view.ts`'s
+  `renderMessage` (the type is non-nullable, so the "(no content)"
+  placeholder could never show — now checks length instead); a low-level
+  network error (`ECONNRESET` etc.) fed neither the rate limiter's
+  backoff nor its recovery streak — it now resets the recovery streak
+  without triggering backoff, since it isn't a quota signal;
+  `GoogleApiRateLimiter`'s constructor had no guard against a
+  non-positive rate (defense in depth only — the one real call site was
+  already validated); the now-effectively-dead
+  `autoTrashAutomatedLowValueConfidence` policy threshold (only
+  `RandomClassifier` can still produce that kind) is now documented as
+  such rather than silently doing nothing.
+
+## Third fix pass: latency and cache-utilization
+
+Reported symptom: `gmail`/`gmail work` still felt too slow, and the
+previously-added `gmail cache` scan cache appeared to do nothing but store
+data — a follow-up run seemed to redo the same work from scratch. Both
+turned out to be real, and both were traced to identifiable causes rather
+than tuned away by guessing:
+
+- **The unconditional `threads.get` call from the prior pass was the
+  single biggest new cost.** It was added so every message could be
+  checked for "does this thread already contain a message the user sent"
+  (thread-reply protection) before any Trash decision — correct for
+  safety, but it ran for *every* message, not just ones actually headed
+  for Trash, doubling the Gmail quota cost of a typical run (`messages.get`
+  at 20 units plus an unconditional `threads.get` at 40 units, vs. 20
+  alone) and adding a full extra network round trip per message.
+  `core/orchestrator.ts`'s `finalizeOutcome` now defers this call: it
+  first evaluates policy using only the cheap, already-known protection
+  signals (explicit important rule, a preexisting `STARRED`/`IMPORTANT`
+  label not attributable to this app), and only calls (and memoizes,
+  per-thread, across the whole run) `fetchThreadHasUserSentMessage` when
+  that first pass would actually plan a Trash action — the one case where
+  the extra signal can change the outcome. Every non-Trash-bound message
+  now costs exactly what it did before thread-reply protection existed.
+- **`gmail work` never actually read what `gmail cache` wrote.**
+  `grep -rln "MessagesRepository" src` before this pass showed `work.ts`
+  never importing the `messages` table repository at all — the per-message
+  content hash, label snapshot, and (once classified) assessment that
+  `gmail cache`/`gmail work` persisted were write-only. CLAUDE.md's AI
+  assessment contract already specified the fix ("Cache assessments using
+  content and version hashes") but it had never been wired up: every run
+  re-classified every unresolved message with a fresh OpenAI call
+  regardless of whether that exact message, under the exact same
+  classifier/prompt/schema/policy versions, had already been classified on
+  a previous run. `core/orchestrator.ts`'s `classifyAndFinalize` now
+  checks a `cachedAssessments` map (keyed by Gmail message ID, loaded by
+  `work.ts` from `MessagesRepository`) before calling the classifier: a
+  cache hit requires the stored content hash and all four version
+  identifiers (`classifierVersion`, `promptVersion`, `schemaVersion`,
+  `policyVersion`) to match exactly, and reconstructs the assessment
+  (`reconstructAssessment`) without any AI call at all. A hit never
+  reconstructs a real Calendar event from cache (`event.intent` is always
+  `"none"` on a cache hit) — an event is a real mutation with its own
+  idempotency machinery below, and CLAUDE.md forbids persisting
+  `sourceEvidence` verbatim, so there is nothing safe to reconstruct an
+  event from. Every scanned message's fresh-or-reused assessment is written
+  back via `MessagesRepository.upsert` at the end of a non-dry-run
+  `gmail work`, so the cache keeps compounding across runs instead of only
+  ever being populated by `gmail cache`. `ResolvedClassifier` now reports
+  real `classifierVersion`/`promptVersion`/`schemaVersion` values (previously
+  hardcoded `"not-configured"` placeholders that could never match anything),
+  and migration `005_message_category.ts` adds the `category` column the
+  `messages` table needed to round-trip the AI-proposed topical label
+  through a cache hit.
+  The cache read also now queues `gmail cache`-only placeholders and stale
+  rows alongside history changes, so the stored IDs drive one targeted live
+  hydration instead of becoming write-only metadata. Migration 006 records
+  whether an assessment had an event candidate; event-bearing and legacy
+  unknown rows are rehydrated because their payload/evidence is intentionally
+  not persisted. Matching event-free rows can skip OpenAI, while deterministic
+  or intentionally unconfigured evaluations record their current versions so
+  they do not remain in the backlog forever. Rule-group and custom-label
+  context is included in the cache-policy hash, and deleted/inactive/actioned
+  rows are evicted from the working set.
+  - Fixing this exposed a real latent bug in `gmail cache` itself: its
+    `messagesRepo.upsert` unconditionally nulled every assessment field on
+    every run. Since CLAUDE.md explicitly recommends re-running
+    `gmail cache` under quota pressure, doing so would have silently wiped
+    out the very cache this pass just built. `cache.ts` now reads the
+    existing row first and preserves its assessment fields whenever the
+    content hash is unchanged; only a genuinely changed message gets a
+    blank (correctly stale) assessment.
+- **The rate limiter's recovery ceiling was capped at its own cold-start
+  guess.** `GoogleApiRateLimiter.reportSuccess()` previously crept back up
+  only as far as the constructor's single `initialRequestsPerSecond`
+  value — so a conservative cold-start rate (chosen defensively, before
+  actual quota headroom is known) could never be exceeded no matter how
+  long a run went or how many requests succeeded in a row. The constructor
+  now takes an optional third `fastestRequestsPerSecond` ceiling
+  (`core/api-retry.ts`); `reportSuccess()` recovers toward that ceiling
+  instead of the start rate, so a long-running command like `gmail cache`
+  can adaptively discover and climb to an account's real throughput over
+  its own execution instead of being frozen at a pessimistic guess for its
+  entire duration. Omitting the third argument preserves the old
+  single-plateau behavior exactly (verified by the existing "never
+  recovers past its original rate" test, still passing unchanged). The
+  singleton's defaults changed from a single `DEFAULT_GOOGLE_REQUESTS_PER_SECOND
+  = 2` to `START_REQUESTS_PER_SECOND = 4` / `FASTEST_REQUESTS_PER_SECOND =
+  12`: the lazy `threads.get` fix above means a typical run is now
+  dominated by plain 20-unit `messages.get` calls rather than a 20/40 mix,
+  so the same quota-headroom math that justified `2` now supports a higher
+  floor, and the new ceiling lets a run reach further when an account's
+  actual quota allows it — both are still overridable via
+  `GMAIL_AGENT_RATE_LIMIT_RPS`.
+- **OpenAI classification latency**: `responses.parse` now passes
+  `reasoning: { effort: "low" }`. Classification is a small, fixed-schema
+  flag decision, not open-ended reasoning, and Structured Outputs already
+  guarantees the response shape regardless of effort level — lower effort
+  trades away reasoning depth the task doesn't need for lower per-call
+  latency. `config.concurrency.aiCalls` (already 5 by default,
+  `config/schema.ts`) and `OpenAiClassifier`'s existing 429/5xx retry with
+  backoff (`withApiRetry`, capped at 3 attempts/8s) were both already in
+  place from earlier work and needed no change.
+- **Remaining request stalls are now bounded and observable.** Gmail read
+  calls use a 20-second request timeout and a short three-attempt retry
+  budget, including history, labels, message, thread, and profile reads.
+  Message hydration and classification use true worker pools rather than
+  fixed batches, removing head-of-line waits when one request retries. Each
+  `gmail work` run reports content-free phase timings, API fetch counts,
+  classifier calls, cache hits, and deferred thread checks to stderr and the
+  structured logger, making a Gmail-side stall distinguishable from AI
+  latency without logging message content.
 
 ## Known deviations from the full design (as of this writing)
 
@@ -757,20 +992,15 @@ covered by new regression tests:
   own safe default when DKIM coverage can't be verified.
 - No interactive sender/message pickers — `gmail add` requires at least
   one explicit category argument.
-- No response caching by content+model+prompt+schema+policy hash, so a
-  message unchanged since the last run (but touched for some other
-  reason, e.g. a label change) is still re-classified (and re-billed)
-  from scratch — `messages`/`MessagesRepository` now exist and are
-  populated by `gmail cache`, giving a future enhancement everything it
-  needs (content hash + label snapshot per message) to skip a redundant
-  OpenAI call, but `work.ts`'s classify step doesn't consult that table
-  yet. This is an OpenAI-cost optimization, distinct from the
-  history-based Gmail-quota optimization below, which is implemented.
-- No version-triggered targeted rescan yet: per CLAUDE.md, a
-  prompt/model/policy version change should force re-evaluation of
-  already-processed Inbox mail even under incremental sync, but
-  `runWorkScan` doesn't compare the persisted `messages` rows' version
-  columns against the current versions to decide this.
+- Cached bodies, summaries, Calendar payloads, and AI source evidence are
+  intentionally not persisted. A cache-only placeholder therefore requires
+  one live full-message hydration before policy can decide commands, and an
+  event-bearing or legacy/unknown assessment is rehydrated rather than
+  reconstructed unsafely. After that pass, matching event-free assessments
+  are reused by content/version hash and stale classifier/prompt/schema/
+  policy/rule/label context queues targeted re-evaluation under incremental
+  sync. This preserves the privacy boundary at the cost of that one safe
+  hydration.
 - No labeled classifier evaluation set or precision gate against real
   AI output (the 90%+ launch-precision gates in `CLAUDE.md` were written
   against this eventual reality) — accuracy is currently unverified.

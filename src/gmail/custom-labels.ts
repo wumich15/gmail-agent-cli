@@ -12,7 +12,10 @@ export interface UserLabel {
  * for AI-assigned topical grouping or the "Calendar" label).
  */
 export async function listUserLabels(client: GmailClient): Promise<UserLabel[]> {
-  const { data } = await withGoogleApiRetry(() => client.users.labels.list({ userId: "me" }));
+  const { data } = await withGoogleApiRetry(
+    () => client.users.labels.list({ userId: "me" }, { timeout: 20_000 }),
+    { maxAttempts: 3, baseDelayMs: 750, maxDelayMs: 10_000 }
+  );
   const labels: UserLabel[] = [];
   for (const label of data.labels ?? []) {
     if (label.type === "user" && label.id && label.name) {

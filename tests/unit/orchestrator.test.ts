@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { resolvePostScanHistoryMarker, runWorkScan } from "../../src/core/orchestrator.js";
+import { resolvePostScanHistoryMarker, runWorkScan, type CachedAssessmentSnapshot } from "../../src/core/orchestrator.js";
 import { SystemClock } from "../../src/core/clock.js";
+import { buildNormalizedMessage, headerMapFromList } from "../../src/gmail/normalize.js";
 import type { Classifier } from "../../src/ai/classifier.js";
 import type { AssessmentResult, NormalizedMessage, RuleGroup } from "../../src/core/models.js";
 import type { GmailClient } from "../../src/gmail/client.js";
@@ -49,6 +50,12 @@ function fakeClient(messages: FakeMessage[]): GmailClient {
             }
           };
         }
+      },
+      // No message in any test thread is ever from the user by default —
+      // see the dedicated "thread has a user-sent message" test below for
+      // the one that overrides this to return SENT.
+      threads: {
+        get: async () => ({ data: { messages: [] } })
       }
     }
   };
@@ -94,6 +101,219 @@ describe("runWorkScan", () => {
     const { outcomes } = await runWorkScan(baseDeps({ gmailClient: client }));
     expect(outcomes).toHaveLength(1);
     expect(outcomes[0]!.decision.actions).toEqual([{ type: "trash", reasonCode: "native_spam" }]);
+  });
+
+  it("protects a message whose thread already contains a message the user sent, even under a high-confidence spam classification", async () => {
+    // Regression: threadHasUserSentMessage was previously hardcoded false
+    // and never consulted by isProtected — this message would otherwise
+    // have been auto-trashed despite the user having replied in the thread.
+    const client = fakeClient([
+      {
+        id: "m1",
+        threadId: "t1",
+        labelIds: ["INBOX", "UNREAD"],
+        headers: [{ name: "From", value: "list@example.com" }]
+      }
+    ]);
+    (client.users as unknown as { threads: { get: () => Promise<unknown> } }).threads = {
+      get: async () => ({ data: { messages: [{ labelIds: ["SENT"] }] } })
+    };
+    const classifier = new FixedClassifier({
+      ok: true,
+      assessment: {
+        kind: "promotion",
+        confidence: 0.99,
+        importanceScore: 0,
+        importanceConfidence: 0,
+        summary: "test",
+        reasonCodes: [],
+        event: {
+          intent: "none",
+          confidence: 0,
+          title: null,
+          start: null,
+          end: null,
+          allDay: false,
+          timeZone: null,
+          location: null,
+          sourceEvidence: null
+        },
+        category: null,
+        classifierVersion: "test",
+        promptVersion: "test",
+        schemaVersion: "test"
+      }
+    });
+    const { outcomes } = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
+    expect(outcomes[0]!.decision.actions.some((a) => a.type === "trash")).toBe(false);
+  });
+
+  it("vetoes AI-derived trash for an authenticated, high-risk-content message instead of trashing it", async () => {
+    // Regression: hasAuthenticatedHighRiskSignal was previously hardcoded
+    // false, so the safety veto in policy.ts could never fire.
+    const client = fakeClient([
+      {
+        id: "m1",
+        threadId: "t1",
+        labelIds: ["INBOX", "UNREAD"],
+        headers: [
+          { name: "From", value: "security@example.com" },
+          { name: "Authentication-Results", value: "dkim=pass header.i=@example.com" }
+        ],
+        snippet: "We detected unusual activity. Please verify your account within 24 hours."
+      }
+    ]);
+    const classifier = new FixedClassifier({
+      ok: true,
+      assessment: {
+        kind: "promotion",
+        confidence: 0.99,
+        importanceScore: 0,
+        importanceConfidence: 0,
+        summary: "test",
+        reasonCodes: [],
+        event: {
+          intent: "none",
+          confidence: 0,
+          title: null,
+          start: null,
+          end: null,
+          allDay: false,
+          timeZone: null,
+          location: null,
+          sourceEvidence: null
+        },
+        category: null,
+        classifierVersion: "test",
+        promptVersion: "test",
+        schemaVersion: "test"
+      }
+    });
+    const { outcomes } = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
+    expect(outcomes[0]!.decision.actions.some((a) => a.type === "trash")).toBe(false);
+    expect(outcomes[0]!.decision.needsReview).toBe(true);
+    expect(outcomes[0]!.decision.reviewReason).toBe("authenticated_high_risk_veto");
+  });
+
+  function contentHashFor(message: FakeMessage): string {
+    return buildNormalizedMessage({
+      gmailMessageId: message.id,
+      gmailThreadId: message.threadId,
+      historyId: "1",
+      internalDate: message.internalDate ?? "1000",
+      labelIds: message.labelIds,
+      snippet: message.snippet ?? "",
+      headers: headerMapFromList(message.headers),
+      htmlBody: null,
+      plainBody: null,
+      userEmail: "me@example.com",
+      threadHasUserSentMessage: false
+    }).contentHash;
+  }
+
+  describe("cachedAssessments (assessment-reuse cache)", () => {
+    const message: FakeMessage = {
+      id: "m1",
+      threadId: "t1",
+      labelIds: ["INBOX", "UNREAD"],
+      headers: [{ name: "From", value: "person@example.com" }, { name: "Subject", value: "Hi" }]
+    };
+    const cachedSnapshot: CachedAssessmentSnapshot = {
+      contentHash: contentHashFor(message),
+      classifierVersion: "openai:test-model",
+      promptVersion: "prompt-v5",
+      schemaVersion: "schema-v5",
+      policyVersion: "policy-v4",
+      kind: "personal_important",
+      confidence: 0.98,
+      importanceScore: 0.95,
+      importanceConfidence: 0.95,
+      reasonCodes: [],
+      category: "Work"
+    };
+
+    it("skips the AI call after the required freshness fetch when content hash and every version match", async () => {
+      const client = fakeClient([message]);
+      const messagesApi = client.users.messages as unknown as {
+        get: (params: { id: string }) => Promise<unknown>;
+      };
+      const originalGet = messagesApi.get;
+      let gmailMessageFetches = 0;
+      messagesApi.get = async (params) => {
+        gmailMessageFetches += 1;
+        return originalGet(params);
+      };
+      let classifierCalls = 0;
+      const classifier: Classifier = {
+        async assess(): Promise<AssessmentResult> {
+          classifierCalls += 1;
+          return { ok: false, unavailable: { reason: "not_configured", detail: null } };
+        }
+      };
+      const { outcomes } = await runWorkScan(
+        baseDeps({
+          gmailClient: client,
+          classifier,
+          classifierVersion: cachedSnapshot.classifierVersion,
+          promptVersion: cachedSnapshot.promptVersion,
+          schemaVersion: cachedSnapshot.schemaVersion,
+          cachedAssessments: new Map([[message.id, cachedSnapshot]])
+        })
+      );
+      // A cache hit saves the slow OpenAI call, but messages.get is still
+      // required to verify that the content hash and current Gmail labels
+      // have not changed since the row was cached.
+      expect(gmailMessageFetches).toBe(1);
+      expect(classifierCalls).toBe(0);
+      // The reconstructed assessment should still drive the same
+      // star/important decision the original classification would have.
+      expect(outcomes[0]!.decision.actions.some((a) => a.type === "star")).toBe(true);
+      expect(outcomes[0]!.decision.actions.some((a) => a.type === "mark_important")).toBe(true);
+    });
+
+    it("calls the AI classifier when the message's content hash no longer matches the cached row (content changed)", async () => {
+      const client = fakeClient([message]);
+      let called = false;
+      const classifier: Classifier = {
+        async assess(): Promise<AssessmentResult> {
+          called = true;
+          return { ok: false, unavailable: { reason: "not_configured", detail: null } };
+        }
+      };
+      await runWorkScan(
+        baseDeps({
+          gmailClient: client,
+          classifier,
+          classifierVersion: cachedSnapshot.classifierVersion,
+          promptVersion: cachedSnapshot.promptVersion,
+          schemaVersion: cachedSnapshot.schemaVersion,
+          cachedAssessments: new Map([[message.id, { ...cachedSnapshot, contentHash: "stale-hash-from-before-an-edit" }]])
+        })
+      );
+      expect(called).toBe(true);
+    });
+
+    it("calls the AI classifier when the run's prompt/schema version no longer matches the cached row (a prompt/model upgrade)", async () => {
+      const client = fakeClient([message]);
+      let called = false;
+      const classifier: Classifier = {
+        async assess(): Promise<AssessmentResult> {
+          called = true;
+          return { ok: false, unavailable: { reason: "not_configured", detail: null } };
+        }
+      };
+      await runWorkScan(
+        baseDeps({
+          gmailClient: client,
+          classifier,
+          classifierVersion: cachedSnapshot.classifierVersion,
+          promptVersion: "prompt-v6", // newer than the cached row's prompt-v5
+          schemaVersion: cachedSnapshot.schemaVersion,
+          cachedAssessments: new Map([[message.id, cachedSnapshot]])
+        })
+      );
+      expect(called).toBe(true);
+    });
   });
 
   it("archives a read inbox message using the classifier's assessment", async () => {
@@ -323,7 +543,8 @@ describe("runWorkScan", () => {
       normalizedName: "shopping",
       displayName: "Shopping",
       newCumulativeCount: 9,
-      applied: false
+      applied: false,
+      newlyVotedMessageIds: messages.map((m) => m.id)
     });
   });
 
@@ -414,7 +635,8 @@ describe("runWorkScan", () => {
       normalizedName: "receipts",
       displayName: "Receipts",
       newCumulativeCount: 11,
-      applied: true
+      applied: true,
+      newlyVotedMessageIds: messages.map((m) => m.id)
     });
   });
 
@@ -497,7 +719,8 @@ describe("runWorkScan", () => {
               payload: { headers: [{ name: "From", value: "person@example.com" }] }
             }
           })
-        }
+        },
+        threads: { get: async () => ({ data: { messages: [] } }) }
       }
     } as unknown as GmailClient;
 
@@ -548,7 +771,8 @@ describe("runWorkScan", () => {
               }
             };
           }
-        }
+        },
+        threads: { get: async () => ({ data: { messages: [] } }) }
       }
     } as unknown as GmailClient;
 
@@ -566,6 +790,164 @@ describe("runWorkScan", () => {
     expect(usedIncrementalSync).toBe(true);
     expect(newHistoryMarker).toBe("200");
     expect(summary.inboxCountBefore).toBe(42);
+  });
+
+  it("unions a locally supplied cached backlog with Gmail history changes and excludes cached rows deleted in that history", async () => {
+    const cachedUnassessed: FakeMessage = {
+      id: "cached-unassessed",
+      threadId: "t-cached-unassessed",
+      labelIds: ["INBOX"],
+      headers: [{ name: "From", value: "cached@example.com" }],
+      internalDate: "6000"
+    };
+    const changedMessage: FakeMessage = {
+      id: "changed-1",
+      threadId: "t-changed-1",
+      labelIds: ["INBOX"],
+      headers: [{ name: "From", value: "changed@example.com" }],
+      internalDate: "5000"
+    };
+    const client = fakeClient([cachedUnassessed, changedMessage]);
+    (client.users.history as unknown as { list: () => Promise<unknown> }).list = async () => ({
+      data: {
+        history: [
+          { id: "150", labelsAdded: [{ message: { id: changedMessage.id, threadId: changedMessage.threadId } }] },
+          { id: "151", messagesDeleted: [{ message: { id: "cached-deleted", threadId: "t-cached-deleted" } }] }
+        ],
+        historyId: "200"
+      }
+    });
+
+    const messagesApi = client.users.messages as unknown as {
+      list: () => Promise<unknown>;
+      get: (params: { id: string }) => Promise<unknown>;
+    };
+    messagesApi.list = async () => {
+      throw new Error("incremental backlog processing must not list the whole mailbox");
+    };
+    const originalGet = messagesApi.get;
+    const fetchedIds: string[] = [];
+    messagesApi.get = async (params) => {
+      fetchedIds.push(params.id);
+      return originalGet(params);
+    };
+
+    const classifiedIds: string[] = [];
+    const classifier: Classifier = {
+      async assess(message): Promise<AssessmentResult> {
+        classifiedIds.push(message.gmailMessageId);
+        return { ok: false, unavailable: { reason: "not_configured", detail: null } };
+      }
+    };
+
+    const { outcomes } = await runWorkScan(
+      baseDeps({
+        gmailClient: client,
+        classifier,
+        historyMarker: "100",
+        cachedBacklogStubs: [
+          { id: cachedUnassessed.id, threadId: cachedUnassessed.threadId },
+          { id: "cached-deleted", threadId: "t-cached-deleted" }
+        ]
+      })
+    );
+
+    expect(fetchedIds.sort()).toEqual([cachedUnassessed.id, changedMessage.id].sort());
+    expect(classifiedIds.sort()).toEqual([cachedUnassessed.id, changedMessage.id].sort());
+    expect(outcomes.map((outcome) => outcome.gmailMessageId).sort()).toEqual(
+      [cachedUnassessed.id, changedMessage.id].sort()
+    );
+    expect(outcomes.every((outcome) => outcome.decision.actions.some((action) => action.type === "archive"))).toBe(true);
+  });
+
+  it("fetches, classifies, and actions a cache-only unassessed message when Gmail history is empty", async () => {
+    const cachedUnassessed: FakeMessage = {
+      id: "cached-unassessed",
+      threadId: "t-cached-unassessed",
+      labelIds: ["INBOX"],
+      headers: [{ name: "From", value: "cached@example.com" }]
+    };
+    const client = fakeClient([cachedUnassessed]);
+    const messagesApi = client.users.messages as unknown as {
+      get: (params: { id: string }) => Promise<unknown>;
+    };
+    const originalGet = messagesApi.get;
+    let gmailMessageFetches = 0;
+    messagesApi.get = async (params) => {
+      gmailMessageFetches += 1;
+      return originalGet(params);
+    };
+    let classifierCalls = 0;
+    const classifier: Classifier = {
+      async assess(): Promise<AssessmentResult> {
+        classifierCalls += 1;
+        return { ok: false, unavailable: { reason: "not_configured", detail: null } };
+      }
+    };
+
+    const { outcomes, usedIncrementalSync } = await runWorkScan(
+      baseDeps({
+        gmailClient: client,
+        classifier,
+        historyMarker: "90",
+        cachedBacklogStubs: [{ id: cachedUnassessed.id, threadId: cachedUnassessed.threadId }]
+      })
+    );
+
+    expect(usedIncrementalSync).toBe(true);
+    expect(gmailMessageFetches).toBe(1);
+    expect(classifierCalls).toBe(1);
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.gmailMessageId).toBe(cachedUnassessed.id);
+    expect(outcomes[0]!.decision.actions).toContainEqual({ type: "archive", reasonCode: "read_non_trash" });
+  });
+
+  it("does not advance the history baseline past incremental work omitted by --limit", async () => {
+    const messages: FakeMessage[] = [
+      {
+        id: "m1",
+        threadId: "t1",
+        labelIds: ["INBOX", "UNREAD"],
+        headers: [{ name: "From", value: "one@example.com" }]
+      },
+      {
+        id: "m2",
+        threadId: "t2",
+        labelIds: ["INBOX", "UNREAD"],
+        headers: [{ name: "From", value: "two@example.com" }]
+      }
+    ];
+    const client = fakeClient(messages);
+    (client.users.history as unknown as { list: () => Promise<unknown> }).list = async () => ({
+      data: {
+        history: [
+          {
+            id: "150",
+            messagesAdded: messages.map((message) => ({
+              message: { id: message.id, threadId: message.threadId }
+            }))
+          }
+        ],
+        historyId: "200"
+      }
+    });
+
+    const result = await runWorkScan(
+      baseDeps({
+        gmailClient: client,
+        historyMarker: "100",
+        limit: 1,
+        classifier: {
+          async assess(): Promise<AssessmentResult> {
+            return { ok: false, unavailable: { reason: "not_configured", detail: null } };
+          }
+        }
+      })
+    );
+
+    expect(result.outcomes).toHaveLength(1);
+    expect(result.newHistoryMarker).toBeNull();
+    expect(result.scanNote).toContain("history baseline will be cleared");
   });
 
   it("excludes a changed message that is no longer in Inbox or Spam from an incremental scan", async () => {
@@ -594,7 +976,8 @@ describe("runWorkScan", () => {
               payload: { headers: [{ name: "From", value: "person@example.com" }] }
             }
           })
-        }
+        },
+        threads: { get: async () => ({ data: { messages: [] } }) }
       }
     } as unknown as GmailClient;
 
@@ -641,7 +1024,8 @@ describe("runWorkScan", () => {
         id: "m1",
         threadId: "t1",
         labelIds: ["INBOX", "UNREAD"], // unread — would not otherwise be archived
-        headers: [{ name: "From", value: "clinic@example.com" }]
+        headers: [{ name: "From", value: "clinic@example.com" }],
+        snippet: "Your appointment is confirmed for 2099-01-01 at 10:00 AM."
       }
     ]);
     const classifier = new FixedClassifier({
@@ -662,7 +1046,7 @@ describe("runWorkScan", () => {
           allDay: false,
           timeZone: "UTC",
           location: null,
-          sourceEvidence: null
+          sourceEvidence: "appointment is confirmed for 2099-01-01 at 10:00 AM"
         },
         category: null,
         classifierVersion: "test",

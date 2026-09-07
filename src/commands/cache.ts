@@ -99,25 +99,38 @@ export async function runCache(options: CacheOptions = {}): Promise<number> {
           userEmail: profile.emailAddress,
           threadHasUserSentMessage: false
         });
+        // A prior `gmail work` run may have already classified this exact
+        // message and cached its assessment (see core/orchestrator.ts's
+        // assessment-reuse cache). `gmail cache` never classifies anything
+        // itself, but blindly nulling those fields out here every time it
+        // re-runs would silently destroy that cache and force every
+        // message to be reclassified by AI again on the next `gmail work`
+        // run — preserve the existing assessment whenever the content
+        // hasn't actually changed; only a genuinely new/changed message
+        // gets a blank (correctly stale) assessment.
+        const existing = messagesRepo.get(account.accountHash, stub.id);
+        const preserveAssessment = existing !== null && existing.contentHash === normalized.contentHash;
         messagesRepo.upsert({
           accountHash: account.accountHash,
           gmailMessageId: stub.id,
           gmailThreadId: stub.threadId,
           contentHash: normalized.contentHash,
           labelSnapshot: labelIds,
-          classifierVersion: null,
-          promptVersion: null,
-          schemaVersion: null,
-          policyVersion: null,
-          assessmentKind: null,
-          assessmentConfidence: null,
-          importanceScore: null,
-          importanceConfidence: null,
-          reasonCodes: null,
-          processedAt: ctx.clock.nowIso(),
+          classifierVersion: preserveAssessment ? existing.classifierVersion : null,
+          promptVersion: preserveAssessment ? existing.promptVersion : null,
+          schemaVersion: preserveAssessment ? existing.schemaVersion : null,
+          policyVersion: preserveAssessment ? existing.policyVersion : null,
+          assessmentKind: preserveAssessment ? existing.assessmentKind : null,
+          assessmentConfidence: preserveAssessment ? existing.assessmentConfidence : null,
+          importanceScore: preserveAssessment ? existing.importanceScore : null,
+          importanceConfidence: preserveAssessment ? existing.importanceConfidence : null,
+          reasonCodes: preserveAssessment ? existing.reasonCodes : null,
+          processedAt: preserveAssessment ? existing.processedAt : ctx.clock.nowIso(),
           subject: normalized.subject || null,
           senderDisplay: normalized.from.displayName ?? normalized.from.address,
-          internalDate: normalized.internalDate
+          internalDate: normalized.internalDate,
+          category: preserveAssessment ? existing.category : null,
+          assessmentHadEvent: preserveAssessment ? existing.assessmentHadEvent : null
         });
         cached += 1;
       } catch {
@@ -134,12 +147,17 @@ export async function runCache(options: CacheOptions = {}): Promise<number> {
     // far better than the whole command crashing here and never recording
     // a marker at all, throwing away the entire point of paying for this
     // expensive full traversal in the first place.
-    const newHistoryMarker = await resolvePostScanHistoryMarker(gmailClient, profile.historyId);
-    new AccountsRepository(ctx.db).updateHistoryMarker(account.accountHash, newHistoryMarker, ctx.clock.nowIso());
+    const snapshotComplete = failed === 0 && !spamResult.truncated && !inboxResult.truncated;
+    if (snapshotComplete) {
+      const newHistoryMarker = await resolvePostScanHistoryMarker(gmailClient, profile.historyId);
+      new AccountsRepository(ctx.db).updateHistoryMarker(account.accountHash, newHistoryMarker, ctx.clock.nowIso());
+    }
 
     console.log(
       `Cached ${cached} message(s)${failed > 0 ? ` (${failed} failed and were skipped)` : ""}. ` +
-        "Future `gmail`/`gmail work` runs will scan incrementally from here instead of re-fetching everything."
+        (snapshotComplete
+          ? "Future `gmail`/`gmail work` runs will hydrate this cached backlog once, then scan incrementally from here."
+          : "The snapshot was incomplete, so its history baseline was not advanced; a later full run can safely recover the omitted messages.")
     );
     return failed > 0 ? EXIT_CODES.operationalFailure : EXIT_CODES.ok;
   } finally {

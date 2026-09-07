@@ -32,7 +32,16 @@ export interface CachedMessageRecord {
   senderDisplay: string | null;
   /** Gmail's internalDate (epoch millis, as a string) — used to sort gmail view's list most-recent-first. */
   internalDate: string | null;
+  /** The AI-proposed topical category (e.g. "Shopping"), or null — see migration 005. */
+  category: string | null;
+  /** Whether the original cached assessment contained an event candidate; the candidate itself is never persisted. */
+  assessmentHadEvent: boolean | null;
 }
+
+type CachedMessageUpsert = Omit<CachedMessageRecord, "assessmentHadEvent"> & {
+  /** Optional for compatibility with callers that do not yet produce this cache-safety metadata. */
+  assessmentHadEvent?: boolean | null;
+};
 
 interface MessageRow {
   account_hash: string;
@@ -53,6 +62,8 @@ interface MessageRow {
   subject: string | null;
   sender_display: string | null;
   internal_date: string | null;
+  category: string | null;
+  assessment_had_event: number | null;
 }
 
 function fromRow(row: MessageRow): CachedMessageRecord {
@@ -74,7 +85,9 @@ function fromRow(row: MessageRow): CachedMessageRecord {
     processedAt: row.processed_at,
     subject: row.subject,
     senderDisplay: row.sender_display,
-    internalDate: row.internal_date
+    internalDate: row.internal_date,
+    category: row.category,
+    assessmentHadEvent: row.assessment_had_event === null ? null : row.assessment_had_event === 1
   };
 }
 
@@ -110,11 +123,20 @@ export class MessagesRepository {
     return this.db.prepare("DELETE FROM messages WHERE account_hash = ?").run(accountHash).changes;
   }
 
-  upsert(record: CachedMessageRecord): void {
+  /** Removes cache projections Gmail has proven deleted or outside the Inbox/Spam working set. */
+  delete(accountHash: string, gmailMessageId: string): boolean {
+    return (
+      this.db
+        .prepare("DELETE FROM messages WHERE account_hash = ? AND gmail_message_id = ?")
+        .run(accountHash, gmailMessageId).changes > 0
+    );
+  }
+
+  upsert(record: CachedMessageUpsert): void {
     this.db
       .prepare(
-        `INSERT INTO messages (account_hash, gmail_message_id, gmail_thread_id, content_hash, label_snapshot, classifier_version, prompt_version, schema_version, policy_version, assessment_kind, assessment_confidence, importance_score, importance_confidence, reason_codes, processed_at, subject, sender_display, internal_date)
-         VALUES (@accountHash, @gmailMessageId, @gmailThreadId, @contentHash, @labelSnapshot, @classifierVersion, @promptVersion, @schemaVersion, @policyVersion, @assessmentKind, @assessmentConfidence, @importanceScore, @importanceConfidence, @reasonCodes, @processedAt, @subject, @senderDisplay, @internalDate)
+        `INSERT INTO messages (account_hash, gmail_message_id, gmail_thread_id, content_hash, label_snapshot, classifier_version, prompt_version, schema_version, policy_version, assessment_kind, assessment_confidence, importance_score, importance_confidence, reason_codes, processed_at, subject, sender_display, internal_date, category, assessment_had_event)
+         VALUES (@accountHash, @gmailMessageId, @gmailThreadId, @contentHash, @labelSnapshot, @classifierVersion, @promptVersion, @schemaVersion, @policyVersion, @assessmentKind, @assessmentConfidence, @importanceScore, @importanceConfidence, @reasonCodes, @processedAt, @subject, @senderDisplay, @internalDate, @category, @assessmentHadEvent)
          ON CONFLICT(account_hash, gmail_message_id) DO UPDATE SET
            gmail_thread_id = excluded.gmail_thread_id,
            content_hash = excluded.content_hash,
@@ -131,7 +153,9 @@ export class MessagesRepository {
            processed_at = excluded.processed_at,
            subject = excluded.subject,
            sender_display = excluded.sender_display,
-           internal_date = excluded.internal_date`
+           internal_date = excluded.internal_date,
+           category = excluded.category,
+           assessment_had_event = excluded.assessment_had_event`
       )
       .run({
         accountHash: record.accountHash,
@@ -151,7 +175,12 @@ export class MessagesRepository {
         processedAt: record.processedAt,
         subject: record.subject,
         senderDisplay: record.senderDisplay,
-        internalDate: record.internalDate
+        internalDate: record.internalDate,
+        category: record.category,
+        assessmentHadEvent:
+          record.assessmentHadEvent === null || record.assessmentHadEvent === undefined
+            ? null
+            : Number(record.assessmentHadEvent)
       });
   }
 }

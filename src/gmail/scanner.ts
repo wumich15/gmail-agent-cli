@@ -1,7 +1,12 @@
 import type { gmail_v1 } from "googleapis";
 import type { GmailClient } from "./client.js";
 import { headerMapFromList } from "./normalize.js";
+import { GMAIL_LABELS } from "./labels.js";
 import { apiErrorStatus, withGoogleApiRetry } from "../core/api-retry.js";
+
+const GMAIL_READ_TIMEOUT_MS = 20_000;
+const GMAIL_READ_RETRY_OPTIONS = { maxAttempts: 3, baseDelayMs: 750, maxDelayMs: 10_000 } as const;
+const GMAIL_READ_REQUEST_OPTIONS = { timeout: GMAIL_READ_TIMEOUT_MS } as const;
 
 export const REQUIRED_METADATA_HEADERS = [
   "From",
@@ -25,7 +30,10 @@ export interface MailboxProfile {
 }
 
 export async function fetchProfile(client: GmailClient): Promise<MailboxProfile> {
-  const { data } = await withGoogleApiRetry(() => client.users.getProfile({ userId: "me" }));
+  const { data } = await withGoogleApiRetry(
+    () => client.users.getProfile({ userId: "me" }, GMAIL_READ_REQUEST_OPTIONS),
+    GMAIL_READ_RETRY_OPTIONS
+  );
   if (!data.emailAddress || !data.historyId) {
     throw new Error("Gmail profile response is missing emailAddress or historyId.");
   }
@@ -70,15 +78,20 @@ export async function listAllMessageIds(
   let estimatedTotal: number | null = null;
 
   do {
-    const { data } = await withGoogleApiRetry(() =>
-      client.users.messages.list({
-        userId: "me",
-        ...(params.labelIds !== undefined ? { labelIds: params.labelIds } : {}),
-        ...(params.q !== undefined ? { q: params.q } : {}),
-        includeSpamTrash: params.includeSpamTrash,
-        maxResults: 500,
-        ...(pageToken !== undefined ? { pageToken } : {})
-      })
+    const { data } = await withGoogleApiRetry(
+      () =>
+        client.users.messages.list(
+          {
+            userId: "me",
+            ...(params.labelIds !== undefined ? { labelIds: params.labelIds } : {}),
+            ...(params.q !== undefined ? { q: params.q } : {}),
+            includeSpamTrash: params.includeSpamTrash,
+            maxResults: 500,
+            ...(pageToken !== undefined ? { pageToken } : {})
+          },
+          GMAIL_READ_REQUEST_OPTIONS
+        ),
+      GMAIL_READ_RETRY_OPTIONS
     );
     if (estimatedTotal === null && typeof data.resultSizeEstimate === "number") {
       estimatedTotal = data.resultSizeEstimate;
@@ -104,13 +117,18 @@ export async function fetchMessageMetadata(
   client: GmailClient,
   messageId: string
 ): Promise<gmail_v1.Schema$Message> {
-  const { data } = await withGoogleApiRetry(() =>
-    client.users.messages.get({
-      userId: "me",
-      id: messageId,
-      format: "metadata",
-      metadataHeaders: [...REQUIRED_METADATA_HEADERS]
-    })
+  const { data } = await withGoogleApiRetry(
+    () =>
+      client.users.messages.get(
+        {
+          userId: "me",
+          id: messageId,
+          format: "metadata",
+          metadataHeaders: [...REQUIRED_METADATA_HEADERS]
+        },
+        GMAIL_READ_REQUEST_OPTIONS
+      ),
+    GMAIL_READ_RETRY_OPTIONS
   );
   return data;
 }
@@ -121,7 +139,10 @@ export async function fetchMessageMetadata(
  * incremental scan means we never list the whole Inbox.
  */
 export async function fetchInboxMessageCount(client: GmailClient): Promise<number> {
-  const { data } = await withGoogleApiRetry(() => client.users.labels.get({ userId: "me", id: "INBOX" }));
+  const { data } = await withGoogleApiRetry(
+    () => client.users.labels.get({ userId: "me", id: "INBOX" }, GMAIL_READ_REQUEST_OPTIONS),
+    GMAIL_READ_RETRY_OPTIONS
+  );
   return data.messagesTotal ?? 0;
 }
 
@@ -129,18 +150,43 @@ export async function fetchMessageFull(
   client: GmailClient,
   messageId: string
 ): Promise<gmail_v1.Schema$Message> {
-  const { data } = await withGoogleApiRetry(() =>
-    client.users.messages.get({
-      userId: "me",
-      id: messageId,
-      format: "full"
-    })
+  const { data } = await withGoogleApiRetry(
+    () =>
+      client.users.messages.get(
+        {
+          userId: "me",
+          id: messageId,
+          format: "full"
+        },
+        GMAIL_READ_REQUEST_OPTIONS
+      ),
+    GMAIL_READ_RETRY_OPTIONS
   );
   return data;
 }
 
 export function headersFromMessage(message: gmail_v1.Schema$Message) {
   return headerMapFromList(message.payload?.headers ?? undefined);
+}
+
+/**
+ * True if any message in the thread carries Gmail's own SENT label — the
+ * "thread contains a message sent by the user" protection signal CLAUDE.md
+ * requires. Uses `format=minimal` (labelIds only, no headers/body) since
+ * that's all this needs; Gmail's per-call quota cost is fixed regardless of
+ * format, so this is one extra 5-unit call per message, same as a metadata
+ * fetch would have cost.
+ */
+export async function fetchThreadHasUserSentMessage(client: GmailClient, threadId: string): Promise<boolean> {
+  const { data } = await withGoogleApiRetry(
+    () =>
+      client.users.threads.get(
+        { userId: "me", id: threadId, format: "minimal" },
+        GMAIL_READ_REQUEST_OPTIONS
+      ),
+    GMAIL_READ_RETRY_OPTIONS
+  );
+  return (data.messages ?? []).some((m) => (m.labelIds ?? []).includes(GMAIL_LABELS.sent));
 }
 
 /**
@@ -188,13 +234,18 @@ export async function listHistorySince(
 
   try {
     do {
-      const { data } = await withGoogleApiRetry(() =>
-        client.users.history.list({
-          userId: "me",
-          startHistoryId,
-          ...(pageToken !== undefined ? { pageToken } : {}),
-          historyTypes: ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"]
-        })
+      const { data } = await withGoogleApiRetry(
+        () =>
+          client.users.history.list(
+            {
+              userId: "me",
+              startHistoryId,
+              ...(pageToken !== undefined ? { pageToken } : {}),
+              historyTypes: ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"]
+            },
+            GMAIL_READ_REQUEST_OPTIONS
+          ),
+        GMAIL_READ_RETRY_OPTIONS
       );
 
       for (const entry of data.history ?? []) {

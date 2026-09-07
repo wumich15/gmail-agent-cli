@@ -139,13 +139,16 @@ describe("openDatabase", () => {
       processedAt: "now",
       subject: "Hello",
       senderDisplay: "alice@example.com",
-      internalDate: "1000"
+      internalDate: "1000",
+      category: null,
+      assessmentHadEvent: true
     });
     const found = repo.get("abc", "m1");
     expect(found?.contentHash).toBe("hash-1");
     expect(found?.labelSnapshot).toEqual(["INBOX", "UNREAD"]);
     expect(found?.subject).toBe("Hello");
     expect(found?.senderDisplay).toBe("alice@example.com");
+    expect(found?.assessmentHadEvent).toBe(true);
     expect(repo.countForAccount("abc")).toBe(1);
     db.close();
   });
@@ -179,7 +182,8 @@ describe("openDatabase", () => {
       reasonCodes: null,
       subject: "Hi",
       senderDisplay: "a@example.com",
-      internalDate: "1000"
+      internalDate: "1000",
+      category: null
     };
     repo.upsert({ ...base, contentHash: "hash-1", processedAt: "t0" });
     repo.upsert({ ...base, contentHash: "hash-2", processedAt: "t1" });
@@ -216,7 +220,8 @@ describe("openDatabase", () => {
       importanceConfidence: null,
       reasonCodes: null,
       processedAt: "now",
-      senderDisplay: "a@example.com"
+      senderDisplay: "a@example.com",
+      category: null
     };
     repo.upsert({ ...base, gmailMessageId: "old", subject: "Old", internalDate: "1000" });
     repo.upsert({ ...base, gmailMessageId: "new", subject: "New", internalDate: "9000" });
@@ -267,6 +272,48 @@ describe("openDatabase", () => {
     db.close();
   });
 
+  it("records and lists voted message IDs, deduplicated by (account, category)", () => {
+    const db = openDatabase(freshDbPath());
+    new AccountsRepository(db).upsert({
+      accountHash: "abc",
+      emailDisplay: null,
+      timezone: "UTC",
+      historyMarker: null,
+      setupComplete: true,
+      automationEnabled: false,
+      createdAt: "now",
+      updatedAt: "now"
+    });
+    const repo = new LabelCandidatesRepository(db);
+    repo.recordVotes("abc", "shopping", ["m1", "m2"]);
+    // Recording the same message ID again (a later run reconciling the
+    // same message) must not create a duplicate row or otherwise error.
+    repo.recordVotes("abc", "shopping", ["m2", "m3"]);
+    const voted = repo.listVotedMessageIdsForAccount("abc");
+    expect(voted.get("shopping")).toEqual(new Set(["m1", "m2", "m3"]));
+    db.close();
+  });
+
+  it("clear() also removes that category's voted-message-ID rows", () => {
+    const db = openDatabase(freshDbPath());
+    new AccountsRepository(db).upsert({
+      accountHash: "abc",
+      emailDisplay: null,
+      timezone: "UTC",
+      historyMarker: null,
+      setupComplete: true,
+      automationEnabled: false,
+      createdAt: "now",
+      updatedAt: "now"
+    });
+    const repo = new LabelCandidatesRepository(db);
+    repo.upsert({ accountHash: "abc", normalizedName: "shopping", displayName: "Shopping", pendingCount: 10, updatedAt: "now" });
+    repo.recordVotes("abc", "shopping", ["m1"]);
+    repo.clear("abc", "shopping");
+    expect(repo.listVotedMessageIdsForAccount("abc").get("shopping")).toBeUndefined();
+    db.close();
+  });
+
   it("gmail uncache: clears every cached message record and label candidate for an account, and resets the history marker", () => {
     const db = openDatabase(freshDbPath());
     const accountsRepo = new AccountsRepository(db);
@@ -299,10 +346,12 @@ describe("openDatabase", () => {
       processedAt: "now",
       subject: "Hi",
       senderDisplay: "a@example.com",
-      internalDate: "1000"
+      internalDate: "1000",
+      category: null
     });
     const candidatesRepo = new LabelCandidatesRepository(db);
     candidatesRepo.upsert({ accountHash: "abc", normalizedName: "shopping", displayName: "Shopping", pendingCount: 3, updatedAt: "now" });
+    candidatesRepo.recordVotes("abc", "shopping", ["m1"]);
 
     expect(messagesRepo.clearForAccount("abc")).toBe(1);
     expect(candidatesRepo.clearForAccount("abc")).toBe(1);
@@ -310,6 +359,7 @@ describe("openDatabase", () => {
 
     expect(messagesRepo.countForAccount("abc")).toBe(0);
     expect(candidatesRepo.listForAccount("abc")).toEqual([]);
+    expect(candidatesRepo.listVotedMessageIdsForAccount("abc").size).toBe(0);
     expect(accountsRepo.get("abc")?.historyMarker).toBeNull();
     db.close();
   });

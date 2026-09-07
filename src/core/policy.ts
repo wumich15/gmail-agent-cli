@@ -4,6 +4,16 @@ export const POLICY_VERSION = "policy-v4";
 
 export interface PolicyThresholds {
   autoTrashPromotionConfidence: number;
+  /**
+   * Currently only reachable via `RandomClassifier` (ai/random-classifier.ts):
+   * the real `OpenAiClassifier`'s compressed `tag` schema (ai/schema.ts)
+   * only ever emits `spam` -> `kind: "promotion"`, never `automated_low_value`
+   * directly, so this threshold has no live effect on a real run today.
+   * Kept distinct (not just an alias of autoTrashPromotionConfidence)
+   * because `EmailAssessmentKind` still models `automated_low_value` as its
+   * own kind for any future classifier that distinguishes it — tune this
+   * independently only once something actually produces that kind again.
+   */
   autoTrashAutomatedLowValueConfidence: number;
   autoStarImportanceScore: number;
   autoStarImportanceConfidence: number;

@@ -22,7 +22,11 @@ export function bootstrap(): CliContext {
   cached ??= {
     db: openDatabase(databaseFilePath()),
     credentialStore: new OsCredentialStore(),
-    logger: createLogger(),
+    // Structured diagnostics go to a dedicated log file (see logDir()),
+    // not stderr — stderr is reserved for the CLI's own human-readable
+    // progress lines (CLAUDE.md: "progress to stderr"), and interleaving
+    // raw JSON log lines with those would make both harder to read.
+    logger: createLogger({ toFile: true }),
     clock: new SystemClock(),
     config: loadConfig()
   };

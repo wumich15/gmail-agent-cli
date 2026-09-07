@@ -26,17 +26,52 @@ import {
 } from "../gmail/executor.js";
 import { getOrCreateLabelId, listUserLabels } from "../gmail/custom-labels.js";
 import { LabelCandidatesRepository } from "../state/repositories/label-candidates.js";
+import { MessagesRepository, type CachedMessageRecord } from "../state/repositories/messages.js";
 import { buildEventInsertPlan, insertIdempotentEvent } from "../calendar/idempotency.js";
 import { withGoogleApiRetry } from "../core/api-retry.js";
 import { contentHash } from "../core/ids.js";
+import type { CachedAssessmentSnapshot } from "../core/orchestrator.js";
 import type { PolicyActionIntent } from "../core/policy.js";
-import type { ActionType, PlannedAction } from "../core/models.js";
+import type { ActionType, PlannedAction, ReasonCode } from "../core/models.js";
 
 export interface WorkOptions {
   dryRun: boolean;
   json: boolean;
   /** Caps the Inbox and native-Spam scans to this many most-recent messages each, to bound Gmail API quota usage. */
   limit?: number;
+}
+
+export interface CurrentCacheVersions {
+  classifierVersion: string;
+  promptVersion: string;
+  schemaVersion: string;
+  policyVersion: string;
+}
+
+/**
+ * Selects the exact local Inbox/Spam backlog that needs a live hydration
+ * pass. A current, event-free assessment (or a completed rules-only/
+ * deterministic evaluation, represented by matching versions with a null
+ * assessmentKind) is already done and stays out of the queue.
+ */
+export function selectCachedBacklogStubs(
+  rows: readonly CachedMessageRecord[],
+  versions: CurrentCacheVersions
+): Array<{ id: string; threadId: string }> {
+  return rows
+    .filter((row) => row.labelSnapshot.includes("INBOX") || row.labelSnapshot.includes("SPAM"))
+    .filter(
+      (row) =>
+        row.classifierVersion !== versions.classifierVersion ||
+        row.promptVersion !== versions.promptVersion ||
+        row.schemaVersion !== versions.schemaVersion ||
+        row.policyVersion !== versions.policyVersion ||
+        // Calendar source evidence and payload are deliberately absent
+        // from SQLite, so such an assessment cannot safely be
+        // reconstructed from its compact projection.
+        (row.assessmentKind !== null && row.assessmentHadEvent !== false)
+    )
+    .map((row) => ({ id: row.gmailMessageId, threadId: row.gmailThreadId }));
 }
 
 /** `labelIdByName` must already hold an entry for every label action's name (lowercased) before this is called. */
@@ -63,7 +98,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
   const ctx = bootstrap();
   const { account, gmailClient, calendarClient } = await resolveAccountSigningInIfNeeded(ctx);
 
-  const { classifier, description } = await resolveClassifier({
+  const { classifier, description, classifierVersion, promptVersion, schemaVersion } = await resolveClassifier({
     accountHash: account.accountHash,
     credentialStore: ctx.credentialStore,
     config: ctx.config
@@ -76,6 +111,8 @@ export async function runWork(options: WorkOptions): Promise<number> {
   const lock = options.dryRun ? null : new ProcessLock(lockFilePath(account.accountHash));
   lock?.acquire();
 
+  ctx.logger.info({ accountHash: account.accountHash, dryRun: options.dryRun }, "work_run_start");
+
   try {
     const ruleGroups = new RuleGroupsRepository(ctx.db).listEnabled(account.accountHash);
 
@@ -85,6 +122,32 @@ export async function runWork(options: WorkOptions): Promise<number> {
     // below for any label actions that survive the run's threshold check.
     const existingLabels = await listUserLabels(gmailClient);
     const labelIdByName = new Map(existingLabels.map((l) => [l.name.trim().toLowerCase(), l.id]));
+    // The AI category prompt depends on the current custom-label set, and
+    // deterministic decisions depend on the current enabled rule set.
+    // Fold both into the cache-policy version so either local-context
+    // change queues only the cached Inbox/Spam rows for targeted
+    // re-evaluation instead of silently reusing a decision made under
+    // different inputs.
+    const cacheContextHash = contentHash(
+      JSON.stringify({
+        labels: existingLabels.map((label) => label.name.trim().toLowerCase()).sort(),
+        rules: ruleGroups
+          .map((rule) => ({
+            id: rule.id,
+            action: rule.action,
+            updatedAt: rule.updatedAt,
+            matchers: [...rule.matchers]
+              .map((matcher) => ({
+                kind: matcher.kind,
+                value: matcher.normalizedValue,
+                auth: matcher.authBinding
+              }))
+              .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
+          }))
+          .sort((a, b) => a.id.localeCompare(b.id))
+      })
+    );
+    const cachePolicyVersion = `${POLICY_VERSION}:${cacheContextHash.slice(0, 16)}`;
 
     const labelCandidatesRepo = new LabelCandidatesRepository(ctx.db);
     const priorLabelCandidateCounts = new Map(
@@ -92,6 +155,58 @@ export async function runWork(options: WorkOptions): Promise<number> {
         .listForAccount(account.accountHash)
         .map((c) => [c.normalizedName, { displayName: c.displayName, count: c.pendingCount }] as const)
     );
+    const priorLabelCandidateVotedMessageIds = labelCandidatesRepo.listVotedMessageIdsForAccount(account.accountHash);
+
+    // Reused, still-valid assessments from `gmail cache` and prior `gmail
+    // work` runs (the actual mechanism behind "use the cache instead of
+    // re-reading everything" — see OrchestratorDeps.cachedAssessments):
+    // only rows this same pipeline previously classified (assessmentKind
+    // non-null) are eligible, since a `gmail cache`-only placeholder row
+    // has no assessment to reuse.
+    const messagesRepo = new MessagesRepository(ctx.db);
+    const cachedRows = messagesRepo.listForAccount(account.accountHash);
+    const cachedAssessments = new Map<string, CachedAssessmentSnapshot>(
+      cachedRows
+        // Event evidence/payload is intentionally not persisted. Reusing
+        // such an incomplete row would silently turn a prior Calendar
+        // candidate into `event: none`, so only explicitly event-free
+        // assessments are safe cache hits.
+        .filter((r) => r.assessmentKind !== null && r.assessmentHadEvent === false)
+        .map(
+          (r) =>
+            [
+              r.gmailMessageId,
+              {
+                contentHash: r.contentHash,
+                classifierVersion: r.classifierVersion ?? "not-configured",
+                promptVersion: r.promptVersion ?? "not-configured",
+                schemaVersion: r.schemaVersion ?? "not-configured",
+                policyVersion: r.policyVersion ?? "not-configured",
+                kind: r.assessmentKind as CachedAssessmentSnapshot["kind"],
+                confidence: r.assessmentConfidence ?? 0,
+                importanceScore: r.importanceScore ?? 0,
+                importanceConfidence: r.importanceConfidence ?? 0,
+                reasonCodes: (r.reasonCodes ?? []) as readonly ReasonCode[],
+                category: r.category
+              } satisfies CachedAssessmentSnapshot
+            ] as const
+        )
+    );
+    // `gmail cache` advances the Gmail history fence after taking its full
+    // snapshot, so those pre-existing messages will not appear in a later
+    // history.list response unless they happen to change. Queue every
+    // actionable cache row that has never been evaluated (or was evaluated
+    // under an older model/prompt/schema/policy) for one targeted live pass.
+    // This is the missing read side that makes the stored rows useful: the
+    // cache supplies the exact backlog IDs, avoiding another full mailbox
+    // listing, and each successfully evaluated row drops out of this queue
+    // on subsequent runs.
+    const cachedBacklogStubs = selectCachedBacklogStubs(cachedRows, {
+      classifierVersion,
+      promptVersion,
+      schemaVersion,
+      policyVersion: cachePolicyVersion
+    });
 
     const {
       summary,
@@ -99,7 +214,10 @@ export async function runWork(options: WorkOptions): Promise<number> {
       scanNote,
       newHistoryMarker,
       usedIncrementalSync,
-      labelCandidateUpdates
+      labelCandidateUpdates,
+      messageCacheUpdates,
+      diagnostics,
+      cacheEvictionMessageIds
     } = await runWorkScan({
       gmailClient,
       classifier,
@@ -110,6 +228,13 @@ export async function runWork(options: WorkOptions): Promise<number> {
       concurrency: { gmailReads: 5, aiCalls: ctx.config?.concurrency.aiCalls ?? 5 },
       existingLabels: existingLabels.map((l) => l.name),
       priorLabelCandidateCounts,
+      priorLabelCandidateVotedMessageIds,
+      classifierVersion,
+      promptVersion,
+      schemaVersion,
+      cachePolicyVersion,
+      cachedAssessments,
+      cachedBacklogStubs,
       // Incremental sync against Gmail's history API is the main lever for
       // staying under Gmail's API quota on repeat runs — see
       // CLAUDE.md's "Incremental synchronization". Passing null/omitting
@@ -121,6 +246,24 @@ export async function runWork(options: WorkOptions): Promise<number> {
     // description above: informational, never part of a piped --json summary.
     console.error(
       pc.dim(usedIncrementalSync ? "Incremental scan (via Gmail history)." : "Full inbox/spam snapshot scan.")
+    );
+    const gmailScanMs =
+      diagnostics.profileMs +
+      diagnostics.historyMs +
+      diagnostics.listingMs +
+      diagnostics.messageFetchMs +
+      diagnostics.inboxCountMs;
+    console.error(
+      pc.dim(
+        `Scan timing: Gmail ${Math.round(gmailScanMs)}ms; AI ${Math.round(diagnostics.classificationMs)}ms ` +
+          `(${diagnostics.classifierCalls} call(s), ${diagnostics.assessmentCacheHits} cache hit(s)); ` +
+          `policy/safety ${Math.round(diagnostics.policyMs)}ms (${diagnostics.threadChecks} thread check(s)); ` +
+          `total ${Math.round(diagnostics.totalMs)}ms.`
+      )
+    );
+    ctx.logger.info(
+      { accountHash: account.accountHash, usedIncrementalSync, scannedCount: outcomes.length, scanNote, ...diagnostics },
+      "work_scan_complete"
     );
 
     let runId: string | undefined;
@@ -145,9 +288,9 @@ export async function runWork(options: WorkOptions): Promise<number> {
         accountHash: account.accountHash,
         mode: "work",
         policyVersion: POLICY_VERSION,
-        classifierVersion: null,
-        promptVersion: null,
-        schemaVersion: null,
+        classifierVersion,
+        promptVersion,
+        schemaVersion,
         startedAt: nowIso,
         finishedAt: null,
         status: "running",
@@ -232,12 +375,17 @@ export async function runWork(options: WorkOptions): Promise<number> {
       const survivingTrash: string[] = [];
       for (const messageId of trashTargets) {
         try {
-          const { data } = await withGoogleApiRetry(() =>
-            gmailClient.users.messages.get({
-              userId: "me",
-              id: messageId,
-              format: "minimal"
-            })
+          const { data } = await withGoogleApiRetry(
+            () =>
+              gmailClient.users.messages.get(
+                {
+                  userId: "me",
+                  id: messageId,
+                  format: "minimal"
+                },
+                { timeout: 20_000 }
+              ),
+            { maxAttempts: 3, baseDelayMs: 750, maxDelayMs: 10_000 }
           );
           const labels = data.labelIds ?? [];
           if (labels.includes("STARRED") || labels.includes("IMPORTANT")) {
@@ -251,11 +399,13 @@ export async function runWork(options: WorkOptions): Promise<number> {
         }
       }
 
+      const successfullyTrashed = new Set<string>();
       for (const messageId of survivingTrash) {
         markActions(messageId, ["trash"], "applying");
         try {
           await trashMessage(gmailClient, messageId);
           markActions(messageId, ["trash"], "applied");
+          successfullyTrashed.add(messageId);
         } catch {
           markActions(messageId, ["trash"], "failed_retryable", "gmail_api_error");
           failureCount += 1;
@@ -273,6 +423,12 @@ export async function runWork(options: WorkOptions): Promise<number> {
         markActions(messageId, ["star", "mark_important", "archive", "label"], "failed_retryable", "gmail_api_error");
         failureCount += 1;
       }
+      const outcomeByMessageId = new Map(outcomes.map((outcome) => [outcome.gmailMessageId, outcome] as const));
+      const successfullyArchived = new Set(
+        labelResult.succeededMessageIds.filter((messageId) =>
+          outcomeByMessageId.get(messageId)?.decision.actions.some((action) => action.type === "archive")
+        )
+      );
 
       // Calendar creation: only for outcomes whose event candidate already
       // passed real-code date/shape validation (see orchestrator.ts). The
@@ -336,36 +492,44 @@ export async function runWork(options: WorkOptions): Promise<number> {
       }
 
       const finishedAt = ctx.clock.nowIso();
-      runsRepo.finish(
-        runId,
-        failureCount > 0 ? "partial_failure" : "completed",
-        finishedAt,
-        {
-          trashed: survivingTrash.length,
-          labelMutations: labelResult.succeededMessageIds.length,
-          calendarCreated,
-          failures: failureCount
-        },
-        failureCount > 0 ? `${failureCount} action(s) failed; see the actions table for run ${runId}` : null
-      );
+      const runCounters = {
+        trashed: survivingTrash.length,
+        labelMutations: labelResult.succeededMessageIds.length,
+        calendarCreated,
+        failures: failureCount
+      };
+      const finalRunStatus = failureCount > 0 ? "partial_failure" : "completed";
+      const completedRunId = runId;
+      if (!completedRunId) {
+        throw new Error("Work run ID was not initialized before checkpoint persistence.");
+      }
 
-      // Only advance the marker now that the run's plan/ledger is durable
-      // (CLAUDE.md: "Advance Gmail history only after the ingestion/plan
-      // checkpoint is durable"). A failed individual action still stays in
-      // the ledger for later reconciliation regardless of this — advancing
-      // history only changes which messages a *future* scan looks at.
-      new AccountsRepository(ctx.db).updateHistoryMarker(account.accountHash, newHistoryMarker, finishedAt);
+      // The history fence, message assessments, label-vote state, and run
+      // completion are one local ingestion checkpoint. If the process
+      // dies anywhere in this block SQLite rolls it all back, leaving the
+      // old history marker in place so the next invocation safely
+      // reconciles these messages again instead of skipping cache rows it
+      // never durably wrote.
+      const persistCheckpoint = ctx.db.transaction(() => {
+        runsRepo.finish(
+          completedRunId,
+          finalRunStatus,
+          finishedAt,
+          runCounters,
+          failureCount > 0
+            ? `${failureCount} action(s) failed; see the actions table for run ${completedRunId}`
+            : null
+        );
 
-      // Persist each category's updated cumulative count: cleared once it
-      // actually crossed the threshold and got applied this run (from then
-      // on the label exists, so `existingLabels` alone keeps applying it —
-      // see applyLabelBatchThreshold), otherwise the new running total so
-      // occurrences keep accumulating across incremental-sync runs instead
-      // of resetting every time.
-      for (const update of labelCandidateUpdates) {
-        if (update.applied) {
-          labelCandidatesRepo.clear(account.accountHash, update.normalizedName);
-        } else {
+        // Persist each category's updated cumulative count: cleared once
+        // it crossed the threshold AND its Gmail label was actually
+        // resolved; otherwise retain both the count and distinct votes.
+        for (const update of labelCandidateUpdates) {
+          const labelActuallyResolved = update.applied && labelIdByName.has(update.normalizedName);
+          if (labelActuallyResolved) {
+            labelCandidatesRepo.clear(account.accountHash, update.normalizedName);
+            continue;
+          }
           labelCandidatesRepo.upsert({
             accountHash: account.accountHash,
             normalizedName: update.normalizedName,
@@ -373,8 +537,61 @@ export async function runWork(options: WorkOptions): Promise<number> {
             pendingCount: update.newCumulativeCount,
             updatedAt: finishedAt
           });
+          if (update.newlyVotedMessageIds.length > 0) {
+            labelCandidatesRepo.recordVotes(account.accountHash, update.normalizedName, update.newlyVotedMessageIds);
+          }
         }
-      }
+
+        // Persist every scanned message's up-to-date cache row so a later
+        // run can reuse the assessment or know the deterministic/rules-only
+        // evaluation already completed under these exact versions.
+        for (const update of messageCacheUpdates) {
+          messagesRepo.upsert({
+            accountHash: account.accountHash,
+            gmailMessageId: update.gmailMessageId,
+            gmailThreadId: update.gmailThreadId,
+            contentHash: update.contentHash,
+            labelSnapshot: update.labelSnapshot,
+            classifierVersion: update.evaluatedVersions?.classifierVersion ?? null,
+            promptVersion: update.evaluatedVersions?.promptVersion ?? null,
+            schemaVersion: update.evaluatedVersions?.schemaVersion ?? null,
+            policyVersion: update.evaluatedVersions?.policyVersion ?? null,
+            assessmentKind: update.assessment?.kind ?? null,
+            assessmentConfidence: update.assessment?.confidence ?? null,
+            importanceScore: update.assessment?.importanceScore ?? null,
+            importanceConfidence: update.assessment?.importanceConfidence ?? null,
+            reasonCodes: update.assessment?.reasonCodes ?? null,
+            processedAt: finishedAt,
+            subject: update.subject,
+            senderDisplay: update.senderDisplay,
+            internalDate: update.internalDate,
+            category: update.assessment?.category ?? null,
+            assessmentHadEvent: update.assessmentHadEvent
+          });
+        }
+
+        // Keep the cache's working set aligned with its Inbox+Spam scope.
+        // This also prevents a cache-only backlog row that was archived,
+        // trashed, or deleted from being hydrated again forever merely
+        // because its old local label snapshot still said INBOX/SPAM.
+        for (const messageId of new Set([
+          ...cacheEvictionMessageIds,
+          ...successfullyTrashed,
+          ...successfullyArchived
+        ])) {
+          messagesRepo.delete(account.accountHash, messageId);
+        }
+
+        // Advance only after every other part of the checkpoint above is
+        // ready to commit atomically.
+        new AccountsRepository(ctx.db).updateHistoryMarker(account.accountHash, newHistoryMarker, finishedAt);
+      });
+      persistCheckpoint();
+
+      ctx.logger.info(
+        { runId: completedRunId, accountHash: account.accountHash, status: finalRunStatus, ...runCounters },
+        "work_run_finished"
+      );
     }
 
     const finalSummary = { ...summary, failureCount, scanNote };

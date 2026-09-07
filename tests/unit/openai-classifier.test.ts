@@ -34,6 +34,7 @@ function flags(overrides: Partial<EmailFlags> = {}): EmailFlags {
     eventStart: null,
     eventEnd: null,
     eventAllDay: false,
+    eventSourceEvidence: null,
     category: null,
     ...overrides
   };

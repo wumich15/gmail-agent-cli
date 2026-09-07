@@ -81,6 +81,35 @@ describe("buildReplyTarget", () => {
     );
     expect(target).toBeNull();
   });
+
+  it("refuses to build a target when the parsed address carries an embedded CR/LF (header injection attempt)", () => {
+    // Regression: a From/Reply-To like "Attacker <evil@x.com\r\nBcc: victim@evil.com>"
+    // must never reach sendReply's raw MIME headers unsanitized.
+    const target = buildReplyTarget(
+      message({
+        headers: headerMapFromList([
+          { name: "From", value: "Attacker <evil@x.com\r\nBcc: victim@evil.com>" },
+          { name: "Subject", value: "Hello" }
+        ])
+      })
+    );
+    expect(target).toBeNull();
+  });
+
+  it("strips an embedded CR/LF from the subject line rather than letting it break the header block", () => {
+    // The CRLF is neutralized (collapsed to a space) so "Bcc: ..." stays
+    // inert text within the Subject header's own value instead of starting
+    // a new header line — it never disappears, it just can't inject.
+    const target = buildReplyTarget(
+      message({
+        headers: headerMapFromList([
+          { name: "From", value: "alice@example.com" },
+          { name: "Subject", value: "Hello\r\nBcc: victim@evil.com" }
+        ])
+      })
+    );
+    expect(target?.subject).not.toMatch(/[\r\n]/);
+  });
 });
 
 describe("sendReply", () => {
@@ -106,5 +135,27 @@ describe("sendReply", () => {
     expect(raw).toContain("Subject: Re: Hello");
     expect(raw).toContain("In-Reply-To: <abc123@example.com>");
     expect(raw).toContain("Thanks, see you then.");
+  });
+
+  it("never lets an embedded CR/LF in the Message-ID header split into an extra header line", async () => {
+    let captured: { requestBody?: { raw?: string } } | undefined;
+    const client = {
+      users: { messages: { send: async (params: typeof captured) => ((captured = params), { data: {} }) } }
+    } as unknown as GmailClient;
+
+    const target = buildReplyTarget(
+      message({
+        headers: headerMapFromList([
+          { name: "From", value: "alice@example.com" },
+          { name: "Subject", value: "Hello" },
+          { name: "Message-ID", value: "<abc\r\nX-Injected: evil@example.com>" }
+        ])
+      })
+    )!;
+    await sendReply(client, target, "body");
+
+    const raw = Buffer.from(captured!.requestBody!.raw!, "base64url").toString("utf-8");
+    const headerBlock = raw.split("\r\n\r\n")[0]!;
+    expect(headerBlock).not.toMatch(/^X-Injected:/m);
   });
 });

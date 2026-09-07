@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { apiErrorStatus, GoogleApiRateLimiter, withApiRetry, withGoogleApiRetry } from "../../src/core/api-retry.js";
+import {
+  apiErrorStatus,
+  googleApiRateLimiter,
+  GoogleApiRateLimiter,
+  withApiRetry,
+  withGoogleApiRetry
+} from "../../src/core/api-retry.js";
 
 function gaxiosLikeError(status: number, retryAfterSeconds?: number): unknown {
   return {
@@ -103,6 +109,25 @@ describe("withApiRetry", () => {
     expect(result).toBe("ok");
   });
 
+  it("caps Retry-After at maxDelayMs so a provider cannot create an unbounded wait", async () => {
+    vi.useFakeTimers();
+    try {
+      const fn = vi.fn().mockRejectedValueOnce(gaxiosLikeError(429, 60)).mockResolvedValue("ok");
+      const promise = withApiRetry(fn, { maxAttempts: 2, baseDelayMs: 1, maxDelayMs: 1_000 });
+
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fn).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(fn).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+
+      await expect(promise).resolves.toBe("ok");
+      expect(fn).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("retries a bare network error (no HTTP status) like ECONNRESET", async () => {
     const networkError = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
     const fn = vi.fn().mockRejectedValueOnce(networkError).mockResolvedValue("ok");
@@ -162,6 +187,23 @@ describe("GoogleApiRateLimiter", () => {
     }
   });
 
+  it("reserves distinct globally-spaced slots for concurrent acquire() calls", async () => {
+    vi.useFakeTimers();
+    try {
+      const limiter = new GoogleApiRateLimiter(10); // 100ms between requests
+      const startedAt = Date.now();
+      const requests = Array.from({ length: 3 }, async () => {
+        await limiter.acquire();
+        return Date.now() - startedAt;
+      });
+
+      await vi.advanceTimersByTimeAsync(200);
+      await expect(Promise.all(requests)).resolves.toEqual([0, 100, 200]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("halves its rate (doubles the interval) on reportQuotaPressure, up to the ceiling", () => {
     const limiter = new GoogleApiRateLimiter(10, 8_000); // starts at 100ms interval
     expect(limiter.currentRequestsPerSecond).toBeCloseTo(10);
@@ -190,6 +232,20 @@ describe("GoogleApiRateLimiter", () => {
     for (let i = 0; i < 1000; i++) limiter.reportSuccess();
     expect(limiter.currentRequestsPerSecond).toBeCloseTo(10);
   });
+
+  it("with an explicit fastest rate, recovers above its cautious start rate after sustained success", () => {
+    const limiter = new GoogleApiRateLimiter(4, 8_000, 12);
+    expect(limiter.currentRequestsPerSecond).toBeCloseTo(4);
+    for (let i = 0; i < 1000; i++) limiter.reportSuccess();
+    expect(limiter.currentRequestsPerSecond).toBeCloseTo(12);
+  });
+
+  it("a quota-pressure backoff still recovers only up to the fastest rate, never beyond it", () => {
+    const limiter = new GoogleApiRateLimiter(4, 8_000, 12);
+    limiter.reportQuotaPressure();
+    for (let i = 0; i < 1000; i++) limiter.reportSuccess();
+    expect(limiter.currentRequestsPerSecond).toBeCloseTo(12);
+  });
 });
 
 describe("withGoogleApiRetry", () => {
@@ -204,5 +260,17 @@ describe("withGoogleApiRetry", () => {
     const fn = vi.fn().mockRejectedValue(gaxiosLikeError(404));
     await expect(withGoogleApiRetry(fn, { baseDelayMs: 1, maxDelayMs: 2 })).rejects.toBeDefined();
     expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries a 5xx without treating the provider outage as quota pressure", async () => {
+    const quotaPressure = vi.spyOn(googleApiRateLimiter, "reportQuotaPressure");
+    try {
+      const fn = vi.fn().mockRejectedValueOnce(gaxiosLikeError(503)).mockResolvedValue("ok");
+      await expect(withGoogleApiRetry(fn, { baseDelayMs: 1, maxDelayMs: 2 })).resolves.toBe("ok");
+      expect(fn).toHaveBeenCalledTimes(2);
+      expect(quotaPressure).not.toHaveBeenCalled();
+    } finally {
+      quotaPressure.mockRestore();
+    }
   });
 });

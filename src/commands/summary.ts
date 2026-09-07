@@ -3,6 +3,12 @@ import { bootstrap } from "../core/bootstrap.js";
 import { resolveAccount } from "./shared.js";
 import { RunsRepository, ActionsRepository } from "../state/repositories/runs.js";
 import { EXIT_CODES } from "../core/errors.js";
+import {
+  apiErrorStatus,
+  isRetryableGoogleQuotaMessage,
+  isRetryableStatus,
+  withGoogleApiRetry
+} from "../core/api-retry.js";
 
 export async function runSummary(runId: string | undefined, options: { json: boolean }): Promise<number> {
   const ctx = bootstrap();
@@ -45,18 +51,27 @@ export async function runSummary(runId: string | undefined, options: { json: boo
   for (const action of actions) {
     if (!action.targetGmailMessageId) continue;
     try {
-      const { data } = await gmailClient.users.messages.get({
-        userId: "me",
-        id: action.targetGmailMessageId,
-        format: "metadata",
-        metadataHeaders: ["From", "Subject"]
-      });
+      const { data } = await withGoogleApiRetry(() =>
+        gmailClient.users.messages.get({
+          userId: "me",
+          id: action.targetGmailMessageId!,
+          format: "metadata",
+          metadataHeaders: ["From", "Subject"]
+        })
+      );
       const headers = data.payload?.headers ?? [];
       const subject = headers.find((h) => h.name === "Subject")?.value ?? "(no subject)";
       const from = headers.find((h) => h.name === "From")?.value ?? "unknown";
       console.log(`  · [${action.type}/${action.status}] ${subject} — ${from}`);
-    } catch {
-      console.log(`  · [${action.type}/${action.status}] message ${action.targetGmailMessageId} (no longer accessible)`);
+    } catch (error) {
+      // A quota/rate-limit failure surviving the retry budget is not the
+      // same as the message being gone — conflating them here would mask a
+      // real Gmail API problem as ordinary data loss.
+      if (isRetryableStatus(apiErrorStatus(error)) || isRetryableGoogleQuotaMessage(error)) {
+        console.log(`  · [${action.type}/${action.status}] message ${action.targetGmailMessageId} (Gmail API rate-limited — try again later)`);
+      } else {
+        console.log(`  · [${action.type}/${action.status}] message ${action.targetGmailMessageId} (no longer accessible)`);
+      }
     }
   }
 

@@ -1,7 +1,8 @@
 import { CREDENTIAL_KEYS, type CredentialStore } from "../auth/credential-store.js";
 import { DEFAULT_MODEL, type Config } from "../config/schema.js";
 import { NotConfiguredClassifier } from "./not-configured-classifier.js";
-import { OpenAiClassifier } from "./openai-classifier.js";
+import { OpenAiClassifier, SCHEMA_VERSION } from "./openai-classifier.js";
+import { PROMPT_VERSION } from "./prompt.js";
 import type { Classifier } from "./classifier.js";
 
 export interface ResolveClassifierInput {
@@ -14,6 +15,19 @@ export interface ResolvedClassifier {
   classifier: Classifier;
   /** Human-readable, printed to the user so it's always clear which mode a run used. */
   description: string;
+  /**
+   * The exact classifier/prompt/schema version identifiers this resolved
+   * classifier would produce right now — passed straight through to
+   * `core/orchestrator.ts`'s `OrchestratorDeps` so it can both label fresh
+   * assessments correctly and recognize a still-valid cached one (see
+   * `OrchestratorDeps.cachedAssessments`). All three are the fixed
+   * `"not-configured"` placeholder for `NotConfiguredClassifier`, which
+   * guarantees a cached row (always carrying a real `"openai:..."` version)
+   * can never spuriously match it.
+   */
+  classifierVersion: string;
+  promptVersion: string;
+  schemaVersion: string;
 }
 
 export interface ResolvedOpenAiCredentials {
@@ -59,7 +73,10 @@ export async function resolveClassifier(input: ResolveClassifierInput): Promise<
   if (!credentials) {
     return {
       classifier: new NotConfiguredClassifier(),
-      description: "AI classification is not configured (no API key found) — using rules-only mode."
+      description: "AI classification is not configured (no API key found) — using rules-only mode.",
+      classifierVersion: "not-configured",
+      promptVersion: "not-configured",
+      schemaVersion: "not-configured"
     };
   }
 
@@ -69,6 +86,9 @@ export async function resolveClassifier(input: ResolveClassifierInput): Promise<
       model: credentials.model,
       ...(credentials.baseURL !== null ? { baseURL: credentials.baseURL } : {})
     }),
-    description: `Using AI classification via ${credentials.baseURL ?? "the OpenAI API"} (model: ${credentials.model}).`
+    description: `Using AI classification via ${credentials.baseURL ?? "the OpenAI API"} (model: ${credentials.model}).`,
+    classifierVersion: `openai:${credentials.model}`,
+    promptVersion: PROMPT_VERSION,
+    schemaVersion: SCHEMA_VERSION
   };
 }

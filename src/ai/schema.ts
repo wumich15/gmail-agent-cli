@@ -34,6 +34,16 @@ export const EmailFlagsSchema = z
     eventStart: z.string().max(40).nullable(),
     eventEnd: z.string().max(40).nullable(),
     eventAllDay: z.boolean(),
+    /**
+     * A short quote or close paraphrase of the exact text stating the
+     * event's date/time, required whenever eventTitle is non-null — real
+     * code (calendar/event-policy.ts's sourceEvidencePresent) verifies
+     * this string is actually present in the normalized message before
+     * any Calendar event is created, so a hallucinated or
+     * signature/footer-invented date can't produce a real event just
+     * because the model asserted one. Null whenever eventTitle is null.
+     */
+    eventSourceEvidence: z.string().max(200).nullable(),
     /** A short, memorable topical label name, or null if none fits. See prompt.ts. */
     category: z.string().max(30).nullable()
   })

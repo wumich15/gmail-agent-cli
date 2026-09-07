@@ -8,7 +8,7 @@ function pick<T>(items: readonly T[]): T {
   return items[Math.floor(Math.random() * items.length)]!;
 }
 
-function randomEventCandidate(intent: EventIntent) {
+function randomEventCandidate(intent: EventIntent, message: NormalizedMessage) {
   if (intent !== "create") {
     return {
       intent,
@@ -24,10 +24,16 @@ function randomEventCandidate(intent: EventIntent) {
   }
   // A plausible-shaped future event so the Calendar creation path can
   // actually be exercised end to end. Real validation still happens in
-  // calendar/event-policy.ts before anything is ever inserted.
+  // calendar/event-policy.ts before anything is ever inserted. sourceEvidence
+  // must be a substring actually present in the message (see
+  // calendar/event-policy.ts's sourceEvidencePresent), so it's taken from
+  // the real snippet/body rather than invented, or omitted (event
+  // discarded by that check) when there's no usable text to quote.
   const daysOut = 1 + Math.floor(Math.random() * 20);
   const start = new Date(Date.now() + daysOut * 24 * 60 * 60 * 1000);
   const allDay = Math.random() < 0.3;
+  const evidenceSource = (message.bodyText ?? message.snippet).trim();
+  const sourceEvidence = evidenceSource.length > 0 ? evidenceSource.slice(0, 40) : null;
   return {
     intent,
     confidence: Math.random(),
@@ -37,7 +43,7 @@ function randomEventCandidate(intent: EventIntent) {
     allDay,
     timeZone: allDay ? null : "UTC",
     location: null,
-    sourceEvidence: null
+    sourceEvidence
   };
 }
 
@@ -58,7 +64,7 @@ function randomEventCandidate(intent: EventIntent) {
  * the `new RandomClassifier()` construction in `commands/work.ts` for it.
  */
 export class RandomClassifier implements Classifier {
-  async assess(_message: NormalizedMessage, _context: ClassifyContext): Promise<AssessmentResult> {
+  async assess(message: NormalizedMessage, _context: ClassifyContext): Promise<AssessmentResult> {
     const kind = pick(EMAIL_ASSESSMENT_KINDS);
     const eventIntent = Math.random() < 0.15 ? "create" : pick(EVENT_INTENTS.filter((i) => i !== "create"));
 
@@ -71,7 +77,7 @@ export class RandomClassifier implements Classifier {
         importanceConfidence: Math.random(),
         summary: `Randomly classified as "${kind}" (placeholder classifier, not a real judgment).`,
         reasonCodes: [pick(REASON_CODES)],
-        event: randomEventCandidate(eventIntent),
+        event: randomEventCandidate(eventIntent, message),
         category: Math.random() < 0.3 ? pick(["Shopping", "Updates", "Receipts"]) : null,
         classifierVersion: CLASSIFIER_VERSION,
         promptVersion: "none",

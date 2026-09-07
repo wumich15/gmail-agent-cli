@@ -13,8 +13,15 @@ export interface KeyEvent {
  * without needing a full TUI framework.
  */
 export function waitForKeypress(): Promise<KeyEvent> {
-  return new Promise((resolve) => {
-    const wasRaw = process.stdin.isTTY ? process.stdin.isRaw : false;
+  return new Promise((resolve, reject) => {
+    if (!process.stdin.isTTY) {
+      // A non-raw, non-interactive stdin (piped input, no TTY at all)
+      // generally never emits a 'keypress' event, which would otherwise
+      // hang here forever with no diagnostic. Fail fast instead.
+      reject(new Error("gmail view's read view requires an interactive terminal (stdin is not a TTY)."));
+      return;
+    }
+    const wasRaw = process.stdin.isRaw;
     readline.emitKeypressEvents(process.stdin);
     if (process.stdin.isTTY) {
       process.stdin.setRawMode(true);

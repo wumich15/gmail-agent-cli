@@ -3,6 +3,7 @@ import type { GmailClient } from "../gmail/client.js";
 import {
   fetchProfile,
   fetchInboxMessageCount,
+  fetchThreadHasUserSentMessage,
   headersFromMessage,
   listAllMessageIds,
   listHistorySince,
@@ -14,11 +15,20 @@ import {
 import { buildNormalizedMessage, extractBodyParts } from "../gmail/normalize.js";
 import { GMAIL_LABELS, hasUnattributedProtectionLabel, isInInbox, isNativeSpam, isRead } from "../gmail/labels.js";
 import { findMatchingRuleGroups } from "../rules/matcher.js";
-import { evaluateMessagePolicy, POLICY_VERSION, type PolicyThresholds } from "./policy.js";
+import { evaluateMessagePolicy, POLICY_VERSION, type MessagePolicyInput, type PolicyThresholds } from "./policy.js";
+import { hasAuthenticatedHighRiskSignal } from "./high-risk-signal.js";
 import { buildRunSummary, type MessageOutcome, type RunSummary } from "../summary/build-summary.js";
-import { validateEventCandidate, type ValidatedEvent } from "../calendar/event-policy.js";
+import { sourceEvidencePresent, validateEventCandidate, type ValidatedEvent } from "../calendar/event-policy.js";
 import { mapWithConcurrency } from "./concurrency.js";
-import type { AssessmentResult, NormalizedMessage, RuleAction } from "./models.js";
+import { buildDeterministicSummary } from "../ai/prompt.js";
+import type {
+  AssessmentResult,
+  EmailAssessment,
+  EmailAssessmentKind,
+  NormalizedMessage,
+  ReasonCode,
+  RuleAction
+} from "./models.js";
 import type { RuleGroup } from "./models.js";
 import type { Clock } from "./clock.js";
 
@@ -63,6 +73,17 @@ export interface OrchestratorDeps {
    */
   priorLabelCandidateCounts?: ReadonlyMap<string, { displayName: string; count: number }>;
   /**
+   * Gmail message IDs that already voted toward a category's cumulative
+   * count in an earlier run, keyed by the same normalized (lowercased)
+   * name as `priorLabelCandidateCounts`. Without this, a message
+   * reconciled again by a later incremental sync (e.g. because it was
+   * separately starred, which generates its own Gmail history event)
+   * would vote for the same category a second time, inflating the count
+   * past what actually reflects distinct messages. See
+   * `WorkScanResult.labelCandidateUpdates`'s `newlyVotedMessageIds`.
+   */
+  priorLabelCandidateVotedMessageIds?: ReadonlyMap<string, ReadonlySet<string>>;
+  /**
    * The account's persisted Gmail history marker from the last successful
    * run, if any. When present and still valid, the scan reconciles only
    * the messages `users.history.list` reports as changed since that point
@@ -72,6 +93,92 @@ export interface OrchestratorDeps {
    * account's first-ever run, or `gmail cache`'s explicit full rebaseline).
    */
   historyMarker?: string | null;
+  /**
+   * The exact version identifiers the currently-resolved classifier would
+   * produce (see `ai/resolve-classifier.ts`'s `ResolvedClassifier`).
+   * Required for `cachedAssessments` to mean anything: a cached row's
+   * stored versions must match these exactly, or the cache is for a
+   * different model/prompt/schema and must not be reused. Defaults to
+   * `"not-configured"` for all three when omitted, matching
+   * `NotConfiguredClassifier`'s placeholder and guaranteeing no accidental
+   * cache hit when nothing meaningful is configured.
+   */
+  classifierVersion?: string;
+  promptVersion?: string;
+  schemaVersion?: string;
+  /**
+   * Cache-only policy/context version. Callers may extend POLICY_VERSION
+   * with hashes of enabled local rules and existing-label context so a
+   * local configuration change queues otherwise-unchanged cached mail for
+   * targeted re-evaluation. Defaults to POLICY_VERSION for direct users.
+   */
+  cachePolicyVersion?: string;
+  /**
+   * Previously-computed, still-valid assessments for messages this account
+   * has already classified, keyed by Gmail message ID — see
+   * `CachedAssessmentSnapshot`. When a message's current content hash and
+   * this run's classifier/prompt/schema/policy versions all match a cached
+   * entry exactly, the AI call is skipped entirely and the cached
+   * assessment is reused verbatim: nothing about the classification inputs
+   * changed, so a fresh call would almost certainly reproduce the same
+   * verdict anyway. This is the concrete mechanism behind CLAUDE.md's
+   * "Cache assessments using content and version hashes" requirement,
+   * which `gmail cache`'s snapshot alone does not implement on its own —
+   * only `gmail work` actually consults and refreshes this cache (see
+   * `WorkScanResult.messageCacheUpdates`).
+   */
+  cachedAssessments?: ReadonlyMap<string, CachedAssessmentSnapshot>;
+  /**
+   * Locally cached messages that still need one live hydration/evaluation
+   * pass (for example rows written by `gmail cache`, which deliberately
+   * does not call the classifier, or rows whose model/prompt/schema/policy
+   * version is stale). These are reconciled alongside Gmail history
+   * changes, so advancing the history marker during `gmail cache` cannot
+   * make the cached backlog permanently invisible to `gmail work`.
+   */
+  cachedBacklogStubs?: readonly MessageStub[];
+}
+
+/** See `OrchestratorDeps.cachedAssessments`. Mirrors the non-verbatim projection `state/repositories/messages.ts` persists — never body text, summaries, or AI sourceEvidence. */
+export interface CachedAssessmentSnapshot {
+  contentHash: string;
+  classifierVersion: string;
+  promptVersion: string;
+  schemaVersion: string;
+  policyVersion: string;
+  kind: EmailAssessmentKind;
+  confidence: number;
+  importanceScore: number;
+  importanceConfidence: number;
+  reasonCodes: readonly ReasonCode[];
+  category: string | null;
+}
+
+/** One message's up-to-date cache row to persist after a run — see `OrchestratorDeps.cachedAssessments`. */
+export interface MessageCacheUpdate {
+  gmailMessageId: string;
+  gmailThreadId: string;
+  contentHash: string;
+  labelSnapshot: readonly string[];
+  /** Null when this message never reached the classifier (bypassed by an explicit rule or native spam) — nothing to cache. */
+  assessment: CachedAssessmentSnapshot | null;
+  /** Whether the fresh assessment contained any event intent; event payload/evidence itself is deliberately never cached. */
+  assessmentHadEvent: boolean | null;
+  /**
+   * Versions under which this row was fully evaluated, even when no AI
+   * assessment exists (deterministic spam/rule bypass, or rules-only mode).
+   * Keeping these separate from `assessment` prevents such rows from
+   * being mistaken for never-processed cache placeholders forever.
+   */
+  evaluatedVersions: {
+    classifierVersion: string;
+    promptVersion: string;
+    schemaVersion: string;
+    policyVersion: string;
+  } | null;
+  subject: string | null;
+  senderDisplay: string | null;
+  internalDate: string;
 }
 
 /**
@@ -91,19 +198,62 @@ export interface LabelCandidateUpdate {
   newCumulativeCount: number;
   /** True once this crossed the threshold and the label was actually applied this run — the caller should clear its stored candidate row rather than keep counting. */
   applied: boolean;
+  /** Message IDs that voted for this category in THIS run (i.e. weren't already counted in a previous run) — the caller should persist these so a later run never counts them again. Empty/irrelevant once `applied` is true, since the candidate row (and its votes) are cleared instead. */
+  newlyVotedMessageIds: readonly string[];
 }
 
 export interface WorkScanResult {
   summary: RunSummary;
   outcomes: MessageOutcome[];
   /** The Gmail history ID the caller should persist as this account's new marker once the run's ledger is durable. */
-  newHistoryMarker: string;
+  /** Null when a --limit made this scan incomplete; callers must clear the marker rather than skip omitted mail. */
+  newHistoryMarker: string | null;
   /** True when this scan reconciled only changed messages via history.list rather than listing the whole Inbox/Spam. */
   usedIncrementalSync: boolean;
   /** Set when --limit capped the scan, or an incremental scan happened; states what was skipped/reconciled. */
   scanNote: string | null;
   /** Per-category cumulative-count bookkeeping the caller should persist (or clear) after this run — see `OrchestratorDeps.priorLabelCandidateCounts`. */
   labelCandidateUpdates: readonly LabelCandidateUpdate[];
+  /** Every scanned message's up-to-date cache row — see `OrchestratorDeps.cachedAssessments`. The caller persists these (outside `--dry-run`) so a later run can skip re-classifying unchanged content. */
+  messageCacheUpdates: readonly MessageCacheUpdate[];
+  /** Content-free timing/call counters used to distinguish Gmail latency, AI latency, retries, and cache effectiveness. */
+  diagnostics: ScanDiagnostics;
+  /** Cached rows proven deleted or no longer in Inbox/Spam by incremental reconciliation. */
+  cacheEvictionMessageIds: readonly string[];
+}
+
+export interface ScanDiagnostics {
+  totalMs: number;
+  profileMs: number;
+  historyMs: number;
+  listingMs: number;
+  messageFetchMs: number;
+  classificationMs: number;
+  policyMs: number;
+  inboxCountMs: number;
+  messagesFetched: number;
+  classifierCalls: number;
+  assessmentCacheHits: number;
+  threadChecks: number;
+  cachedBacklogQueued: number;
+}
+
+function emptyScanDiagnostics(): ScanDiagnostics {
+  return {
+    totalMs: 0,
+    profileMs: 0,
+    historyMs: 0,
+    listingMs: 0,
+    messageFetchMs: 0,
+    classificationMs: 0,
+    policyMs: 0,
+    inboxCountMs: 0,
+    messagesFetched: 0,
+    classifierCalls: 0,
+    assessmentCacheHits: 0,
+    threadChecks: 0,
+    cachedBacklogQueued: 0
+  };
 }
 
 export function dedupeStubs(stubs: readonly MessageStub[]): MessageStub[] {
@@ -112,14 +262,6 @@ export function dedupeStubs(stubs: readonly MessageStub[]): MessageStub[] {
     seen.set(stub.id, stub);
   }
   return [...seen.values()];
-}
-
-function chunk<T>(items: readonly T[], size: number): T[][] {
-  const chunks: T[][] = [];
-  for (let i = 0; i < items.length; i += size) {
-    chunks.push(items.slice(i, i + size));
-  }
-  return chunks;
 }
 
 /**
@@ -134,18 +276,36 @@ function chunk<T>(items: readonly T[], size: number): T[][] {
  * given run, never the policy that decides what happens to them.
  */
 export async function runWorkScan(deps: OrchestratorDeps): Promise<WorkScanResult> {
-  const profile = await fetchProfile(deps.gmailClient);
-
+  const totalStartedAt = performance.now();
+  const diagnostics = emptyScanDiagnostics();
   if (deps.historyMarker) {
+    const historyStartedAt = performance.now();
     const history = await listHistorySince(deps.gmailClient, deps.historyMarker);
+    diagnostics.historyMs = performance.now() - historyStartedAt;
     if (!history.expiredMarker) {
-      return runIncrementalScan(deps, profile, history);
+      // A valid incremental run already has the signed-in address from the
+      // account row. Avoid an otherwise redundant getProfile round trip on
+      // the hottest (and most common) path.
+      let userEmail = deps.userEmail;
+      if (userEmail.trim().length === 0) {
+        const profileStartedAt = performance.now();
+        userEmail = (await fetchProfile(deps.gmailClient)).emailAddress;
+        diagnostics.profileMs = performance.now() - profileStartedAt;
+      }
+      const result = await runIncrementalScan(deps, userEmail, history, diagnostics);
+      diagnostics.totalMs = performance.now() - totalStartedAt;
+      return result;
     }
     // Gmail returned 404 for the stored marker (it expired) — fall through
     // to the fenced full-rescan procedure below, exactly as CLAUDE.md
     // specifies for this case.
   }
-  return runFullScan(deps, profile);
+  const profileStartedAt = performance.now();
+  const profile = await fetchProfile(deps.gmailClient);
+  diagnostics.profileMs = performance.now() - profileStartedAt;
+  const result = await runFullScan(deps, profile, diagnostics);
+  diagnostics.totalMs = performance.now() - totalStartedAt;
+  return result;
 }
 
 /** Phase 1: fetch + normalize + rule-match every stub, batched at gmailReads concurrency, sorted most-recent-first. */
@@ -154,11 +314,12 @@ async function fetchAndNormalizeAll(
   deps: OrchestratorDeps,
   userEmail: string
 ): Promise<PreprocessedMessage[]> {
-  const preprocessed: PreprocessedMessage[] = [];
-  for (const batch of chunk(stubs, deps.concurrency.gmailReads)) {
-    const batchResults = await Promise.all(batch.map((stub) => fetchAndNormalize(stub, deps, userEmail)));
-    preprocessed.push(...batchResults);
-  }
+  // A worker pool avoids fixed-batch head-of-line blocking: as soon as one
+  // Gmail fetch finishes its slot starts the next message, even if another
+  // request from the original group is slow or retrying.
+  const preprocessed = await mapWithConcurrency(stubs, deps.concurrency.gmailReads, (stub) =>
+    fetchAndNormalize(stub, deps, userEmail)
+  );
   // Most recent first: Gmail's own list/history order is not a documented,
   // guaranteed contract, and this is what actually determines both
   // classification priority (under concurrency, earlier array entries get
@@ -171,27 +332,166 @@ async function fetchAndNormalizeAll(
 interface ClassifyAndFinalizeResult {
   outcomes: MessageOutcome[];
   labelCandidateUpdates: readonly LabelCandidateUpdate[];
+  messageCacheUpdates: readonly MessageCacheUpdate[];
 }
 
-/** Phases 2-4: classify (bounded at aiCalls concurrency), evaluate policy, then the run-wide label-batch threshold. No further Gmail I/O. */
+/**
+ * Phases 2-4: classify (bounded at aiCalls concurrency, skipping the AI
+ * call entirely on a cache hit — see `OrchestratorDeps.cachedAssessments`),
+ * evaluate policy (deferring the thread-reply-protection Gmail call to
+ * only the messages actually about to be trashed — see `finalizeOutcome`),
+ * then the run-wide label-batch threshold.
+ */
 async function classifyAndFinalize(
   preprocessed: readonly PreprocessedMessage[],
-  deps: OrchestratorDeps
+  deps: OrchestratorDeps,
+  diagnostics: ScanDiagnostics
 ): Promise<ClassifyAndFinalizeResult> {
-  const assessmentResults = await mapWithConcurrency(preprocessed, deps.concurrency.aiCalls, (pre) =>
-    pre.bypassed
-      ? Promise.resolve(null)
-      : deps.classifier.assess(pre.normalized, {
-          classifierVersion: "not-configured",
-          promptVersion: "not-configured",
-          schemaVersion: "not-configured",
-          policyVersion: POLICY_VERSION,
-          existingLabels: deps.existingLabels ?? []
-        })
+  const classifierVersion = deps.classifierVersion ?? "not-configured";
+  const promptVersion = deps.promptVersion ?? "not-configured";
+  const schemaVersion = deps.schemaVersion ?? "not-configured";
+  const cachePolicyVersion = deps.cachePolicyVersion ?? POLICY_VERSION;
+
+  const classificationStartedAt = performance.now();
+  const assessmentResults = await mapWithConcurrency(preprocessed, deps.concurrency.aiCalls, (pre) => {
+    if (pre.bypassed) {
+      return Promise.resolve(null);
+    }
+    const cached = deps.cachedAssessments?.get(pre.stub.id);
+    if (
+      cached &&
+      cached.contentHash === pre.normalized.contentHash &&
+      cached.classifierVersion === classifierVersion &&
+      cached.promptVersion === promptVersion &&
+      cached.schemaVersion === schemaVersion &&
+      cached.policyVersion === cachePolicyVersion
+    ) {
+      diagnostics.assessmentCacheHits += 1;
+      // Nothing about the classification inputs changed since this exact
+      // assessment was produced (identical content, identical
+      // classifier/prompt/schema/policy versions) — a fresh AI call would
+      // almost certainly reproduce the same verdict, so skip it entirely.
+      // This is what makes a later `gmail work` run actually use `gmail
+      // cache`'s (and a prior run's own) stored data instead of
+      // re-classifying every changed message from scratch.
+      return Promise.resolve<AssessmentResult>({ ok: true, assessment: reconstructAssessment(cached, pre.normalized) });
+    }
+    diagnostics.classifierCalls += 1;
+    return deps.classifier.assess(pre.normalized, {
+      classifierVersion,
+      promptVersion,
+      schemaVersion,
+      policyVersion: POLICY_VERSION,
+      existingLabels: deps.existingLabels ?? []
+    });
+  });
+  diagnostics.classificationMs += performance.now() - classificationStartedAt;
+
+  // Bounded at gmailReads concurrency: most messages need no extra Gmail
+  // call at all (see finalizeOutcome's deferred thread-protection check),
+  // but this still caps how many can be in flight at once for the ones
+  // that do.
+  const threadSentCache = new Map<string, Promise<boolean>>();
+  const policyStartedAt = performance.now();
+  const rawOutcomes = await mapWithConcurrency(preprocessed, deps.concurrency.gmailReads, (pre, i) =>
+    finalizeOutcome(pre, assessmentResults[i] ?? null, deps, threadSentCache, diagnostics)
   );
-  const rawOutcomes = preprocessed.map((pre, i) => finalizeOutcome(pre, assessmentResults[i] ?? null, deps));
   const existingLabelNamesLower = new Set((deps.existingLabels ?? []).map((name) => name.trim().toLowerCase()));
-  return applyLabelBatchThreshold(rawOutcomes, existingLabelNamesLower, deps.priorLabelCandidateCounts ?? new Map());
+  const { outcomes, labelCandidateUpdates } = applyLabelBatchThreshold(
+    rawOutcomes,
+    existingLabelNamesLower,
+    deps.priorLabelCandidateCounts ?? new Map(),
+    deps.priorLabelCandidateVotedMessageIds ?? new Map()
+  );
+  diagnostics.policyMs += performance.now() - policyStartedAt;
+  return {
+    outcomes,
+    labelCandidateUpdates,
+    messageCacheUpdates: buildMessageCacheUpdates(preprocessed, assessmentResults, {
+      classifierVersion,
+      promptVersion,
+      schemaVersion,
+      policyVersion: cachePolicyVersion
+    })
+  };
+}
+
+/**
+ * One up-to-date cache row per scanned message, built from the RAW
+ * (pre-label-threshold) assessment so a message whose category didn't
+ * cross this run's batch threshold still gets its actual proposed category
+ * persisted — a later run reconstructing this assessment from cache must
+ * see the same category it would have gotten from a fresh AI call, so it
+ * can keep contributing votes toward the threshold exactly as before.
+ */
+function buildMessageCacheUpdates(
+  preprocessed: readonly PreprocessedMessage[],
+  assessmentResults: readonly (AssessmentResult | null)[],
+  currentVersions: NonNullable<MessageCacheUpdate["evaluatedVersions"]>
+): MessageCacheUpdate[] {
+  return preprocessed.map((pre, i) => {
+    const result = assessmentResults[i] ?? null;
+    const assessment = result?.ok ? result.assessment : null;
+    // Provider/network/schema failures remain eligible for retry on the
+    // next run. A deterministic bypass or deliberately unconfigured AI is
+    // nevertheless a complete evaluation under the current setup and must
+    // not be hydrated on every invocation forever.
+    const evaluationCompleted =
+      pre.bypassed || assessment !== null || (result !== null && !result.ok && result.unavailable.reason === "not_configured");
+    return {
+      gmailMessageId: pre.stub.id,
+      gmailThreadId: pre.stub.threadId,
+      contentHash: pre.normalized.contentHash,
+      labelSnapshot: pre.labelIds,
+      assessment: assessment
+        ? {
+            contentHash: pre.normalized.contentHash,
+            classifierVersion: assessment.classifierVersion,
+            promptVersion: assessment.promptVersion,
+            schemaVersion: assessment.schemaVersion,
+            policyVersion: POLICY_VERSION,
+            kind: assessment.kind,
+            confidence: assessment.confidence,
+            importanceScore: assessment.importanceScore,
+            importanceConfidence: assessment.importanceConfidence,
+            reasonCodes: assessment.reasonCodes,
+            category: assessment.category
+          }
+        : null,
+      assessmentHadEvent: assessment === null ? null : assessment.event.intent !== "none",
+      evaluatedVersions: evaluationCompleted ? currentVersions : null,
+      subject: pre.normalized.subject || null,
+      senderDisplay: pre.normalized.from.displayName ?? pre.normalized.from.address,
+      internalDate: pre.normalized.internalDate
+    };
+  });
+}
+
+/** Rebuilds a full internal EmailAssessment from a cached row, with no AI call. `event` is always reconstructed as absent: a validated Calendar event already moved its message out of Inbox (so it can't reappear here), and a message that had no event before a content-identical reclassification still has none now. `summary` is recomputed fresh (cheap, deterministic, no AI) since it's never persisted verbatim. */
+function reconstructAssessment(cached: CachedAssessmentSnapshot, message: NormalizedMessage): EmailAssessment {
+  return {
+    kind: cached.kind,
+    confidence: cached.confidence,
+    importanceScore: cached.importanceScore,
+    importanceConfidence: cached.importanceConfidence,
+    summary: buildDeterministicSummary(message),
+    reasonCodes: cached.reasonCodes,
+    event: {
+      intent: "none",
+      confidence: 0,
+      title: null,
+      start: null,
+      end: null,
+      allDay: false,
+      timeZone: null,
+      location: null,
+      sourceEvidence: null
+    },
+    category: cached.category,
+    classifierVersion: cached.classifierVersion,
+    promptVersion: cached.promptVersion,
+    schemaVersion: cached.schemaVersion
+  };
 }
 
 /**
@@ -218,7 +518,12 @@ export async function resolvePostScanHistoryMarker(client: GmailClient, fenceHis
   }
 }
 
-async function runFullScan(deps: OrchestratorDeps, profile: MailboxProfile): Promise<WorkScanResult> {
+async function runFullScan(
+  deps: OrchestratorDeps,
+  profile: MailboxProfile,
+  diagnostics: ScanDiagnostics
+): Promise<WorkScanResult> {
+  const listingStartedAt = performance.now();
   const [spamResult, inboxResult] = await Promise.all([
     listAllMessageIds(deps.gmailClient, {
       labelIds: [GMAIL_LABELS.spam],
@@ -231,10 +536,18 @@ async function runFullScan(deps: OrchestratorDeps, profile: MailboxProfile): Pro
       ...(deps.limit !== undefined ? { safetyCapCount: deps.limit } : {})
     })
   ]);
+  diagnostics.listingMs = performance.now() - listingStartedAt;
 
   const stubs = dedupeStubs([...spamResult.messages, ...inboxResult.messages]);
+  const fetchStartedAt = performance.now();
   const preprocessed = await fetchAndNormalizeAll(stubs, deps, profile.emailAddress);
-  const { outcomes, labelCandidateUpdates } = await classifyAndFinalize(preprocessed, deps);
+  diagnostics.messageFetchMs = performance.now() - fetchStartedAt;
+  diagnostics.messagesFetched = stubs.length;
+  const { outcomes, labelCandidateUpdates, messageCacheUpdates } = await classifyAndFinalize(
+    preprocessed,
+    deps,
+    diagnostics
+  );
   const summary = buildRunSummary(inboxResult.messages.length, outcomes);
 
   // Catches anything that changed while this full snapshot was being
@@ -242,7 +555,13 @@ async function runFullScan(deps: OrchestratorDeps, profile: MailboxProfile): Pro
   // incremental run (which starts from the marker persisted below) — see
   // CLAUDE.md's "read historyId before listing... then reconcile every
   // change through the returned ending history ID."
-  const newHistoryMarker = await resolvePostScanHistoryMarker(deps.gmailClient, profile.historyId);
+  const snapshotTruncated = inboxResult.truncated || spamResult.truncated;
+  let newHistoryMarker: string | null = null;
+  if (!snapshotTruncated) {
+    const historyStartedAt = performance.now();
+    newHistoryMarker = await resolvePostScanHistoryMarker(deps.gmailClient, profile.historyId);
+    diagnostics.historyMs += performance.now() - historyStartedAt;
+  }
 
   return {
     summary,
@@ -250,44 +569,83 @@ async function runFullScan(deps: OrchestratorDeps, profile: MailboxProfile): Pro
     newHistoryMarker,
     usedIncrementalSync: false,
     scanNote: buildScanNote(inboxResult, spamResult),
-    labelCandidateUpdates
+    labelCandidateUpdates,
+    messageCacheUpdates,
+    diagnostics,
+    cacheEvictionMessageIds: []
   };
 }
 
 async function runIncrementalScan(
   deps: OrchestratorDeps,
-  profile: MailboxProfile,
-  history: HistorySyncResult
+  userEmail: string,
+  history: HistorySyncResult,
+  diagnostics: ScanDiagnostics
 ): Promise<WorkScanResult> {
   const allChanged = [...history.changedMessages.entries()];
-  let stubs: MessageStub[] = allChanged.map(([id, threadId]) => ({ id, threadId }));
+  // History is authoritative when the same ID appears in both sources.
+  // A deletion is authoritative too: never resurrect a locally cached row
+  // that Gmail says no longer exists.
+  const workById = new Map<string, MessageStub>();
+  for (const cached of deps.cachedBacklogStubs ?? []) {
+    if (!history.deletedMessageIds.has(cached.id)) {
+      workById.set(cached.id, cached);
+    }
+  }
+  for (const [id, threadId] of allChanged) {
+    workById.set(id, { id, threadId });
+  }
+  diagnostics.cachedBacklogQueued = [...workById.keys()].filter((id) => !history.changedMessages.has(id)).length;
+  let stubs = [...workById.values()];
   let truncationNote: string | null = null;
   if (deps.limit !== undefined && stubs.length > deps.limit) {
-    truncationNote = `--limit applied: processing ${deps.limit} of ${stubs.length} changed message(s); the rest will be reconciled on a later run.`;
+    truncationNote = `--limit applied: processing ${deps.limit} of ${stubs.length} queued message(s); the history baseline will be cleared so an uncapped later run can safely recover the rest.`;
     stubs = stubs.slice(0, deps.limit);
   }
 
-  const preprocessedAll = await fetchAndNormalizeAll(stubs, deps, profile.emailAddress);
+  const fetchStartedAt = performance.now();
+  const preprocessedAll = await fetchAndNormalizeAll(stubs, deps, userEmail);
+  diagnostics.messageFetchMs = performance.now() - fetchStartedAt;
+  diagnostics.messagesFetched = stubs.length;
   // Only a message currently in Inbox or native Spam is ever actionable —
   // exactly the same two input streams a full scan lists directly. A
   // message that changed for an unrelated reason (the user archived or
   // trashed it themselves, etc.) simply isn't evaluated, matching how it
   // would never have appeared in a full listAllMessageIds pass either.
   const preprocessed = preprocessedAll.filter((pre) => isInInbox(pre.labelIds) || isNativeSpam(pre.labelIds));
+  const inactiveMessageIds = preprocessedAll
+    .filter((pre) => !isInInbox(pre.labelIds) && !isNativeSpam(pre.labelIds))
+    .map((pre) => pre.stub.id);
 
-  const { outcomes, labelCandidateUpdates } = await classifyAndFinalize(preprocessed, deps);
+  const { outcomes, labelCandidateUpdates, messageCacheUpdates } = await classifyAndFinalize(
+    preprocessed,
+    deps,
+    diagnostics
+  );
+  const inboxCountStartedAt = performance.now();
   const inboxCountBefore = await fetchInboxMessageCount(deps.gmailClient);
+  diagnostics.inboxCountMs = performance.now() - inboxCountStartedAt;
   const summary = buildRunSummary(inboxCountBefore, outcomes);
 
-  const incrementalNote = `Incremental scan: reconciled ${preprocessed.length} changed, currently Inbox/Spam message(s) since the last run (${allChanged.length} total change(s) detected).`;
+  const cachedBacklogCount = stubs.filter((stub) => !history.changedMessages.has(stub.id)).length;
+  const incrementalNote =
+    `Incremental scan: reconciled ${preprocessed.length} currently Inbox/Spam message(s) ` +
+    `(${allChanged.length} Gmail change(s), ${cachedBacklogCount} cached backlog message(s)).`;
 
   return {
     summary,
     outcomes,
-    newHistoryMarker: history.endHistoryId,
+    // Advancing to history.endHistoryId after slicing the work list would
+    // permanently discard the omitted changes despite the old note saying
+    // they would be reconciled later. Clearing the marker forces a safe
+    // full recovery on the next uncapped run.
+    newHistoryMarker: truncationNote === null ? history.endHistoryId : null,
     usedIncrementalSync: true,
     scanNote: truncationNote ? `${truncationNote} ${incrementalNote}` : incrementalNote,
-    labelCandidateUpdates
+    labelCandidateUpdates,
+    messageCacheUpdates,
+    diagnostics,
+    cacheEvictionMessageIds: [...new Set([...history.deletedMessageIds, ...inactiveMessageIds])]
   };
 }
 
@@ -305,22 +663,40 @@ async function runIncrementalScan(
  * Every surviving category label in a group is normalized to one exact
  * display name so messages that agreed case-insensitively still end up
  * under the exact same Gmail label instead of near-duplicates.
+ *
+ * Counting is deduplicated by Gmail message ID against `priorVotedMessageIds`
+ * (messages that already voted for this category in an earlier run): a
+ * message reconciled again by a later incremental sync — e.g. because it
+ * was separately starred, which generates its own Gmail history event —
+ * must not vote for the same category a second time, or a handful of
+ * distinct messages could spuriously inflate the cumulative count past
+ * MIN_LABEL_BATCH_SIZE.
  */
+interface LabelThresholdResult {
+  outcomes: MessageOutcome[];
+  labelCandidateUpdates: readonly LabelCandidateUpdate[];
+}
+
 function applyLabelBatchThreshold(
   outcomes: readonly MessageOutcome[],
   existingLabelNamesLower: ReadonlySet<string>,
-  priorCounts: ReadonlyMap<string, { displayName: string; count: number }>
-): ClassifyAndFinalizeResult {
-  const groups = new Map<string, { count: number; displayName: string }>();
+  priorCounts: ReadonlyMap<string, { displayName: string; count: number }>,
+  priorVotedMessageIds: ReadonlyMap<string, ReadonlySet<string>>
+): LabelThresholdResult {
+  const groups = new Map<string, { newMessageIds: Set<string>; displayName: string }>();
   for (const outcome of outcomes) {
     for (const action of outcome.decision.actions) {
       if (action.type === "label" && action.reasonCode.startsWith("ai_category:")) {
         const key = action.labelName.trim().toLowerCase();
+        const alreadyVoted = priorVotedMessageIds.get(key)?.has(outcome.gmailMessageId) ?? false;
+        if (alreadyVoted) {
+          continue;
+        }
         const group = groups.get(key);
         if (group) {
-          group.count += 1;
+          group.newMessageIds.add(outcome.gmailMessageId);
         } else {
-          groups.set(key, { count: 1, displayName: action.labelName.trim() });
+          groups.set(key, { newMessageIds: new Set([outcome.gmailMessageId]), displayName: action.labelName.trim() });
         }
       }
     }
@@ -334,7 +710,7 @@ function applyLabelBatchThreshold(
       continue;
     }
     const priorCount = priorCounts.get(key)?.count ?? 0;
-    const cumulative = priorCount + group.count;
+    const cumulative = priorCount + group.newMessageIds.size;
     const applied = cumulative >= MIN_LABEL_BATCH_SIZE;
     if (applied) {
       eligibleKeys.add(key);
@@ -343,7 +719,8 @@ function applyLabelBatchThreshold(
       normalizedName: key,
       displayName: priorCounts.get(key)?.displayName ?? group.displayName,
       newCumulativeCount: cumulative,
-      applied
+      applied,
+      newlyVotedMessageIds: [...group.newMessageIds]
     });
   }
 
@@ -399,16 +776,21 @@ interface PreprocessedMessage {
   nativeSpam: boolean;
   explicitRule: { action: RuleAction; ruleGroupId: string } | null;
   authFailedImportantRule: boolean;
+  /**
+   * Protection from cheap, already-available signals only (explicit
+   * important rule, a preexisting unattributed STARRED/IMPORTANT label) —
+   * does NOT yet reflect thread-reply status, which is deliberately
+   * deferred to `finalizeOutcome` and only checked for a message that's
+   * actually about to be trashed (see that function's doc comment). This
+   * field alone is therefore NOT the full protection determination; do not
+   * treat it as such outside this file.
+   */
   isProtected: boolean;
   /** True when native spam or an explicit spam rule means the classifier must never be called for this message. */
   bypassed: boolean;
 }
 
-async function fetchAndNormalize(
-  stub: MessageStub,
-  deps: OrchestratorDeps,
-  userEmail: string
-): Promise<PreprocessedMessage> {
+async function fetchAndNormalize(stub: MessageStub, deps: OrchestratorDeps, userEmail: string): Promise<PreprocessedMessage> {
   // format=full costs the same Gmail API quota unit as format=metadata (5
   // units either way), so fetching the body up front — rather than a
   // second round trip only for messages that turn out to need
@@ -437,6 +819,11 @@ async function fetchAndNormalize(
     htmlBody: html,
     plainBody: plain,
     userEmail,
+    // Real thread-reply status is resolved lazily in finalizeOutcome, only
+    // for a message that's actually about to be trashed — see this
+    // struct's isProtected doc comment. This placeholder mirrors every
+    // other call site that builds a NormalizedMessage outside this
+    // pipeline (view.ts, cache.ts, spam.ts, important.ts).
     threadHasUserSentMessage: false
   });
 
@@ -468,33 +855,57 @@ async function fetchAndNormalize(
   };
 }
 
-function finalizeOutcome(
+/**
+ * `threads.get` (the thread-reply-protection Gmail call) is only actually
+ * needed to decide whether a message that WOULD otherwise be trashed
+ * (native spam, an explicit spam rule, or a high-confidence AI verdict)
+ * should instead be protected because the user has replied in its thread.
+ * For every other message — the large majority of a normal inbox — the
+ * cheap signals `PreprocessedMessage.isProtected` already carries are
+ * sufficient, so no extra Gmail call happens at all. This is what lets the
+ * thread-reply-protection fix from an earlier pass avoid roughly doubling
+ * Gmail call volume on every run.
+ */
+async function finalizeOutcome(
   pre: PreprocessedMessage,
   assessmentResult: AssessmentResult | null,
-  deps: OrchestratorDeps
-): MessageOutcome {
-  const { stub, normalized, labelIds, nativeSpam, explicitRule, authFailedImportantRule, isProtected } = pre;
+  deps: OrchestratorDeps,
+  threadSentCache: Map<string, Promise<boolean>>,
+  diagnostics: ScanDiagnostics
+): Promise<MessageOutcome> {
+  const { stub, normalized, labelIds, nativeSpam, explicitRule, authFailedImportantRule } = pre;
 
   const assessment = assessmentResult?.ok ? assessmentResult.assessment : null;
   const assessmentUnavailable = !pre.bypassed && assessmentResult !== null && !assessmentResult.ok;
 
-  const rawDecision = evaluateMessagePolicy(
-    {
-      gmailMessageId: stub.id,
-      isInInbox: isInInbox(labelIds),
-      isRead: isRead(labelIds),
-      isNativeSpam: nativeSpam,
-      isProtected,
-      explicitRule,
-      // Authenticated high-risk signal detection requires the real
-      // classifier; without it this can only ever gate AI-derived trash,
-      // which never fires while AI is not configured.
-      hasAuthenticatedHighRiskSignal: false,
-      assessment,
-      assessmentUnavailable
-    },
-    deps.policyThresholds
-  );
+  const policyInput: MessagePolicyInput = {
+    gmailMessageId: stub.id,
+    isInInbox: isInInbox(labelIds),
+    isRead: isRead(labelIds),
+    isNativeSpam: nativeSpam,
+    isProtected: pre.isProtected,
+    explicitRule,
+    hasAuthenticatedHighRiskSignal: hasAuthenticatedHighRiskSignal(normalized),
+    assessment,
+    assessmentUnavailable
+  };
+  let rawDecision = evaluateMessagePolicy(policyInput, deps.policyThresholds);
+
+  if (!pre.isProtected && rawDecision.actions.some((a) => a.type === "trash")) {
+    let threadHasUserSentMessagePromise = threadSentCache.get(stub.threadId);
+    if (!threadHasUserSentMessagePromise) {
+      diagnostics.threadChecks += 1;
+      threadHasUserSentMessagePromise = fetchThreadHasUserSentMessage(deps.gmailClient, stub.threadId);
+      threadSentCache.set(stub.threadId, threadHasUserSentMessagePromise);
+    }
+    if (await threadHasUserSentMessagePromise) {
+      // The user has replied in this thread — never trash it, regardless
+      // of what triggered the trash decision above (native spam, an
+      // explicit spam rule, or a high-confidence AI verdict all reuse this
+      // one re-evaluation instead of three separate checks).
+      rawDecision = evaluateMessagePolicy({ ...policyInput, isProtected: true }, deps.policyThresholds);
+    }
+  }
 
   // The policy only checks the event's confidence and intent — it never
   // validates the date/time shape itself (that's real code's job, not
@@ -506,7 +917,15 @@ function finalizeOutcome(
   const calendarAction = rawDecision.actions.find((a) => a.type === "calendar_create");
   let decision = rawDecision;
   if (calendarAction && calendarAction.type === "calendar_create") {
-    const validation = validateEventCandidate(calendarAction.event, deps.clock.now(), deps.userTimezone);
+    // A hallucinated or injected date must never produce a real Calendar
+    // event just because the model asserted one (CLAUDE.md: "validate that
+    // short sourceEvidence is actually present in the normalized message
+    // when it is used to justify a date"). Checked before the date/time
+    // shape validation below, using the same downgrade-to-review path.
+    const evidenceOk = sourceEvidencePresent(calendarAction.event.sourceEvidence, normalized.bodyText ?? normalized.snippet);
+    const validation = evidenceOk
+      ? validateEventCandidate(calendarAction.event, deps.clock.now(), deps.userTimezone)
+      : ({ ok: false, reason: "missing_source_evidence" } as const);
     if (validation.ok) {
       validatedEvent = validation.event;
     } else {
