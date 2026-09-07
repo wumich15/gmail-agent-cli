@@ -31,6 +31,50 @@ export const REQUIRED_METADATA_HEADERS = [
   "Precedence"
 ] as const;
 
+/**
+ * Gmail partial-response `fields` selectors (CLAUDE.md's "Planned Gmail
+ * read-transport optimization", step 2): narrow every response to exactly
+ * what normalization/policy consumes, cutting response bytes without
+ * changing quota cost (partial responses are a transport optimization, not
+ * a cheaper call). `fields` cannot filter array elements by content — e.g.
+ * `messages.get`'s `metadataHeaders` param, not `fields`, is what actually
+ * restricts *which* headers come back — so `fields` here only trims whole
+ * unused top-level branches (payload/parts on a metadata fetch, threadsTotal
+ * on a profile, etc).
+ *
+ * `MESSAGE_FULL_PART_TREE_DEPTH` bounds how many MIME `parts` levels the
+ * selector asks for. Partial response has no recursive/wildcard selector, so
+ * an arbitrarily deep MIME tree (e.g. a deeply nested forwarded message with
+ * its own nested multipart attachment) could in principle lose parts below
+ * this depth; 6 levels comfortably covers every structure this app has
+ * observed (typical mail nests at most 2-3: multipart/mixed ->
+ * multipart/alternative -> text/plain|html, occasionally +1 for
+ * multipart/related inline images or +1 for multipart/signed). Only body
+ * text extraction is affected by a part missed below this depth — headers
+ * live solely on the top-level `payload`, never on nested parts this app
+ * reads — so a message that did exceed it would still normalize correctly
+ * except for falling back to the Gmail-provided `snippet` instead of a full
+ * body, exactly as already happens today for a message with no text part
+ * inside the depth that IS fetched.
+ */
+const MESSAGE_FULL_PART_TREE_DEPTH = 6;
+
+function buildPartTreeFields(remainingDepth: number): string {
+  const leaf = "mimeType,body/data";
+  return remainingDepth <= 0 ? leaf : `${leaf},parts(${buildPartTreeFields(remainingDepth - 1)})`;
+}
+
+export const PROFILE_FIELDS = "emailAddress,historyId";
+export const MESSAGE_LIST_FIELDS = "messages(id,threadId),nextPageToken,resultSizeEstimate";
+export const MESSAGE_METADATA_FIELDS = "id,threadId,historyId,internalDate,labelIds,snippet,payload/headers";
+export const MESSAGE_FULL_FIELDS =
+  `id,threadId,historyId,internalDate,labelIds,snippet,payload(headers,${buildPartTreeFields(MESSAGE_FULL_PART_TREE_DEPTH)})`;
+export const INBOX_LABEL_FIELDS = "messagesTotal";
+export const THREAD_MINIMAL_FIELDS = "messages/labelIds";
+export const HISTORY_LIST_FIELDS =
+  "history(id,messagesAdded/message(id,threadId),labelsAdded/message(id,threadId)," +
+  "labelsRemoved/message(id,threadId),messagesDeleted/message(id,threadId)),nextPageToken,historyId";
+
 export interface MailboxProfile {
   emailAddress: string;
   historyId: string;
@@ -38,7 +82,7 @@ export interface MailboxProfile {
 
 export async function fetchProfile(client: GmailClient): Promise<MailboxProfile> {
   const { data } = await withGoogleApiRetry(
-    () => client.users.getProfile({ userId: "me" }, GMAIL_READ_REQUEST_OPTIONS),
+    () => client.users.getProfile({ userId: "me", fields: PROFILE_FIELDS }, GMAIL_READ_REQUEST_OPTIONS),
     GMAIL_READ_RETRY_OPTIONS,
     GMAIL_QUOTA_WEIGHT.label
   );
@@ -95,6 +139,7 @@ export async function listAllMessageIds(
             ...(params.q !== undefined ? { q: params.q } : {}),
             includeSpamTrash: params.includeSpamTrash,
             maxResults: 500,
+            fields: MESSAGE_LIST_FIELDS,
             ...(pageToken !== undefined ? { pageToken } : {})
           },
           GMAIL_READ_REQUEST_OPTIONS
@@ -133,7 +178,8 @@ export async function fetchMessageMetadata(
           userId: "me",
           id: messageId,
           format: "metadata",
-          metadataHeaders: [...REQUIRED_METADATA_HEADERS]
+          metadataHeaders: [...REQUIRED_METADATA_HEADERS],
+          fields: MESSAGE_METADATA_FIELDS
         },
         GMAIL_READ_REQUEST_OPTIONS
       ),
@@ -150,7 +196,7 @@ export async function fetchMessageMetadata(
  */
 export async function fetchInboxMessageCount(client: GmailClient): Promise<number> {
   const { data } = await withGoogleApiRetry(
-    () => client.users.labels.get({ userId: "me", id: "INBOX" }, GMAIL_READ_REQUEST_OPTIONS),
+    () => client.users.labels.get({ userId: "me", id: "INBOX", fields: INBOX_LABEL_FIELDS }, GMAIL_READ_REQUEST_OPTIONS),
     GMAIL_READ_RETRY_OPTIONS,
     GMAIL_QUOTA_WEIGHT.label
   );
@@ -182,7 +228,8 @@ export async function fetchMessageFull(
         {
           userId: "me",
           id: messageId,
-          format: "full"
+          format: "full",
+          fields: MESSAGE_FULL_FIELDS
         },
         GMAIL_READ_REQUEST_OPTIONS
       ),
@@ -211,7 +258,7 @@ export async function fetchThreadHasUserSentMessage(client: GmailClient, threadI
   const { data } = await withGoogleApiRetry(
     () =>
       client.users.threads.get(
-        { userId: "me", id: threadId, format: "minimal" },
+        { userId: "me", id: threadId, format: "minimal", fields: THREAD_MINIMAL_FIELDS },
         GMAIL_READ_REQUEST_OPTIONS
       ),
     // This is a safety-only lookup. If Gmail is already returning a per-user
@@ -276,7 +323,8 @@ export async function listHistorySince(
               userId: "me",
               startHistoryId,
               ...(pageToken !== undefined ? { pageToken } : {}),
-              historyTypes: ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"]
+              historyTypes: ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"],
+              fields: HISTORY_LIST_FIELDS
             },
             GMAIL_READ_REQUEST_OPTIONS
           ),

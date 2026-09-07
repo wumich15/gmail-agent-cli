@@ -1,12 +1,19 @@
 import { describe, expect, it } from "vitest";
 import {
   fetchInboxMessageCount,
+  fetchMessageFull,
+  fetchProfile,
   historyIdGreaterThan,
   listAllMessageIds,
   listHistorySince,
-  listSentThreadIds
+  listSentThreadIds,
+  headersFromMessage,
+  MESSAGE_LIST_FIELDS,
+  PROFILE_FIELDS
 } from "../../src/gmail/scanner.js";
+import { buildNormalizedMessage, extractBodyParts } from "../../src/gmail/normalize.js";
 import type { GmailClient } from "../../src/gmail/client.js";
+import type { gmail_v1 } from "googleapis";
 
 function fakeListClient(pages: { messages: { id: string; threadId: string }[]; resultSizeEstimate: number }[]) {
   let pageIndex = 0;
@@ -178,6 +185,145 @@ describe("fetchInboxMessageCount", () => {
   it("defaults to 0 when messagesTotal is absent", async () => {
     const client = { users: { labels: { get: async () => ({ data: {} }) } } } as unknown as GmailClient;
     expect(await fetchInboxMessageCount(client)).toBe(0);
+  });
+});
+
+describe("partial-response `fields` selectors", () => {
+  it("fetchMessageFull requests format=full narrowed by MESSAGE_FULL_FIELDS", async () => {
+    let capturedParams: unknown;
+    const client = {
+      users: {
+        messages: {
+          get: async (params: unknown) => {
+            capturedParams = params;
+            return { data: { id: "m1", threadId: "t1" } };
+          }
+        }
+      }
+    } as unknown as GmailClient;
+    await fetchMessageFull(client, "m1");
+    expect(capturedParams).toMatchObject({ format: "full", fields: expect.stringContaining("payload(") });
+  });
+
+  it("listAllMessageIds and fetchProfile request their documented field selectors", async () => {
+    let listParams: unknown;
+    let profileParams: unknown;
+    const client = {
+      users: {
+        messages: {
+          list: async (params: unknown) => {
+            listParams = params;
+            return { data: { messages: [], resultSizeEstimate: 0 } };
+          }
+        },
+        getProfile: async (params: unknown) => {
+          profileParams = params;
+          return { data: { emailAddress: "me@example.com", historyId: "1" } };
+        }
+      }
+    } as unknown as GmailClient;
+    await listAllMessageIds(client, { labelIds: ["INBOX"], includeSpamTrash: false });
+    await fetchProfile(client);
+    expect(listParams).toMatchObject({ fields: MESSAGE_LIST_FIELDS });
+    expect(profileParams).toMatchObject({ fields: PROFILE_FIELDS });
+  });
+
+  /**
+   * Proves CLAUDE.md's partial-response requirement: "Add fixtures proving
+   * the narrowed response produces identical normalized messages" — a raw
+   * Gmail response containing every field a real message could carry
+   * (including several MESSAGE_FULL_FIELDS deliberately excludes, like
+   * payload.partId/filename and a message-level sizeEstimate) must
+   * normalize identically to one pre-trimmed to exactly the fields that
+   * selector requests, down through a 3-level nested MIME tree well within
+   * MESSAGE_FULL_PART_TREE_DEPTH.
+   */
+  it("a response narrowed to exactly MESSAGE_FULL_FIELDS normalizes identically to the untrimmed original", () => {
+    const fullRaw: gmail_v1.Schema$Message = {
+      id: "m1",
+      threadId: "t1",
+      historyId: "500",
+      internalDate: "1700000000000",
+      labelIds: ["INBOX", "UNREAD"],
+      snippet: "Hello there",
+      sizeEstimate: 4096, // excluded by MESSAGE_FULL_FIELDS
+      payload: {
+        partId: "0", // excluded by MESSAGE_FULL_FIELDS
+        filename: "", // excluded by MESSAGE_FULL_FIELDS
+        mimeType: "multipart/mixed",
+        headers: [
+          { name: "From", value: "person@example.com" },
+          { name: "Subject", value: "Hi" }
+        ],
+        body: { size: 0 },
+        parts: [
+          {
+            partId: "0.0",
+            mimeType: "multipart/alternative",
+            body: { size: 0 },
+            parts: [
+              {
+                partId: "0.0.0",
+                mimeType: "text/plain",
+                filename: "",
+                body: { size: 5, data: Buffer.from("plain").toString("base64url") },
+                parts: []
+              },
+              {
+                partId: "0.0.1",
+                mimeType: "text/html",
+                body: { size: 15, data: Buffer.from("<p>html</p>").toString("base64url") },
+                parts: []
+              }
+            ]
+          }
+        ]
+      }
+    };
+
+    // Only the fields MESSAGE_FULL_FIELDS actually selects survive here —
+    // this is what Gmail's real server would return for that `fields` value.
+    const narrowedRaw: gmail_v1.Schema$Message = {
+      id: "m1",
+      threadId: "t1",
+      historyId: "500",
+      internalDate: "1700000000000",
+      labelIds: ["INBOX", "UNREAD"],
+      snippet: "Hello there",
+      payload: {
+        mimeType: fullRaw.payload!.mimeType ?? null,
+        headers: fullRaw.payload!.headers ?? [],
+        body: { data: fullRaw.payload!.body?.data ?? null },
+        parts: fullRaw.payload!.parts!.map((p0) => ({
+          mimeType: p0.mimeType ?? null,
+          body: { data: p0.body?.data ?? null },
+          parts: p0.parts!.map((p1) => ({
+            mimeType: p1.mimeType ?? null,
+            body: { data: p1.body?.data ?? null },
+            parts: []
+          }))
+        }))
+      }
+    };
+
+    function normalizeOf(raw: gmail_v1.Schema$Message) {
+      const { plain, html } = extractBodyParts(raw.payload ?? undefined);
+      return buildNormalizedMessage({
+        gmailMessageId: raw.id!,
+        gmailThreadId: raw.threadId!,
+        historyId: raw.historyId!,
+        internalDate: raw.internalDate!,
+        labelIds: raw.labelIds ?? [],
+        snippet: raw.snippet ?? "",
+        headers: headersFromMessage(raw),
+        htmlBody: html,
+        plainBody: plain,
+        userEmail: "me@example.com",
+        threadHasUserSentMessage: false
+      });
+    }
+
+    expect(normalizeOf(narrowedRaw)).toEqual(normalizeOf(fullRaw));
   });
 });
 

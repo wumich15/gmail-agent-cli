@@ -268,7 +268,11 @@ failed snapshot leaves the baseline untouched. It upserts each visited
 message's non-verbatim projection (`contentHash`, label snapshot,
 `subject`/`senderDisplay`/`internalDate`, no body or assessment payload) into
 the `messages` table via `MessagesRepository`, which `gmail view` reads
-directly (see "gmail view" below).
+directly (see "gmail view" below). Its full lifecycle is visible on stderr:
+discovery, an eight-worker full-message hydration pool, and final marker
+reconciliation each have a progress state. The hydration pool overlaps network
+latency, while the shared quota-weighted limiter still controls actual Gmail
+request departure rate.
 
 On the next `gmail work`, the cached rows are now read: unassessed rows and
 rows whose classifier, prompt, schema, policy, rule, or custom-label context
@@ -290,9 +294,9 @@ process-wide pacer every Gmail/Calendar call goes through via
 `work.ts`, `undo.ts` — switched from the plain `withApiRetry`; OpenAI
 calls are untouched, a separate quota domain with their own budget in
 `OpenAiClassifier`). Rather than hardcoding one "safe" requests/second
-number — real observed per-project quotas have proven lower than Google's
-documented defaults in live use this session — it starts at 3 baseline-
-equivalent messages/s and recovers toward 4/s (or the explicit
+number — projects can retain either the legacy or new Gmail quota tier — it
+starts at 5 baseline-equivalent messages/s and recovers toward 10/s (200
+`messages.get`-equivalent units/second, or the explicit
 `GMAIL_AGENT_RATE_LIMIT_RPS` value), halves itself on a quota-shaped failure
 (429 or the Service Infrastructure quota-message pattern), and only creeps
 back up after 25 consecutive clean calls. Calls reserve quota-weighted slots:
@@ -1018,12 +1022,12 @@ findings trace directly back to the previous ("Third") fix pass:
     second" for the one call site whose cost differs enough to matter in
     practice (see `api-retry.ts`'s updated doc comment for why the other,
     much rarer or much cheaper endpoints were left at the default).
-  - The defaults were also recalculated and lowered: `START_REQUESTS_PER_SECOND`
-    3 and `FASTEST_REQUESTS_PER_SECOND` 4 (60 and 80 real units/second),
-    comfortably under the 100 units/second cap even accounting for
-    concurrent-burst rounding in `acquire()`'s slot reservation — both
-    still overridable via `GMAIL_AGENT_RATE_LIMIT_RPS` for an account
-    confirmed to be on Gmail's older, more permissive quota tier.
+  - The defaults now start at `START_REQUESTS_PER_SECOND` 5 and recover toward
+    `FASTEST_REQUESTS_PER_SECOND` 10 (100 and 200 real units/second). This lets
+    projects retaining Gmail's legacy quota tier use its available headroom;
+    projects on the newer 100-units/second tier automatically halve throughput
+    when Gmail reports quota pressure. Both remain overridable via
+    `GMAIL_AGENT_RATE_LIMIT_RPS` when a project's quota is known.
 
 ## Fifth fix pass: quota-aware reply protection and user-visible progress
 
@@ -1048,6 +1052,78 @@ production strategy therefore avoids unnecessary 40-unit thread reads:
   planned actions before mutations, and appends a complete plaintext
   important-email paragraph after every run. Timing diagnostics remain
   content-free.
+- `gmail cache` reports its entire read-only lifecycle on stderr: Inbox/Spam
+  discovery, per-message hydration, and history-marker reconciliation. It uses
+  eight concurrent hydration workers to overlap slow Gmail network requests;
+  the shared weighted limiter remains the quota safety boundary, so this does
+  not create an uncontrolled request burst.
+
+## Sixth fix pass: Gmail read-transport optimization (batching and partial responses)
+
+Implements CLAUDE.md's "Planned Gmail read-transport optimization" plan.
+Batching and gzip are transport optimizations, not quota bypasses — none of
+this reduces the quota units a run consumes; it reduces HTTP setup overhead
+and response bytes for the same quota cost.
+
+- **Partial responses** (`gmail/scanner.ts`): every read call
+  (`getProfile`, `messages.list`, `messages.get` in both `metadata` and
+  `full` format, `labels.get`, `threads.get`, `history.list`) now passes a
+  `fields` selector narrowing the response to exactly what normalization
+  and policy consume. `MESSAGE_FULL_FIELDS` is built programmatically to a
+  bounded MIME-part-tree depth (6 levels) rather than hand-written, since
+  partial response has no true recursive selector — a fixture test
+  (`tests/unit/scanner.test.ts`) proves a response pre-trimmed to exactly
+  this selector normalizes identically to an untrimmed one carrying extra
+  real-world fields (`sizeEstimate`, `payload.partId`/`filename`) the
+  selector deliberately excludes.
+- **A dedicated multipart batch transport** (`gmail/batch.ts`), scoped
+  narrowly to batching `messages.get` reads (not a generic multi-endpoint
+  batch client, per the plan). Built on `OAuth2Client.request` — the same
+  gaxios/node-fetch pipeline `googleapis`-generated clients use — rather
+  than a raw `fetch`, so real gzip response decompression works
+  transparently; the module explicitly sets `Accept-Encoding: gzip` and a
+  gzip-tagged `User-Agent` itself, since those are added by
+  `googleapis-common`'s wrapper (confirmed by reading
+  `apirequest.js`), which this transport bypasses.
+  `tests/unit/gzip-batch.test.ts` proves this end-to-end against a real
+  local HTTP server returning a real gzip-compressed multipart body —
+  deliberately not a fake, since the property under test is that the real
+  decompression pipeline works, not that the code calls the right function
+  names. Response parsing maps parts by `Content-ID` (never array
+  position), and unit tests cover every scenario CLAUDE.md's acceptance
+  gate names: mixed 2xx/404/429/5xx statuses, out-of-order parts, a part
+  with no `Content-ID` at all, and a non-multipart/garbage body (throws
+  `BatchTransportError` rather than silently returning wrong data).
+- **Quota-aware batching driver** (`gmail/batch-hydrate.ts`) owns the
+  policy `batch.ts` deliberately doesn't: it reserves quota for every inner
+  call in the shared limiter before sending an outer batch (an outer batch
+  is never accounted as one cheap request), retries only the specific
+  parts that came back retryable (429/5xx) — never a successful part or the
+  whole batch — shrinks subsequent batch size on quota pressure, bounds the
+  total number of retry rounds so hydration always terminates, and falls
+  back to individual `fetchMessageFull` reads for a whole chunk when the
+  outer HTTP request fails structurally (malformed response, network
+  error, non-2xx envelope) — without losing any other chunk's
+  already-successful results. The rate limiter is injectable
+  (`BatchHydrationOptions.rateLimiter`) purely for test isolation; the real
+  singleton is the default.
+- **`gmail cache` wiring**: hydration logic was factored into a shared
+  `upsertHydratedMessage` helper used by both the existing per-message
+  `fetchMessageFull` loop and the new batched path, so the "preserve a
+  still-valid cached assessment" fix from the previous pass exists once,
+  not twice. Batching is strictly opt-in via `GMAIL_AGENT_BATCH_HYDRATION=1`
+  — CLAUDE.md's acceptance gate requires a live-account 200/500-message
+  benchmark proving a wall-clock/request-count improvement with no higher
+  429 rate before this can default on, and this development environment has
+  no live Gmail account to run that benchmark against. The individual-read
+  path remains the unconditional default.
+- **Explicitly not done in this pass**: the finer-grained instrumentation
+  CLAUDE.md's step 1 describes (response byte counts, time spent waiting on
+  the quota limiter versus Gmail network time, distinguishing "quota
+  cooldown" from "hung request" in the progress display) — `gmail cache`'s
+  batch path currently reports only outer-batch-request and
+  individual-fallback counts. The live-account benchmark itself (step 6's
+  acceptance gate) also remains outstanding for the same reason.
 
 ## Known deviations from the full design (as of this writing)
 

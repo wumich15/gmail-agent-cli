@@ -280,27 +280,33 @@ export class GoogleApiRateLimiter {
  * an unweighted double-cost call plus a ceiling already over budget on its
  * own — is what produced real "Quota exceeded ... Units per minute per
  * user" errors in production. With `threads.get` now correctly weighted,
- * FASTEST=5 (100 units/second, the full published budget) would still have
- * zero headroom for the concurrent-burst rounding `acquire()`'s slot
- * reservation allows, so both constants below stay comfortably under it.
+ * FASTEST=10 (200 units/second) is appropriate for projects that retained
+ * Gmail's legacy, more permissive quota tier. Newer projects can receive the
+ * published 100-units/second limit; those projects are detected by the first
+ * quota-shaped response and immediately back off through `reportQuotaPressure`
+ * instead of failing the entire cache run. The explicit
+ * `GMAIL_AGENT_RATE_LIMIT_RPS` override remains available when a project has
+ * a known custom quota.
  *
  * Google also changed these unit costs and limits on 2026-05-01; a project
  * that was already using the Gmail API before then keeps its older, more
- * permissive quota "for now" (250 units/second with `messages.get` at 5
- * units — roughly 10x more headroom than the numbers above). Since which
- * regime applies to any given account can't be known from inside this
- * process, these defaults target the newer, stricter regime — an account
- * still on the legacy quota has an easy, explicit way to go faster
- * (`GMAIL_AGENT_RATE_LIMIT_RPS`) rather than the reverse (an account on the
- * stricter regime silently exceeding its real budget with no override to
- * make the crash stop). FASTEST_REQUESTS_PER_SECOND is how far a
+ * permissive quota "for now" (the legacy tier is substantially faster than
+ * the new 6,000-units/minute tier). Since which regime applies to any given
+ * account can't be known from inside this process, these defaults allow the
+ * legacy tier to reach 200 units/second while a stricter project feeds back a
+ * quota response and is paced down automatically. `GMAIL_AGENT_RATE_LIMIT_RPS`
+ * remains available when a project has a known custom quota. FASTEST_REQUESTS_PER_SECOND is how far a
  * long-running command (most concretely `gmail cache`'s thousand-plus-
  * message snapshot) is allowed to ramp up to if sustained clean requests
  * suggest the account can sustain it (15% steps every 25 consecutive clean
  * requests), abandoned immediately on the first real quota-shaped failure.
  */
-const START_REQUESTS_PER_SECOND = 3;
-const FASTEST_REQUESTS_PER_SECOND = 4;
+// Start above the old conservative 80-units/second cap, then ramp to
+// 200-units/second (10 messages.get-equivalents/sec) on a clean run. A newer
+// 6,000-units/minute project will feed back a quota response and be paced down
+// automatically; an older project can use its available headroom immediately.
+const START_REQUESTS_PER_SECOND = 5;
+const FASTEST_REQUESTS_PER_SECOND = 10;
 // Effectively unlimited: real production pacing has no place slowing down
 // a test suite that constructs dozens of fake-client calls per test and
 // never talks to a real Gmail API. Vitest sets this env var in every
