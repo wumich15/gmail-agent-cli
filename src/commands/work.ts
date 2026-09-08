@@ -1,3 +1,7 @@
+import { formatBatchDiagnostics, hydrateMessagesBatched } from "../gmail/batch-hydrate.js";
+import { batchHydrationEnabled, configuredBatchSize } from "../gmail/hydration-options.js";
+import { mapWithConcurrency } from "../core/concurrency.js";
+import type { gmail_v1 } from "googleapis";
 import pc from "picocolors";
 import { bootstrap } from "../core/bootstrap.js";
 import { resolveAccountSigningInIfNeeded } from "./shared.js";
@@ -22,18 +26,19 @@ import {
   labelOnlyMutation,
   markImportantOnlyMutation,
   starOnlyMutation,
-  trashMessage
+  trashMutation
 } from "../gmail/executor.js";
 import { getOrCreateLabelId, listUserLabels } from "../gmail/custom-labels.js";
 import { LabelCandidatesRepository } from "../state/repositories/label-candidates.js";
 import { MessagesRepository, type CachedMessageRecord } from "../state/repositories/messages.js";
 import { buildEventInsertPlan, insertIdempotentEvent } from "../calendar/idempotency.js";
-import { withGoogleApiRetry } from "../core/api-retry.js";
-import { listSentThreadIds } from "../gmail/scanner.js";
+import { googleApiRateLimiter } from "../core/api-retry.js";
+import { fetchMessageMinimal, listSentThreadIds } from "../gmail/scanner.js";
 import { contentHash } from "../core/ids.js";
-import type { CachedAssessmentSnapshot, ClassifierProgress } from "../core/orchestrator.js";
+import type { CachedAssessmentSnapshot } from "../core/orchestrator.js";
 import type { PolicyActionIntent } from "../core/policy.js";
 import type { ActionType, PlannedAction, ReasonCode } from "../core/models.js";
+import { createClassifierProgress, createReadProgress } from "./progress.js";
 
 export interface WorkOptions {
   dryRun: boolean;
@@ -75,42 +80,6 @@ export function selectCachedBacklogStubs(
     .map((row) => ({ id: row.gmailMessageId, threadId: row.gmailThreadId }));
 }
 
-function createClassifierProgress(): ClassifierProgress {
-  let total = 0;
-  let lastReported = -1;
-  const draw = (completed: number): void => {
-    const width = 24;
-    const filled = total > 0 ? Math.round((completed / total) * width) : width;
-    const bar = `${"#".repeat(Math.min(width, filled))}${"-".repeat(Math.max(0, width - filled))}`;
-    const line = `Classifier [${bar}] ${completed}/${total}`;
-    if (process.stderr.isTTY) {
-      process.stderr.write(`\r${line}`);
-    } else if (completed === 0 || completed === total || completed - lastReported >= 10) {
-      console.error(line);
-    }
-    lastReported = completed;
-  };
-  return {
-    onStart(nextTotal) {
-      total = nextTotal;
-      lastReported = -1;
-      if (total === 0) {
-        console.error("Classifier: no messages to evaluate.");
-      } else {
-        draw(0);
-      }
-    },
-    onProgress(completed) {
-      draw(completed);
-    },
-    onFinish() {
-      if (process.stderr.isTTY && total > 0) {
-        process.stderr.write("\n");
-      }
-    }
-  };
-}
-
 /** `labelIdByName` must already hold an entry for every label action's name (lowercased) before this is called. */
 function mutationForActions(actions: readonly PolicyActionIntent[], labelIdByName: ReadonlyMap<string, string>) {
   const mutations = actions
@@ -133,7 +102,7 @@ function mutationForActions(actions: readonly PolicyActionIntent[], labelIdByNam
 
 export async function runWork(options: WorkOptions): Promise<number> {
   const ctx = bootstrap();
-  const { account, gmailClient, calendarClient } = await resolveAccountSigningInIfNeeded(ctx);
+  const { account, gmailClient, calendarClient, oauthClient } = await resolveAccountSigningInIfNeeded(ctx);
 
   const { classifier, description, classifierVersion, promptVersion, schemaVersion } = await resolveClassifier({
     accountHash: account.accountHash,
@@ -149,24 +118,27 @@ export async function runWork(options: WorkOptions): Promise<number> {
   lock?.acquire();
 
   ctx.logger.info({ accountHash: account.accountHash, dryRun: options.dryRun }, "work_run_start");
+  const readProgress = createReadProgress({ interactive: !options.json });
+  const unsubscribeQuotaWait = googleApiRateLimiter.subscribeQuotaWait((waitMs) => readProgress.onQuotaWait(waitMs));
 
   try {
+    readProgress.onPhase("preparing");
     const ruleGroups = new RuleGroupsRepository(ctx.db).listEnabled(account.accountHash);
 
     // Reading the label list is safe even in --dry-run (no mutation); it's
     // what lets the classifier prefer reusing an existing label over
     // inventing a near-duplicate. `labelIdByName` seeds label resolution
     // below for any label actions that survive the run's threshold check.
-    const [existingLabels, sentThreadIndex] = await Promise.all([
-      listUserLabels(gmailClient),
-      listSentThreadIds(gmailClient).then(
-        (threadIds) => ({ threadIds, unavailable: false }),
-        () => ({ threadIds: new Set<string>(), unavailable: true })
-      )
-    ]);
-    if (sentThreadIndex.unavailable) {
-      console.error(pc.yellow("Gmail Sent-thread index unavailable; destructive Trash actions will be held for Review."));
-    }
+    const existingLabels = await listUserLabels(gmailClient);
+    let sentIndexPromise: Promise<ReadonlySet<string>> | undefined;
+    const loadSentThreadIds = (): Promise<ReadonlySet<string>> => {
+      if (!sentIndexPromise) {
+        readProgress.onPhase("reconciling");
+        sentIndexPromise = listSentThreadIds(gmailClient, (count) => readProgress.onProgress(count))
+          .finally(() => readProgress.onFinish());
+      }
+      return sentIndexPromise;
+    };
     const labelIdByName = new Map(existingLabels.map((l) => [l.name.trim().toLowerCase(), l.id]));
     // The AI category prompt depends on the current custom-label set, and
     // deterministic decisions depend on the current enabled rule set.
@@ -266,6 +238,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
       cacheEvictionMessageIds
     } = await runWorkScan({
       gmailClient,
+      oauthClient,
       classifier,
       ruleGroups,
       userEmail: account.emailDisplay ?? "",
@@ -281,9 +254,13 @@ export async function runWork(options: WorkOptions): Promise<number> {
       cachePolicyVersion,
       cachedAssessments,
       cachedBacklogStubs,
-      sentThreadIds: sentThreadIndex.threadIds,
-      sentThreadIndexUnavailable: sentThreadIndex.unavailable,
-      progress: createClassifierProgress(),
+      loadSentThreadIds,
+      progress: createClassifierProgress({ interactive: !options.json }),
+      readProgress,
+      onBatchDiagnostics: (batchDiagnostics) => {
+        readProgress.writeMessage(formatBatchDiagnostics(batchDiagnostics));
+        ctx.logger.info({ ...batchDiagnostics }, "work_batch_reads_complete");
+      },
       // Incremental sync against Gmail's history API is the main lever for
       // staying under Gmail's API quota on repeat runs — see
       // CLAUDE.md's "Incremental synchronization". Passing null/omitting
@@ -291,6 +268,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
       historyMarker: account.historyMarker,
       ...(options.limit !== undefined ? { limit: options.limit } : {})
     });
+    readProgress.onFinish();
     // Always goes to stderr for the same reason as the classifier
     // description above: informational, never part of a piped --json summary.
     console.error(
@@ -320,7 +298,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
     console.error(pc.dim(renderExecutiveSummary(summary)));
 
     let runId: string | undefined;
-    let failureCount = 0;
+    let failureCount = summary.failureCount;
 
     if (!options.dryRun) {
       runId = newRunId();
@@ -426,43 +404,49 @@ export async function runWork(options: WorkOptions): Promise<number> {
       // change the user made after the snapshot (e.g. starring a message)
       // is respected rather than overwritten.
       const survivingTrash: string[] = [];
-      for (const messageId of trashTargets) {
-        try {
-          const { data } = await withGoogleApiRetry(
-            () =>
-              gmailClient.users.messages.get(
-                {
-                  userId: "me",
-                  id: messageId,
-                  format: "minimal"
-                },
-                { timeout: 20_000 }
-              ),
-            { maxAttempts: 3, baseDelayMs: 750, maxDelayMs: 10_000 }
-          );
-          const labels = data.labelIds ?? [];
-          if (labels.includes("STARRED") || labels.includes("IMPORTANT")) {
-            markActions(messageId, ["trash"], "skipped_conflict");
-            continue; // user protected it after the snapshot; skip this trash.
-          }
-          survivingTrash.push(messageId);
-        } catch {
+      let checkedTrash = 0;
+      let failedTrashChecks = 0;
+      if (trashTargets.length > 0) readProgress.onPhase("reconciling", trashTargets.length);
+      const recordTrashCheck = (messageId: string, data: gmail_v1.Schema$Message | null): void => {
+        if (data === null) {
           markActions(messageId, ["trash"], "failed_retryable", "precondition_check_failed");
           failureCount += 1;
+          failedTrashChecks += 1;
+        } else {
+          const labels = data.labelIds ?? [];
+          if (labels.includes("STARRED") || labels.includes("IMPORTANT") ||
+            (!labels.includes("INBOX") && !labels.includes("SPAM"))) {
+            markActions(messageId, ["trash"], "skipped_conflict");
+          } else {
+            survivingTrash.push(messageId);
+          }
         }
+        readProgress.onProgress(++checkedTrash, trashTargets.length, failedTrashChecks);
+      };
+      if (batchHydrationEnabled()) {
+        await hydrateMessagesBatched(gmailClient, oauthClient, trashTargets, recordTrashCheck,
+          { initialBatchSize: configuredBatchSize(), format: "minimal" });
+      } else {
+        await mapWithConcurrency(trashTargets, 5, async (messageId) => {
+          let data: gmail_v1.Schema$Message | null;
+          try { data = await fetchMessageMinimal(gmailClient, messageId); }
+          catch { data = null; }
+          recordTrashCheck(messageId, data);
+        });
       }
+      readProgress.onFinish(failedTrashChecks === 0);
 
       const successfullyTrashed = new Set<string>();
-      for (const messageId of survivingTrash) {
-        markActions(messageId, ["trash"], "applying");
-        try {
-          await trashMessage(gmailClient, messageId);
-          markActions(messageId, ["trash"], "applied");
-          successfullyTrashed.add(messageId);
-        } catch {
-          markActions(messageId, ["trash"], "failed_retryable", "gmail_api_error");
-          failureCount += 1;
-        }
+      for (const messageId of survivingTrash) markActions(messageId, ["trash"], "applying");
+      const trashResult = await applyGroupedLabelMutations(gmailClient,
+        survivingTrash.map((messageId) => ({ messageId, mutation: trashMutation() })));
+      for (const messageId of trashResult.succeededMessageIds) {
+        markActions(messageId, ["trash"], "applied");
+        successfullyTrashed.add(messageId);
+      }
+      for (const messageId of trashResult.failedMessageIds) {
+        markActions(messageId, ["trash"], "failed_retryable", "gmail_api_error");
+        failureCount += 1;
       }
 
       for (const { messageId } of labelTargets) {
@@ -659,6 +643,8 @@ export async function runWork(options: WorkOptions): Promise<number> {
     }
     return failureCount > 0 ? EXIT_CODES.operationalFailure : EXIT_CODES.ok;
   } finally {
+    readProgress.onFinish(false);
+    unsubscribeQuotaWait();
     lock?.release();
   }
 }

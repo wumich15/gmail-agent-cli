@@ -10,10 +10,9 @@
  */
 
 export function apiErrorStatus(error: unknown): number | undefined {
-  if (typeof error !== "object" || error === null || !("status" in error)) {
-    return undefined;
-  }
-  const status = (error as { status?: unknown }).status;
+  if (typeof error !== "object" || error === null) return undefined;
+  const candidate = error as { status?: unknown; response?: { status?: unknown } };
+  const status = candidate.status ?? candidate.response?.status;
   return typeof status === "number" ? status : undefined;
 }
 
@@ -33,7 +32,7 @@ const RETRYABLE_NETWORK_ERROR_CODES = new Set([
   "EPIPE"
 ]);
 
-function isRetryableNetworkError(error: unknown): boolean {
+export function isRetryableNetworkError(error: unknown): boolean {
   if (typeof error !== "object" || error === null || !("code" in error)) {
     return false;
   }
@@ -59,13 +58,27 @@ export function isRetryableGoogleQuotaMessage(error: unknown): boolean {
   return /Quota exceeded for quota metric/i.test(message) && /per (second|minute|100 seconds)/i.test(message);
 }
 
+/** Gmail reports transient quota pressure as 403 reasons as well as 429. */
+export function isGoogleQuotaError(error: unknown): boolean {
+  if (apiErrorStatus(error) === 429 || isRetryableGoogleQuotaMessage(error)) return true;
+  if (typeof error !== "object" || error === null) return false;
+  const response = (error as { response?: { data?: unknown } }).response;
+  const data = response?.data ?? error;
+  const body = typeof data === "object" && data !== null
+    ? data as { error?: { message?: string; errors?: { reason?: string }[] }; message?: string; errors?: { reason?: string }[] }
+    : undefined;
+  const reasons = body?.error?.errors ?? body?.errors ?? [];
+  return isRetryableGoogleQuotaMessage(body?.error?.message ?? body?.message) || reasons.some(({ reason }) => reason === "rateLimitExceeded" || reason === "userRateLimitExceeded");
+}
+
 /** Parses RFC 7231 `Retry-After` in either its delta-seconds or HTTP-date form. */
-function retryAfterMs(error: unknown): number | null {
+export function retryAfterMs(error: unknown): number | null {
   const headers = (error as { response?: { headers?: unknown } } | undefined)?.response?.headers;
-  if (!headers || typeof (headers as { get?: unknown }).get !== "function") {
-    return null;
-  }
-  const raw = (headers as { get: (name: string) => string | null }).get("retry-after");
+  if (!headers || typeof headers !== "object") return null;
+  const rawValue = typeof (headers as { get?: unknown }).get === "function"
+    ? (headers as { get: (name: string) => string | null }).get("retry-after")
+    : Object.entries(headers).find(([name]) => name.toLowerCase() === "retry-after")?.[1];
+  const raw = typeof rawValue === "string" || typeof rawValue === "number" ? String(rawValue) : null;
   if (!raw) return null;
   const seconds = Number(raw);
   if (Number.isFinite(seconds) && seconds >= 0) {
@@ -129,7 +142,7 @@ export async function withApiRetry<T>(fn: () => Promise<T>, options: RetryOption
     } catch (error) {
       attempt += 1;
       const status = apiErrorStatus(error);
-      const retryable = isRetryableStatus(status) || isRetryableNetworkError(error) || isRetryableGoogleQuotaMessage(error);
+      const retryable = isRetryableStatus(status) || isRetryableNetworkError(error) || isGoogleQuotaError(error);
       if (!retryable || attempt >= maxAttempts) {
         throw error;
       }
@@ -140,7 +153,7 @@ export async function withApiRetry<T>(fn: () => Promise<T>, options: RetryOption
       // the caller's latency bound. In particular, an erroneous HTTP date
       // hours in the future previously made an otherwise capped retry loop
       // look hung indefinitely.
-      await sleep(retryAfter === null ? exponential + jitter : Math.min(retryAfter, maxDelayMs));
+      await sleep(retryAfter === null ? Math.min(exponential + jitter, maxDelayMs) : Math.min(retryAfter, maxDelayMs));
     }
   }
 }
@@ -162,6 +175,22 @@ export class GoogleApiRateLimiter {
   private readonly ceilingIntervalMs: number;
   private nextRequestAt = 0;
   private consecutiveSuccesses = 0;
+  private cooldownUntil = 0;
+  private queue: Promise<void> = Promise.resolve();
+  private readonly quotaWaitListeners = new Set<(waitMs: number) => void>();
+  private waitMs = 0;
+  private readonly recentAdmissions: { at: number; weight: number }[] = [];
+
+  get quotaCooldownRemainingMs(): number {
+    return Math.max(0, this.cooldownUntil - Date.now());
+  }
+
+  get totalWaitMs(): number { return this.waitMs; }
+
+  subscribeQuotaWait(listener: (waitMs: number) => void): () => void {
+    this.quotaWaitListeners.add(listener);
+    return () => { this.quotaWaitListeners.delete(listener); };
+  }
 
   /**
    * `startRequestsPerSecond` is only where the pacer BEGINS each process —
@@ -177,7 +206,8 @@ export class GoogleApiRateLimiter {
   constructor(
     startRequestsPerSecond: number,
     ceilingIntervalMs = 4000,
-    fastestRequestsPerSecond: number = startRequestsPerSecond
+    fastestRequestsPerSecond: number = startRequestsPerSecond,
+    private readonly minuteBudget: number = Infinity
   ) {
     // Defense-in-depth: the only production instantiation below is already
     // guarded by parsePositiveNumber, but a non-positive rate here would
@@ -217,29 +247,55 @@ export class GoogleApiRateLimiter {
    * pacer reporting a seemingly-safe requests/second figure throughout.
    */
   async acquire(weight = 1): Promise<void> {
+    if (!Number.isFinite(weight) || weight <= 0 || weight > this.minuteBudget) throw new Error("Quota weight must be positive and finite.");
+    const startedAt = Date.now();
+    // Serialize admission, not HTTP work. Queued workers recheck the shared
+    // cooldown and current pace instead of retaining stale pre-error slots.
+    const admission = this.queue.then(async () => {
+      for (;;) {
+        const now = Date.now();
+        while (this.recentAdmissions[0] && this.recentAdmissions[0].at <= now - 60_000) this.recentAdmissions.shift();
+        let used = this.recentAdmissions.reduce((sum, entry) => sum + entry.weight, 0);
+        let budgetAvailableAt = now;
+        for (const entry of this.recentAdmissions) {
+          if (used + weight <= this.minuteBudget + 1e-9) break;
+          budgetAvailableAt = entry.at + 60_000;
+          used -= entry.weight;
+        }
+        const wait = Math.max(this.nextRequestAt, this.cooldownUntil, budgetAvailableAt) - now;
+        if (wait <= 0) break;
+        await sleep(wait);
+      }
+      if (Number.isFinite(this.minuteBudget)) this.recentAdmissions.push({ at: Date.now(), weight });
+      this.nextRequestAt = Date.now() + this.intervalMs * weight;
+      this.waitMs += Date.now() - startedAt;
+    });
+    this.queue = admission.catch(() => {});
+    await admission;
+  }
+
+  reportQuotaPressure(cooldownMs = 0): void {
     const now = Date.now();
-    // Reserve the slot synchronously, before yielding. Multiple callers can
-    // enter acquire() in the same event-loop turn; merely updating a
-    // last-request timestamp after their sleeps lets all of them observe the
-    // same timestamp and wake as one burst. Advancing nextRequestAt here
-    // gives every concurrent caller its own globally-spaced slot.
-    const requestAt = Math.max(now, this.nextRequestAt);
-    this.nextRequestAt = requestAt + this.intervalMs * weight;
-    if (requestAt > now) {
-      await sleep(requestAt - now);
+    // All failures in one in-flight wave share one slowdown. Repeatedly
+    // halving for each worker used to drive an eight-worker pool to a crawl.
+    if (cooldownMs > 0 && this.cooldownUntil > now) return;
+    this.intervalMs = Math.min(this.intervalMs * 2, this.ceilingIntervalMs);
+    this.consecutiveSuccesses = 0;
+    if (cooldownMs > 0) {
+      this.cooldownUntil = now + Math.min(cooldownMs, 60_000);
+      for (const listener of this.quotaWaitListeners) listener(this.quotaCooldownRemainingMs);
     }
   }
 
-  reportQuotaPressure(): void {
-    this.intervalMs = Math.min(this.intervalMs * 2, this.ceilingIntervalMs);
-    this.consecutiveSuccesses = 0;
-  }
-
-  reportSuccess(): void {
-    this.consecutiveSuccesses += 1;
-    if (this.consecutiveSuccesses >= 25 && this.intervalMs > this.fastestIntervalMs) {
-      this.intervalMs = Math.max(this.fastestIntervalMs, this.intervalMs * 0.85);
-      this.consecutiveSuccesses = 0;
+  reportSuccess(weight = 1): void {
+    if (this.quotaCooldownRemainingMs > 0) return;
+    this.consecutiveSuccesses += weight;
+    // Count inner messages, not envelopes: 50 successful reads earn the
+    // same recovery as fifty individual successes (two 25-read steps).
+    const recoverySteps = Math.floor(this.consecutiveSuccesses / 25);
+    if (recoverySteps > 0) {
+      this.intervalMs = Math.max(this.fastestIntervalMs, this.intervalMs * 0.85 ** recoverySteps);
+      this.consecutiveSuccesses %= 25;
     }
   }
 
@@ -260,53 +316,20 @@ export class GoogleApiRateLimiter {
 }
 
 /**
- * Grounded in Gmail API's currently-published per-user quota rather than a
- * guess: Google enforces 6,000 quota units per minute per user per project
- * (https://developers.google.com/workspace/gmail/api/reference/quota),
- * i.e. a 100 units/second sustained average. `messages.get` (20 units) is
- * the baseline this "requests/second" number is calibrated against —
- * `withGoogleApiRetry`'s `weight` parameter scales the pacing interval for
- * calls that cost a different amount, most notably `threads.get` (40
- * units = weight 2) — so these two constants can be read directly as
- * "baseline-equivalent calls per second," not raw HTTP calls per second.
- *
- * **Correcting an earlier version of this comment/these numbers**: a prior
- * pass set FASTEST to 12, i.e. 12 * 20 = 240 real units/second — more than
- * double the 100 units/second cap above — because at the time `threads.get`
- * was priced into the "typical run" assumption but never actually weighted
- * in the pacer itself, so nothing stopped the adaptive recovery climb from
- * quietly blowing past the account's real budget on any run with a lot of
- * trash-bound mail (each triggering a `threads.get`). That combination —
- * an unweighted double-cost call plus a ceiling already over budget on its
- * own — is what produced real "Quota exceeded ... Units per minute per
- * user" errors in production. With `threads.get` now correctly weighted,
- * FASTEST=10 (200 units/second) is appropriate for projects that retained
- * Gmail's legacy, more permissive quota tier. Newer projects can receive the
- * published 100-units/second limit; those projects are detected by the first
- * quota-shaped response and immediately back off through `reportQuotaPressure`
- * instead of failing the entire cache run. The explicit
- * `GMAIL_AGENT_RATE_LIMIT_RPS` override remains available when a project has
- * a known custom quota.
- *
- * Google also changed these unit costs and limits on 2026-05-01; a project
- * that was already using the Gmail API before then keeps its older, more
- * permissive quota "for now" (the legacy tier is substantially faster than
- * the new 6,000-units/minute tier). Since which regime applies to any given
- * account can't be known from inside this process, these defaults allow the
- * legacy tier to reach 200 units/second while a stricter project feeds back a
- * quota response and is paced down automatically. `GMAIL_AGENT_RATE_LIMIT_RPS`
- * remains available when a project has a known custom quota. FASTEST_REQUESTS_PER_SECOND is how far a
- * long-running command (most concretely `gmail cache`'s thousand-plus-
- * message snapshot) is allowed to ramp up to if sustained clean requests
- * suggest the account can sustain it (15% steps every 25 consecutive clean
- * requests), abandoned immediately on the first real quota-shaped failure.
+ * Gmail's current quota is 6,000 units/minute/user/project; messages.get
+ * costs 20, so 300 reads/minute is the theoretical ceiling with zero
+ * headroom. Target 275/minute instead (per explicit product decision):
+ * the rolling weighted budget also charges auxiliary reads (list/history/
+ * labels/profile) and retries against the same minute, so pacing right at
+ * 300 means the very first auxiliary call of a minute already exceeds the
+ * account's real budget. 275 leaves ~500 quota units/minute of headroom for
+ * that traffic without a separate, harder-to-reason-about accounting path.
+ * Legacy/custom projects can explicitly set GMAIL_AGENT_RATE_LIMIT_RPS to
+ * use their verified higher budget.
+ * https://developers.google.com/workspace/gmail/api/reference/quota
  */
-// Start above the old conservative 80-units/second cap, then ramp to
-// 200-units/second (10 messages.get-equivalents/sec) on a clean run. A newer
-// 6,000-units/minute project will feed back a quota response and be paced down
-// automatically; an older project can use its available headroom immediately.
-const START_REQUESTS_PER_SECOND = 5;
-const FASTEST_REQUESTS_PER_SECOND = 10;
+const START_REQUESTS_PER_SECOND = 275 / 60;
+const FASTEST_REQUESTS_PER_SECOND = 275 / 60;
 // Effectively unlimited: real production pacing has no place slowing down
 // a test suite that constructs dozens of fake-client calls per test and
 // never talks to a real Gmail API. Vitest sets this env var in every
@@ -336,7 +359,9 @@ export const googleApiRateLimiter = new GoogleApiRateLimiter(
   4000,
   process.env["VITEST"] !== undefined
     ? TEST_ENV_REQUESTS_PER_SECOND
-    : parsePositiveNumber(process.env["GMAIL_AGENT_RATE_LIMIT_RPS"], FASTEST_REQUESTS_PER_SECOND)
+    : parsePositiveNumber(process.env["GMAIL_AGENT_RATE_LIMIT_RPS"], FASTEST_REQUESTS_PER_SECOND),
+  process.env["VITEST"] !== undefined ? Infinity : Math.max(275,
+    parsePositiveNumber(process.env["GMAIL_AGENT_RATE_LIMIT_RPS"], FASTEST_REQUESTS_PER_SECOND) * 60)
 );
 
 /**
@@ -362,15 +387,16 @@ export async function withGoogleApiRetry<T>(fn: () => Promise<T>, options: Retry
     await googleApiRateLimiter.acquire(weight);
     try {
       const result = await fn();
-      googleApiRateLimiter.reportSuccess();
+      googleApiRateLimiter.reportSuccess(weight);
       return result;
     } catch (error) {
       // 5xx responses remain retryable in withApiRetry, but they indicate a
       // provider outage rather than quota pressure. Slowing every later
       // Gmail call after a transient 500/503 only compounds that outage.
-      if (apiErrorStatus(error) === 429 || isRetryableGoogleQuotaMessage(error)) {
-        googleApiRateLimiter.reportQuotaPressure();
-      } else if (isRetryableNetworkError(error)) {
+      if (isGoogleQuotaError(error)) {
+        const cap = options.maxDelayMs ?? DEFAULT_OPTIONS.maxDelayMs;
+        googleApiRateLimiter.reportQuotaPressure(Math.min(retryAfterMs(error) ?? 10_000, cap));
+      } else {
         googleApiRateLimiter.reportNetworkError();
       }
       throw error;

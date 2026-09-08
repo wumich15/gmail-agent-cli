@@ -1,3 +1,4 @@
+import { runScenarios } from "../helpers/scenarios.js";
 import { describe, expect, it } from "vitest";
 import { buildRunSummary, type MessageOutcome } from "../../src/summary/build-summary.js";
 import { renderHumanSummary } from "../../src/summary/render-human.js";
@@ -20,7 +21,9 @@ function outcome(overrides: Partial<MessageOutcome> & { decision: PolicyDecision
 }
 
 describe("buildRunSummary", () => {
-  it("carries the exact subject/sender for every trashed message, not just a count", () => {
+  it("preserves all 8 scenarios", async () => {
+    await runScenarios([
+      { name: "carries the exact subject/sender for every trashed message, not just a count", run: () => {
     const summary = buildRunSummary(5, [
       outcome({
         subjectForDisplay: "50% off everything!",
@@ -32,9 +35,8 @@ describe("buildRunSummary", () => {
       { subject: "50% off everything!", sender: "deals@shop.example.com", reasonCode: "ai_promotion" }
     ]);
     expect(summary.trashedByReason).toEqual({ ai_promotion: 1 });
-  });
-
-  it("only counts a trashed message against inboxTrashedCount if it actually carried INBOX at snapshot time", () => {
+  } },
+      { name: "only counts a trashed message against inboxTrashedCount if it actually carried INBOX at snapshot time", run: () => {
     // Regression: native-spam messages are never part of the Inbox count
     // to begin with (they come from the separate Spam listing), so
     // trashing them must not be subtracted from the Inbox total.
@@ -50,9 +52,8 @@ describe("buildRunSummary", () => {
     ]);
     expect(summary.trashedByReason).toEqual({ native_spam: 1, ai_promotion: 1 });
     expect(summary.inboxTrashedCount).toBe(1);
-  });
-
-  it("carries details for archive/star/mark_important/calendar_create too", () => {
+  } },
+      { name: "carries details for archive/star/mark_important/calendar_create too", run: () => {
     const summary = buildRunSummary(1, [
       outcome({
         subjectForDisplay: "Dentist appointment",
@@ -89,9 +90,8 @@ describe("buildRunSummary", () => {
     expect(summary.archived).toEqual([
       { subject: "Dentist appointment", sender: "clinic@example.com", reasonCode: "read_non_trash" }
     ]);
-  });
-
-  it("carries every Review item, not a capped sample", () => {
+  } },
+      { name: "carries every Review item, not a capped sample", run: () => {
     const outcomes = Array.from({ length: 8 }, (_, i) =>
       outcome({
         subjectForDisplay: `Subject ${i}`,
@@ -100,9 +100,8 @@ describe("buildRunSummary", () => {
     );
     const summary = buildRunSummary(8, outcomes);
     expect(summary.reviewSamples).toHaveLength(8);
-  });
-
-  it("lists unread messages under recentUnread, capped at 10, most-recent-first order preserved as given", () => {
+  } },
+      { name: "lists unread messages under recentUnread, capped at 10, most-recent-first order preserved as given", run: () => {
     const outcomes = Array.from({ length: 12 }, (_, i) =>
       outcome({
         subjectForDisplay: `Unread ${i}`,
@@ -115,9 +114,8 @@ describe("buildRunSummary", () => {
     expect(summary.recentUnread).toHaveLength(10);
     expect(summary.recentUnread[0]!.subject).toBe("Unread 0");
     expect(summary.recentUnread[9]!.subject).toBe("Unread 9");
-  });
-
-  it("does not list a read message under recentUnread", () => {
+  } },
+      { name: "does not list a read message under recentUnread", run: () => {
     const summary = buildRunSummary(1, [
       outcome({
         subjectForDisplay: "Read message",
@@ -126,9 +124,8 @@ describe("buildRunSummary", () => {
       })
     ]);
     expect(summary.recentUnread).toEqual([]);
-  });
-
-  it("lists a message with no action and no review flag under unchanged, uncapped", () => {
+  } },
+      { name: "lists a message with no action and no review flag under unchanged, uncapped", run: () => {
     const outcomes = Array.from({ length: 15 }, (_, i) =>
       outcome({
         subjectForDisplay: `Unchanged ${i}`,
@@ -137,9 +134,8 @@ describe("buildRunSummary", () => {
     );
     const summary = buildRunSummary(15, outcomes);
     expect(summary.unchanged).toHaveLength(15);
-  });
-
-  it("does not double-list a message under unchanged when it has an action or needs review", () => {
+  } },
+      { name: "does not double-list a message under unchanged when it has an action or needs review", run: () => {
     const summary = buildRunSummary(2, [
       outcome({
         subjectForDisplay: "Archived",
@@ -151,11 +147,15 @@ describe("buildRunSummary", () => {
       })
     ]);
     expect(summary.unchanged).toEqual([]);
+  } }
+    ]);
   });
 });
 
 describe("renderHumanSummary", () => {
-  it("prints the exact subject line for a trashed message", () => {
+  it("preserves all 2 scenarios", async () => {
+    await runScenarios([
+      { name: "prints the exact subject line for a trashed message", run: () => {
     const summary = buildRunSummary(1, [
       outcome({
         subjectForDisplay: "Win a free prize now",
@@ -166,9 +166,8 @@ describe("renderHumanSummary", () => {
     const text = renderHumanSummary(summary, { dryRun: true });
     expect(text).toContain("Win a free prize now");
     expect(text).toContain("spam@example.com");
-  });
-
-  it("computes 'Inbox: X before -> Y after' correctly when native-spam messages are trashed alongside Inbox activity", () => {
+  } },
+      { name: "computes 'Inbox: X before -> Y after' correctly when native-spam messages are trashed alongside Inbox activity", run: () => {
     // Regression: native-spam trashes (never part of the Inbox count) used
     // to be subtracted from inboxCountBefore anyway, understating "after."
     const outcomes = [
@@ -192,5 +191,7 @@ describe("renderHumanSummary", () => {
     const summary = buildRunSummary(100, outcomes);
     const text = renderHumanSummary(summary, { dryRun: false });
     expect(text).toContain("Inbox: 100 before -> 90 after");
+  } }
+    ]);
   });
 });

@@ -1,3 +1,4 @@
+import { runScenarios } from "../helpers/scenarios.js";
 import { describe, expect, it } from "vitest";
 import {
   canonicalJsonStringify,
@@ -8,7 +9,9 @@ import {
 } from "../../src/core/ids.js";
 
 describe("deterministicCalendarEventId", () => {
-  it("is stable for identical inputs", () => {
+  it("preserves all 3 scenarios", async () => {
+    await runScenarios([
+      { name: "is stable for identical inputs", run: () => {
     const a = deterministicCalendarEventId({
       accountHash: "acct1",
       gmailMessageId: "msg1",
@@ -20,9 +23,8 @@ describe("deterministicCalendarEventId", () => {
       candidateIndex: 0
     });
     expect(a).toBe(b);
-  });
-
-  it("differs for different messages", () => {
+  } },
+      { name: "differs for different messages", run: () => {
     const a = deterministicCalendarEventId({
       accountHash: "acct1",
       gmailMessageId: "msg1",
@@ -34,25 +36,27 @@ describe("deterministicCalendarEventId", () => {
       candidateIndex: 0
     });
     expect(a).not.toBe(b);
-  });
-
-  it("only uses characters Google Calendar accepts for event IDs", () => {
+  } },
+      { name: "only uses characters Google Calendar accepts for event IDs", run: () => {
     const id = deterministicCalendarEventId({
       accountHash: "acct1",
       gmailMessageId: "msg1",
       candidateIndex: 0
     });
     expect(id).toMatch(/^[a-v0-9]{5,1024}$/);
+  } }
+    ]);
   });
 });
 
 describe("deterministicActionKey", () => {
-  it("is stable across calls with the same logical action", () => {
+  it("preserves all 2 scenarios", async () => {
+    await runScenarios([
+      { name: "is stable across calls with the same logical action", run: () => {
     const args = { accountHash: "a", type: "trash", target: "msg1", payloadHash: "h" };
     expect(deterministicActionKey(args)).toBe(deterministicActionKey({ ...args }));
-  });
-
-  it("differs when the target differs", () => {
+  } },
+      { name: "differs when the target differs", run: () => {
     const key1 = deterministicActionKey({
       accountHash: "a",
       type: "trash",
@@ -66,23 +70,27 @@ describe("deterministicActionKey", () => {
       payloadHash: "h"
     });
     expect(key1).not.toBe(key2);
+  } }
+    ]);
   });
 });
 
 describe("canonicalJsonStringify / payloadHash", () => {
-  it("produces the same hash regardless of object key order", () => {
+  it("preserves all 3 scenarios", async () => {
+    await runScenarios([
+      { name: "produces the same hash regardless of object key order", run: () => {
     const a = { reasonCode: "x", event: { title: "T", confidence: 0.9 } };
     const b = { event: { confidence: 0.9, title: "T" }, reasonCode: "x" };
     expect(canonicalJsonStringify(a)).toBe(canonicalJsonStringify(b));
     expect(payloadHash(a)).toBe(payloadHash(b));
-  });
-
-  it("preserves array order (arrays are ordered data, not sorted)", () => {
+  } },
+      { name: "preserves array order (arrays are ordered data, not sorted)", run: () => {
     expect(canonicalJsonStringify([3, 1, 2])).toBe("[3,1,2]");
-  });
-
-  it("still distinguishes genuinely different payloads", () => {
+  } },
+      { name: "still distinguishes genuinely different payloads", run: () => {
     expect(payloadHash({ a: 1 })).not.toBe(payloadHash({ a: 2 }));
+  } }
+    ]);
   });
 });
 

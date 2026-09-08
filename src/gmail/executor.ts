@@ -2,7 +2,7 @@ import type { GmailClient } from "./client.js";
 import { GMAIL_LABELS } from "./labels.js";
 import { withGoogleApiRetry } from "../core/api-retry.js";
 
-const BATCH_MODIFY_MAX_IDS = 1000;
+const BATCH_MODIFY_MAX_IDS = 50;
 const GMAIL_MUTATION_REQUEST_OPTIONS = { timeout: 20_000 } as const;
 const GMAIL_MUTATION_RETRY_OPTIONS = { maxAttempts: 2, baseDelayMs: 750, maxDelayMs: 5_000 } as const;
 
@@ -26,7 +26,7 @@ export interface GroupedMutationResult {
 
 /**
  * Groups message IDs by their exact validated label mutation and issues
- * batchModify calls of at most 1,000 IDs each. Callers must not assume
+ * batchModify calls of at most 50 IDs each. Callers must not assume
  * batches execute in order or save quota units. A chunk that fails does
  * not stop the remaining chunks/groups — each is independent, matching
  * the design's "continue independent actions after an isolated failure"
@@ -110,6 +110,11 @@ export async function untrashMessage(
       0.25
     );
   }
+}
+
+/** Reversible bulk cleanup; batchDelete would permanently remove messages. */
+export function trashMutation(): LabelMutation {
+  return { addLabelIds: [GMAIL_LABELS.trash], removeLabelIds: [GMAIL_LABELS.inbox, GMAIL_LABELS.spam] };
 }
 
 export function archiveMutation(): LabelMutation {

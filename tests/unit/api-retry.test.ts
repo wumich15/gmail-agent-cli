@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   apiErrorStatus,
+  isGoogleQuotaError,
   googleApiRateLimiter,
   GoogleApiRateLimiter,
   withApiRetry,
@@ -293,5 +294,49 @@ describe("withGoogleApiRetry", () => {
     } finally {
       quotaPressure.mockRestore();
     }
+  });
+});
+
+
+describe("shared quota recovery", () => {
+  it("recognizes 403 rate-limit reasons without retrying permission failures", () => {
+    expect(isGoogleQuotaError({ status: 403, response: { data: { error: { errors: [{ reason: "userRateLimitExceeded" }] } } } })).toBe(true);
+    expect(isGoogleQuotaError({ status: 403, response: { data: { error: { errors: [{ reason: "forbidden" }] } } } })).toBe(false);
+  });
+
+  it("slows once for concurrent failures and holds already queued requests for the shared cooldown", async () => {
+    vi.useFakeTimers();
+    try {
+      const limiter = new GoogleApiRateLimiter(10);
+      await limiter.acquire();
+      const admitted = vi.fn();
+      const queued = limiter.acquire().then(admitted);
+      limiter.reportQuotaPressure(1000);
+      limiter.reportQuotaPressure(1000);
+      expect(limiter.currentRequestsPerSecond).toBe(5);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(admitted).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await queued;
+      expect(admitted).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("counts every inner read against the rolling minute budget", async () => {
+    vi.useFakeTimers();
+    try {
+      const limiter = new GoogleApiRateLimiter(1000, 4000, 1000, 100);
+      await limiter.acquire(50);
+      const second = limiter.acquire(50);
+      await vi.advanceTimersByTimeAsync(50);
+      await second;
+      const admitted = vi.fn();
+      const third = limiter.acquire(50).then(admitted);
+      await vi.advanceTimersByTimeAsync(59_949);
+      expect(admitted).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await third;
+      expect(admitted).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
   });
 });

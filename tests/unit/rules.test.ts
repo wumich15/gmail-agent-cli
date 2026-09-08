@@ -1,3 +1,4 @@
+import { runScenarios } from "../helpers/scenarios.js";
 import { describe, expect, it } from "vitest";
 import { evaluateMatcher, evaluateRuleGroup } from "../../src/rules/matcher.js";
 import {
@@ -26,25 +27,25 @@ function message(overrides: Partial<Parameters<typeof buildNormalizedMessage>[0]
 }
 
 describe("evaluateMatcher", () => {
-  it("matches an exact normalized from_address", () => {
+  it("preserves all 5 scenarios", async () => {
+    await runScenarios([
+      { name: "matches an exact normalized from_address", run: () => {
     const m = message();
     const result = evaluateMatcher(
       { kind: "from_address", normalizedValue: "news@list.example.com", authBinding: null },
       m
     );
     expect(result).toBe("matched");
-  });
-
-  it("does not match a different address", () => {
+  } },
+      { name: "does not match a different address", run: () => {
     const m = message();
     const result = evaluateMatcher(
       { kind: "from_address", normalizedValue: "other@example.com", authBinding: null },
       m
     );
     expect(result).toBe("no_match");
-  });
-
-  it("matches list_id from the bracketed value", () => {
+  } },
+      { name: "matches list_id from the bracketed value", run: () => {
     const m = message({
       headers: headerMapFromList([
         { name: "From", value: "news@list.example.com" },
@@ -56,9 +57,8 @@ describe("evaluateMatcher", () => {
       m
     );
     expect(result).toBe("matched");
-  });
-
-  it("reports auth_failed for a bound important matcher with no passing aligned auth", () => {
+  } },
+      { name: "reports auth_failed for a bound important matcher with no passing aligned auth", run: () => {
     const m = message();
     const result = evaluateMatcher(
       {
@@ -69,9 +69,8 @@ describe("evaluateMatcher", () => {
       m
     );
     expect(result).toBe("auth_failed");
-  });
-
-  it("matches a bound important matcher when DKIM passes for the aligned domain", () => {
+  } },
+      { name: "matches a bound important matcher when DKIM passes for the aligned domain", run: () => {
     const m = message({
       headers: headerMapFromList([
         { name: "From", value: "news@list.example.com" },
@@ -90,11 +89,15 @@ describe("evaluateMatcher", () => {
       m
     );
     expect(result).toBe("matched");
+  } }
+    ]);
   });
 });
 
 describe("evaluateRuleGroup", () => {
-  it("matches if any matcher in the group matches (OR semantics)", () => {
+  it("preserves all 2 scenarios", async () => {
+    await runScenarios([
+      { name: "matches if any matcher in the group matches (OR semantics)", run: () => {
     const group: RuleGroup = {
       id: "r1",
       accountHash: "a",
@@ -109,9 +112,8 @@ describe("evaluateRuleGroup", () => {
       updatedAt: ""
     };
     expect(evaluateRuleGroup(group, message())).toBe("matched");
-  });
-
-  it("ignores disabled rule groups", () => {
+  } },
+      { name: "ignores disabled rule groups", run: () => {
     const group: RuleGroup = {
       id: "r1",
       accountHash: "a",
@@ -123,11 +125,15 @@ describe("evaluateRuleGroup", () => {
       updatedAt: ""
     };
     expect(evaluateRuleGroup(group, message())).toBe("no_match");
+  } }
+    ]);
   });
 });
 
 describe("groupBySubscriptionIdentity and proposeMatcher", () => {
-  it("prefers List-ID as identity when present", () => {
+  it("preserves all 2 scenarios", async () => {
+    await runScenarios([
+      { name: "prefers List-ID as identity when present", run: () => {
     const m = message({
       headers: headerMapFromList([
         { name: "From", value: "news@list.example.com" },
@@ -141,9 +147,8 @@ describe("groupBySubscriptionIdentity and proposeMatcher", () => {
       normalizedValue: "newsletter.list.example.com",
       authBinding: null
     });
-  });
-
-  it("falls back to sender address when there is no List-ID", () => {
+  } },
+      { name: "falls back to sender address when there is no List-ID", run: () => {
     const [identity] = groupBySubscriptionIdentity([message()]);
     expect(identity!.listId).toBeNull();
     expect(proposeMatcher(identity!)).toEqual({
@@ -151,11 +156,15 @@ describe("groupBySubscriptionIdentity and proposeMatcher", () => {
       normalizedValue: "news@list.example.com",
       authBinding: null
     });
+  } }
+    ]);
   });
 });
 
 describe("findConflictingRuleGroup", () => {
-  it("rejects a spam rule that overlaps an existing important rule", () => {
+  it("preserves all 2 scenarios", async () => {
+    await runScenarios([
+      { name: "rejects a spam rule that overlaps an existing important rule", run: () => {
     const important: RuleGroup = {
       id: "r1",
       accountHash: "a",
@@ -172,14 +181,15 @@ describe("findConflictingRuleGroup", () => {
       [{ kind: "from_address", normalizedValue: "boss@example.com", authBinding: null }]
     );
     expect(conflict).toBe(important);
-  });
-
-  it("returns null when there is no overlap", () => {
+  } },
+      { name: "returns null when there is no overlap", run: () => {
     const conflict = findConflictingRuleGroup(
       [],
       "spam",
       [{ kind: "from_address", normalizedValue: "boss@example.com", authBinding: null }]
     );
     expect(conflict).toBeNull();
+  } }
+    ]);
   });
 });

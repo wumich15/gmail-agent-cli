@@ -1,3 +1,4 @@
+import { runScenarios } from "../helpers/scenarios.js";
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_POLICY_THRESHOLDS,
@@ -49,47 +50,43 @@ function assessment(overrides: Partial<EmailAssessment> = {}): EmailAssessment {
 }
 
 describe("evaluateMessagePolicy", () => {
-  it("trashes an explicit spam rule match with no other actions", () => {
+  it("preserves all 24 scenarios", async () => {
+    await runScenarios([
+      { name: "trashes an explicit spam rule match with no other actions", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({ explicitRule: { action: "spam", ruleGroupId: "g1" } })
     );
     expect(decision.actions).toEqual([{ type: "trash", reasonCode: "explicit_spam_rule" }]);
-  });
-
-  it("never trashes a protected message even with an explicit spam rule", () => {
+  } },
+      { name: "never trashes a protected message even with an explicit spam rule", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({ isProtected: true, explicitRule: { action: "spam", ruleGroupId: "g1" } })
     );
     expect(decision.actions.some((a) => a.type === "trash")).toBe(false);
     expect(decision.needsReview).toBe(true);
-  });
-
-  it("trashes unprotected native spam without needing an assessment", () => {
+  } },
+      { name: "trashes unprotected native spam without needing an assessment", run: () => {
     const decision = evaluateMessagePolicy(baseInput({ isNativeSpam: true }));
     expect(decision.actions).toEqual([{ type: "trash", reasonCode: "native_spam" }]);
-  });
-
-  it("never trashes protected native spam", () => {
+  } },
+      { name: "never trashes protected native spam", run: () => {
     const decision = evaluateMessagePolicy(baseInput({ isNativeSpam: true, isProtected: true }));
     expect(decision.actions.some((a) => a.type === "trash")).toBe(false);
     expect(decision.needsReview).toBe(true);
-  });
-
-  it("trashes a high-confidence AI promotion", () => {
+  } },
+      { name: "trashes a high-confidence AI promotion", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({ assessment: assessment({ kind: "promotion", confidence: 0.98 }) })
     );
     expect(decision.actions).toEqual([{ type: "trash", reasonCode: "ai_promotion" }]);
-  });
-
-  it("does not trash a promotion below the confidence threshold", () => {
+  } },
+      { name: "does not trash a promotion below the confidence threshold", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({ assessment: assessment({ kind: "promotion", confidence: 0.8 }) })
     );
     expect(decision.actions.some((a) => a.type === "trash")).toBe(false);
-  });
-
-  it("vetoes AI-derived trash when an authenticated high-risk signal is present", () => {
+  } },
+      { name: "vetoes AI-derived trash when an authenticated high-risk signal is present", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({
         hasAuthenticatedHighRiskSignal: true,
@@ -98,15 +95,13 @@ describe("evaluateMessagePolicy", () => {
     );
     expect(decision.actions.some((a) => a.type === "trash")).toBe(false);
     expect(decision.reviewReason).toBe("authenticated_high_risk_veto");
-  });
-
-  it("produces no AI-derived mutation when the assessment is unavailable, but still archives if read", () => {
+  } },
+      { name: "produces no AI-derived mutation when the assessment is unavailable, but still archives if read", run: () => {
     const decision = evaluateMessagePolicy(baseInput({ assessmentUnavailable: true }));
     expect(decision.actions).toEqual([{ type: "archive", reasonCode: "read_non_trash" }]);
     expect(decision.needsReview).toBe(true);
-  });
-
-  it("stars and marks important on qualifying importance scores", () => {
+  } },
+      { name: "stars and marks important on qualifying importance scores", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({
         assessment: assessment({
@@ -125,9 +120,8 @@ describe("evaluateMessagePolicy", () => {
       type: "mark_important",
       reasonCode: "ai_importance_personal_important"
     });
-  });
-
-  it("an explicit important rule stars regardless of AI availability", () => {
+  } },
+      { name: "an explicit important rule stars regardless of AI availability", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({ explicitRule: { action: "important", ruleGroupId: "g1" } })
     );
@@ -139,9 +133,8 @@ describe("evaluateMessagePolicy", () => {
       type: "mark_important",
       reasonCode: "explicit_important_rule"
     });
-  });
-
-  it("creates a calendar event on a high-confidence create intent", () => {
+  } },
+      { name: "creates a calendar event on a high-confidence create intent", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({
         assessment: assessment({
@@ -161,19 +154,16 @@ describe("evaluateMessagePolicy", () => {
       })
     );
     expect(decision.actions.some((a) => a.type === "calendar_create")).toBe(true);
-  });
-
-  it("archives every read non-trash inbox message", () => {
+  } },
+      { name: "archives every read non-trash inbox message", run: () => {
     const decision = evaluateMessagePolicy(baseInput({ isRead: true, isInInbox: true }));
     expect(decision.actions).toContainEqual({ type: "archive", reasonCode: "read_non_trash" });
-  });
-
-  it("does not archive an unread message", () => {
+  } },
+      { name: "does not archive an unread message", run: () => {
     const decision = evaluateMessagePolicy(baseInput({ isRead: false }));
     expect(decision.actions.some((a) => a.type === "archive")).toBe(false);
-  });
-
-  it("never combines trash with any other action (invariant)", () => {
+  } },
+      { name: "never combines trash with any other action (invariant)", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({
         isNativeSpam: true,
@@ -187,9 +177,8 @@ describe("evaluateMessagePolicy", () => {
     if (decision.actions.some((a) => a.type === "trash")) {
       expect(decision.actions).toHaveLength(1);
     }
-  });
-
-  it("suspicious/unknown kinds never produce an AI-derived mutation", () => {
+  } },
+      { name: "suspicious/unknown kinds never produce an AI-derived mutation", run: () => {
     for (const kind of ["suspicious", "unknown"] as const) {
       const decision = evaluateMessagePolicy(
         baseInput({
@@ -204,9 +193,8 @@ describe("evaluateMessagePolicy", () => {
       expect(decision.actions).toEqual([]);
       expect(decision.needsReview).toBe(true);
     }
-  });
-
-  it("still creates a calendar event for a protected (already-Important) message (regression: protection must bypass importance classification, not event extraction)", () => {
+  } },
+      { name: "still creates a calendar event for a protected (already-Important) message (regression: protection must bypass importance classification, not event extraction)", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({
         isProtected: true,
@@ -228,9 +216,8 @@ describe("evaluateMessagePolicy", () => {
       })
     );
     expect(decision.actions.some((a) => a.type === "calendar_create")).toBe(true);
-  });
-
-  it("still labels a protected message when the assessment carries a category", () => {
+  } },
+      { name: "still labels a protected message when the assessment carries a category", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({
         isProtected: true,
@@ -242,16 +229,14 @@ describe("evaluateMessagePolicy", () => {
       reasonCode: "ai_category:Receipts",
       labelName: "Receipts"
     });
-  });
-
-  it("never trashes a protected message via AI assessment alone, even at high promotion confidence", () => {
+  } },
+      { name: "never trashes a protected message via AI assessment alone, even at high promotion confidence", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({ isProtected: true, assessment: assessment({ kind: "promotion", confidence: 0.99 }) })
     );
     expect(decision.actions.some((a) => a.type === "trash")).toBe(false);
-  });
-
-  it("does not double-star a protected message via AI importance (the explicit rule or existing label already covers it)", () => {
+  } },
+      { name: "does not double-star a protected message via AI importance (the explicit rule or existing label already covers it)", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({
         isProtected: true,
@@ -264,9 +249,8 @@ describe("evaluateMessagePolicy", () => {
       })
     );
     expect(decision.actions.some((a) => a.type === "star")).toBe(false);
-  });
-
-  it("proposes a label action when the assessment carries a category", () => {
+  } },
+      { name: "proposes a label action when the assessment carries a category", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({ assessment: assessment({ kind: "personal_routine", confidence: 0, category: "Shopping" }) })
     );
@@ -275,28 +259,24 @@ describe("evaluateMessagePolicy", () => {
       reasonCode: "ai_category:Shopping",
       labelName: "Shopping"
     });
-  });
-
-  it("does not propose a label action when category is null", () => {
+  } },
+      { name: "does not propose a label action when category is null", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({ assessment: assessment({ kind: "personal_routine", confidence: 0, category: null }) })
     );
     expect(decision.actions.some((a) => a.type === "label")).toBe(false);
-  });
-
-  it("never labels a suspicious/unknown message even if category is somehow set", () => {
+  } },
+      { name: "never labels a suspicious/unknown message even if category is somehow set", run: () => {
     const decision = evaluateMessagePolicy(
       baseInput({ isRead: false, assessment: assessment({ kind: "suspicious", category: "Shopping" }) })
     );
     expect(decision.actions.some((a) => a.type === "label")).toBe(false);
-  });
-
-  it("never labels a message that gets trashed (mutual exclusivity)", () => {
+  } },
+      { name: "never labels a message that gets trashed (mutual exclusivity)", run: () => {
     const decision = evaluateMessagePolicy(baseInput({ isNativeSpam: true }));
     expect(decision.actions.some((a) => a.type === "label")).toBe(false);
-  });
-
-  it("uses the product-decided default thresholds (uniform 0.90)", () => {
+  } },
+      { name: "uses the product-decided default thresholds (uniform 0.90)", run: () => {
     expect(DEFAULT_POLICY_THRESHOLDS).toEqual({
       autoTrashPromotionConfidence: 0.9,
       autoTrashAutomatedLowValueConfidence: 0.9,
@@ -304,5 +284,7 @@ describe("evaluateMessagePolicy", () => {
       autoStarImportanceConfidence: 0.9,
       autoCreateEventConfidence: 0.9
     });
+  } }
+    ]);
   });
 });

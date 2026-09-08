@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { resolvePostScanHistoryMarker, runWorkScan, type CachedAssessmentSnapshot } from "../../src/core/orchestrator.js";
 import { SystemClock } from "../../src/core/clock.js";
 import { buildNormalizedMessage, headerMapFromList } from "../../src/gmail/normalize.js";
@@ -1114,44 +1114,38 @@ describe("runWorkScan", () => {
 });
 
 describe("resolvePostScanHistoryMarker", () => {
-  it("returns the reconciled endHistoryId when the post-scan history.list call succeeds", async () => {
-    const client = {
-      users: { history: { list: async () => ({ data: { history: [], historyId: "200" } }) } }
-    } as unknown as GmailClient;
-    expect(await resolvePostScanHistoryMarker(client, "100")).toBe("200");
-  });
-
-  it("falls back to the fence historyId when history.list reports an expired marker", async () => {
-    const client = {
-      users: {
-        history: {
-          list: async () => {
-            throw Object.assign(new Error("not found"), { status: 404 });
-          }
-        }
-      }
-    } as unknown as GmailClient;
+  it("keeps the original fence without an extra API call so concurrent arrivals remain discoverable", async () => {
+    const list = vi.fn(async () => ({ data: { historyId: "200", history: [{
+      id: "150", messagesAdded: [{ message: { id: "arrived-during-scan", threadId: "new-thread" } }]
+    }] } }));
+    const client = { users: { history: { list } } } as unknown as GmailClient;
     expect(await resolvePostScanHistoryMarker(client, "100")).toBe("100");
+    expect(list).not.toHaveBeenCalled();
+  });
+});
+
+describe("read failure recovery", () => {
+  it("finishes independent reads and preserves an incremental marker after one failed message", async () => {
+    const client = fakeClient([{ id: "good", threadId: "t-good", labelIds: ["SPAM"], headers: [] }]);
+    client.users.history.list = vi.fn(async () => ({ data: { historyId: "200", history: [{
+      id: "150", messagesAdded: [
+        { message: { id: "missing", threadId: "t-missing" } },
+        { message: { id: "good", threadId: "t-good" } }
+      ]
+    }] } })) as unknown as typeof client.users.history.list;
+    const progress = { onPhase: vi.fn(), onProgress: vi.fn(), onFinish: vi.fn() };
+    const result = await runWorkScan(baseDeps({ gmailClient: client, historyMarker: "100", readProgress: progress }));
+    expect(result.summary.failureCount).toBe(1);
+    expect(result.newHistoryMarker).toBe("100");
+    expect(result.outcomes).toHaveLength(2);
+    expect(result.messageCacheUpdates).toHaveLength(1);
+    expect(result.diagnostics.messagesFailed).toBe(1);
+    expect(progress.onProgress).toHaveBeenLastCalledWith(2, 2, 1);
   });
 
-  it("falls back to the fence historyId, without throwing, when the reconciliation call fails outright", async () => {
-    // Regression: a full `gmail cache`/full-scan run of thousands of
-    // messages could exhaust Gmail's per-minute quota right as it reached
-    // this one last call — letting that exception propagate crashed the
-    // whole command AFTER already paying for the entire expensive
-    // traversal, discarding all of it (no history marker was ever
-    // persisted, so the next run paid the same full cost again). A 400
-    // (non-retryable, so this stays fast) stands in for any failure mode
-    // here — the fallback must not depend on which error it was.
-    const client = {
-      users: {
-        history: {
-          list: async () => {
-            throw Object.assign(new Error("bad request"), { status: 400 });
-          }
-        }
-      }
-    } as unknown as GmailClient;
-    await expect(resolvePostScanHistoryMarker(client, "100")).resolves.toBe("100");
+  it("does not load the Sent index when nothing is a trash candidate", async () => {
+    const loadSentThreadIds = vi.fn(async () => new Set<string>());
+    await runWorkScan(baseDeps({ loadSentThreadIds }));
+    expect(loadSentThreadIds).not.toHaveBeenCalled();
   });
 });

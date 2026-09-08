@@ -1,3 +1,7 @@
+import type { OAuth2Client } from "google-auth-library";
+import type { gmail_v1 } from "googleapis";
+import { hydrateMessagesBatched, type BatchHydrationDiagnostics } from "../gmail/batch-hydrate.js";
+import { batchHydrationEnabled, configuredBatchSize } from "../gmail/hydration-options.js";
 import type { Classifier } from "../ai/classifier.js";
 import type { GmailClient } from "../gmail/client.js";
 import {
@@ -34,6 +38,7 @@ import type { Clock } from "./clock.js";
 
 export interface OrchestratorDeps {
   gmailClient: GmailClient;
+  oauthClient?: OAuth2Client;
   classifier: Classifier;
   ruleGroups: readonly RuleGroup[];
   userEmail: string;
@@ -143,10 +148,19 @@ export interface OrchestratorDeps {
    * issuing a 40-unit `threads.get` for every Trash candidate.
    */
   sentThreadIds?: ReadonlySet<string>;
+  loadSentThreadIds?: () => Promise<ReadonlySet<string>>;
   /** True when the Sent index could not be built; Trash must be held for review. */
   sentThreadIndexUnavailable?: boolean;
   /** Optional progress sink used by the CLI; omitted by library/test callers. */
   progress?: ClassifierProgress;
+  readProgress?: ReadProgress;
+  onBatchDiagnostics?: (diagnostics: BatchHydrationDiagnostics) => void;
+}
+
+export interface ReadProgress {
+  onPhase(phase: "preparing" | "discovering" | "hydrating" | "reconciling", total?: number): void;
+  onProgress(completed: number, total?: number, failed?: number): void;
+  onFinish(success?: boolean): void;
 }
 
 export interface ClassifierProgress {
@@ -248,6 +262,7 @@ export interface ScanDiagnostics {
   policyMs: number;
   inboxCountMs: number;
   messagesFetched: number;
+  messagesFailed: number;
   classifierCalls: number;
   assessmentCacheHits: number;
   threadChecks: number;
@@ -266,6 +281,7 @@ function emptyScanDiagnostics(): ScanDiagnostics {
     policyMs: 0,
     inboxCountMs: 0,
     messagesFetched: 0,
+    messagesFailed: 0,
     classifierCalls: 0,
     assessmentCacheHits: 0,
     threadChecks: 0,
@@ -296,9 +312,11 @@ export function dedupeStubs(stubs: readonly MessageStub[]): MessageStub[] {
 export async function runWorkScan(deps: OrchestratorDeps): Promise<WorkScanResult> {
   const totalStartedAt = performance.now();
   const diagnostics = emptyScanDiagnostics();
+  deps.readProgress?.onPhase("discovering");
   if (deps.historyMarker) {
     const historyStartedAt = performance.now();
-    const history = await listHistorySince(deps.gmailClient, deps.historyMarker);
+    const history = await listHistorySince(deps.gmailClient, deps.historyMarker,
+      (count) => deps.readProgress?.onProgress(count));
     diagnostics.historyMs = performance.now() - historyStartedAt;
     if (!history.expiredMarker) {
       // A valid incremental run already has the signed-in address from the
@@ -331,20 +349,46 @@ async function fetchAndNormalizeAll(
   stubs: readonly MessageStub[],
   deps: OrchestratorDeps,
   userEmail: string
-): Promise<PreprocessedMessage[]> {
-  // A worker pool avoids fixed-batch head-of-line blocking: as soon as one
-  // Gmail fetch finishes its slot starts the next message, even if another
-  // request from the original group is slow or retrying.
-  const preprocessed = await mapWithConcurrency(stubs, deps.concurrency.gmailReads, (stub) =>
-    fetchAndNormalize(stub, deps, userEmail)
-  );
-  // Most recent first: Gmail's own list/history order is not a documented,
-  // guaranteed contract, and this is what actually determines both
-  // classification priority (under concurrency, earlier array entries get
-  // picked up first) and the "most recent unread" summary section below —
-  // so it's made explicit here rather than assumed from the API response.
-  preprocessed.sort((a, b) => Number(b.normalized.internalDate) - Number(a.normalized.internalDate));
-  return preprocessed;
+): Promise<{ messages: PreprocessedMessage[]; failed: MessageOutcome[] }> {
+  const messages: PreprocessedMessage[] = [];
+  const failed: MessageOutcome[] = [];
+  let completed = 0;
+  deps.readProgress?.onPhase("hydrating", stubs.length);
+  const record = (stub: MessageStub, raw: gmail_v1.Schema$Message | null): void => {
+    try {
+      if (raw === null) throw new Error("Message read failed.");
+      messages.push(normalizeFetchedMessage(stub, deps, userEmail, raw));
+    } catch {
+      failed.push({
+        gmailMessageId: stub.id, gmailThreadId: stub.threadId,
+        subjectForDisplay: "Message could not be read", senderForDisplay: "",
+        decision: { actions: [], needsReview: true, reviewReason: "gmail_read_failed" },
+        bypassReason: null, labelIdsAtSnapshot: [], validatedEvent: null,
+        classifierVersion: null, internalDate: "0", isUnread: false
+      });
+    }
+    deps.readProgress?.onProgress(++completed, stubs.length, failed.length);
+  };
+  try {
+    if (deps.oauthClient && batchHydrationEnabled()) {
+      const byId = new Map(stubs.map((stub) => [stub.id, stub]));
+      const batchDiagnostics = await hydrateMessagesBatched(deps.gmailClient, deps.oauthClient, [...byId.keys()],
+        (id, raw) => record(byId.get(id)!, raw), { initialBatchSize: configuredBatchSize() });
+      deps.readProgress?.onFinish(failed.length === 0);
+      deps.onBatchDiagnostics?.(batchDiagnostics);
+    } else {
+      await mapWithConcurrency(stubs, deps.concurrency.gmailReads, async (stub) => {
+        let raw: gmail_v1.Schema$Message | null;
+        try { raw = await fetchMessageFull(deps.gmailClient, stub.id); }
+        catch { raw = null; }
+        record(stub, raw);
+      });
+    }
+  } finally {
+    deps.readProgress?.onFinish(completed === stubs.length && failed.length === 0);
+  }
+  messages.sort((a, b) => Number(b.normalized.internalDate) - Number(a.normalized.internalDate));
+  return { messages, failed };
 }
 
 interface ClassifyAndFinalizeResult {
@@ -526,28 +570,12 @@ function reconstructAssessment(cached: CachedAssessmentSnapshot, message: Normal
   };
 }
 
-/**
- * Resolves the historyId to persist after a full snapshot, tolerating a
- * failure of the reconciliation call itself (e.g. a sustained Gmail quota
- * error surviving withApiRetry's whole budget). Falling back to the
- * pre-scan fence here is strictly safer than letting the exception
- * propagate: history is only ever an optimization (CLAUDE.md), so a
- * caller that can't complete this one read-only reconciliation call
- * should still get to persist *a* valid marker and keep the rest of an
- * expensive scan's results, rather than the whole command crashing and
- * losing everything after already paying for the full traversal — the
- * only cost of falling back to the fence is that the next incremental
- * scan re-reconciles anything that changed during this scan's own
- * listing window, which is exactly what it would have done anyway if the
- * marker had expired.
- */
-export async function resolvePostScanHistoryMarker(client: GmailClient, fenceHistoryId: string): Promise<string> {
-  try {
-    const postScanHistory = await listHistorySince(client, fenceHistoryId);
-    return postScanHistory.expiredMarker ? fenceHistoryId : postScanHistory.endHistoryId;
-  } catch {
-    return fenceHistoryId;
-  }
+/** Reuse the pre-scan fence; changes during hydration remain pending for the next run. */
+export function resolvePostScanHistoryMarker(_client: GmailClient, fenceHistoryId: string): Promise<string> {
+  // Persist the fence already read before listing. A second history call
+  // cannot advance it without hydrating those changes; the next incremental
+  // run reconciles them anyway, so avoid that redundant request entirely.
+  return Promise.resolve(fenceHistoryId);
 }
 
 async function runFullScan(
@@ -555,16 +583,24 @@ async function runFullScan(
   profile: MailboxProfile,
   diagnostics: ScanDiagnostics
 ): Promise<WorkScanResult> {
+  deps.readProgress?.onPhase("discovering");
+  const discovered = [0, 0];
+  const reportDiscovery = (index: number, count: number): void => {
+    discovered[index] = count;
+    deps.readProgress?.onProgress(discovered[0]! + discovered[1]!);
+  };
   const listingStartedAt = performance.now();
   const [spamResult, inboxResult] = await Promise.all([
     listAllMessageIds(deps.gmailClient, {
       labelIds: [GMAIL_LABELS.spam],
       includeSpamTrash: true,
+      onProgress: (count) => reportDiscovery(0, count),
       ...(deps.limit !== undefined ? { safetyCapCount: deps.limit } : {})
     }),
     listAllMessageIds(deps.gmailClient, {
       labelIds: [GMAIL_LABELS.inbox],
       includeSpamTrash: false,
+      onProgress: (count) => reportDiscovery(1, count),
       ...(deps.limit !== undefined ? { safetyCapCount: deps.limit } : {})
     })
   ]);
@@ -572,15 +608,19 @@ async function runFullScan(
 
   const stubs = dedupeStubs([...spamResult.messages, ...inboxResult.messages]);
   const fetchStartedAt = performance.now();
-  const preprocessed = await fetchAndNormalizeAll(stubs, deps, profile.emailAddress);
+  const { messages: fetched, failed } = await fetchAndNormalizeAll(stubs, deps, profile.emailAddress);
+  const preprocessed = fetched.filter((pre) => isInInbox(pre.labelIds) || isNativeSpam(pre.labelIds));
   diagnostics.messageFetchMs = performance.now() - fetchStartedAt;
-  diagnostics.messagesFetched = stubs.length;
+  diagnostics.messagesFetched = stubs.length - failed.length;
+  diagnostics.messagesFailed = failed.length;
   const { outcomes, labelCandidateUpdates, messageCacheUpdates } = await classifyAndFinalize(
     preprocessed,
     deps,
     diagnostics
   );
+  outcomes.push(...failed);
   const summary = buildRunSummary(inboxResult.messages.length, outcomes);
+  summary.failureCount = failed.length;
 
   // Catches anything that changed while this full snapshot was being
   // listed/fetched, so it isn't silently missed forever by the next
@@ -589,10 +629,12 @@ async function runFullScan(
   // change through the returned ending history ID."
   const snapshotTruncated = inboxResult.truncated || spamResult.truncated;
   let newHistoryMarker: string | null = null;
-  if (!snapshotTruncated) {
+  if (!snapshotTruncated && failed.length === 0) {
+    deps.readProgress?.onPhase("reconciling");
     const historyStartedAt = performance.now();
     newHistoryMarker = await resolvePostScanHistoryMarker(deps.gmailClient, profile.historyId);
     diagnostics.historyMs += performance.now() - historyStartedAt;
+    deps.readProgress?.onFinish();
   }
 
   return {
@@ -604,7 +646,7 @@ async function runFullScan(
     labelCandidateUpdates,
     messageCacheUpdates,
     diagnostics,
-    cacheEvictionMessageIds: []
+    cacheEvictionMessageIds: fetched.filter((pre) => !isInInbox(pre.labelIds) && !isNativeSpam(pre.labelIds)).map((pre) => pre.stub.id)
   };
 }
 
@@ -636,9 +678,10 @@ async function runIncrementalScan(
   }
 
   const fetchStartedAt = performance.now();
-  const preprocessedAll = await fetchAndNormalizeAll(stubs, deps, userEmail);
+  const { messages: preprocessedAll, failed } = await fetchAndNormalizeAll(stubs, deps, userEmail);
   diagnostics.messageFetchMs = performance.now() - fetchStartedAt;
-  diagnostics.messagesFetched = stubs.length;
+  diagnostics.messagesFetched = stubs.length - failed.length;
+  diagnostics.messagesFailed = failed.length;
   // Only a message currently in Inbox or native Spam is ever actionable —
   // exactly the same two input streams a full scan lists directly. A
   // message that changed for an unrelated reason (the user archived or
@@ -654,10 +697,14 @@ async function runIncrementalScan(
     deps,
     diagnostics
   );
+  deps.readProgress?.onPhase("reconciling");
   const inboxCountStartedAt = performance.now();
   const inboxCountBefore = await fetchInboxMessageCount(deps.gmailClient);
   diagnostics.inboxCountMs = performance.now() - inboxCountStartedAt;
+  deps.readProgress?.onFinish(failed.length === 0);
+  outcomes.push(...failed);
   const summary = buildRunSummary(inboxCountBefore, outcomes);
+  summary.failureCount = failed.length;
 
   const cachedBacklogCount = stubs.filter((stub) => !history.changedMessages.has(stub.id)).length;
   const incrementalNote =
@@ -671,7 +718,7 @@ async function runIncrementalScan(
     // permanently discard the omitted changes despite the old note saying
     // they would be reconciled later. Clearing the marker forces a safe
     // full recovery on the next uncapped run.
-    newHistoryMarker: truncationNote === null ? history.endHistoryId : null,
+    newHistoryMarker: truncationNote !== null ? null : failed.length > 0 ? deps.historyMarker ?? null : history.endHistoryId,
     usedIncrementalSync: true,
     scanNote: truncationNote ? `${truncationNote} ${incrementalNote}` : incrementalNote,
     labelCandidateUpdates,
@@ -822,14 +869,9 @@ interface PreprocessedMessage {
   bypassed: boolean;
 }
 
-async function fetchAndNormalize(stub: MessageStub, deps: OrchestratorDeps, userEmail: string): Promise<PreprocessedMessage> {
-  // format=full costs the same Gmail API quota unit as format=metadata (5
-  // units either way), so fetching the body up front — rather than a
-  // second round trip only for messages that turn out to need
-  // classification — costs no extra requests, just larger responses for
-  // the messages that end up bypassed. This is what lets event extraction
-  // actually see the message body instead of only Gmail's short snippet.
-  const raw = await fetchMessageFull(deps.gmailClient, stub.id);
+function normalizeFetchedMessage(
+  stub: MessageStub, deps: OrchestratorDeps, userEmail: string, raw: gmail_v1.Schema$Message
+): PreprocessedMessage {
   const headers = headersFromMessage(raw);
   const labelIds = raw.labelIds ?? [];
   const { plain, html } = extractBodyParts(raw.payload ?? undefined);
@@ -934,6 +976,8 @@ async function finalizeOutcome(
       // this run. This is a local set lookup: no per-candidate `threads.get`
       // call, no 40-unit quota charge, and no extra network round trip.
       threadHasUserSentMessagePromise = Promise.resolve(deps.sentThreadIds.has(stub.threadId));
+    } else if (deps.loadSentThreadIds) {
+      threadHasUserSentMessagePromise = deps.loadSentThreadIds().then((ids) => ids.has(stub.threadId));
     } else {
       // Retain the direct lookup as a safe fallback for library callers that
       // do not provide the run-level Sent index.

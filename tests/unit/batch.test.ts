@@ -1,3 +1,4 @@
+import { runScenarios } from "../helpers/scenarios.js";
 import { describe, expect, it } from "vitest";
 import {
   BatchTransportError,
@@ -37,18 +38,20 @@ describe("messageGetPath", () => {
 });
 
 describe("extractBoundary", () => {
-  it("extracts a bare boundary value", () => {
+  it("preserves all 3 scenarios", async () => {
+    await runScenarios([
+      { name: "extracts a bare boundary value", run: () => {
     expect(extractBoundary("multipart/mixed; boundary=batch_abc123")).toBe("batch_abc123");
-  });
-
-  it("extracts a quoted boundary value", () => {
+  } },
+      { name: "extracts a quoted boundary value", run: () => {
     expect(extractBoundary('multipart/mixed; boundary="batch_abc123"')).toBe("batch_abc123");
-  });
-
-  it("returns null for a missing or non-multipart content-type", () => {
+  } },
+      { name: "returns null for a missing or non-multipart content-type", run: () => {
     expect(extractBoundary("application/json")).toBeNull();
     expect(extractBoundary(undefined)).toBeNull();
     expect(extractBoundary(null)).toBeNull();
+  } }
+    ]);
   });
 });
 
@@ -59,20 +62,22 @@ describe("buildBatchRequestBody", () => {
     expect(body).toContain("GET /gmail/v1/users/me/messages/a HTTP/1.1");
     expect(body).toContain("Content-ID: <b>");
     expect(body.trim().endsWith("--B1--")).toBe(true);
+    expect(body).toContain("HTTP/1.1\r\n\r\n\r\n--B1");
   });
 });
 
 describe("parseBatchResponseBody", () => {
-  it("maps parts by Content-ID regardless of response order", () => {
+  it("preserves all 5 scenarios", async () => {
+    await runScenarios([
+      { name: "maps parts by Content-ID regardless of response order", run: () => {
     const boundary = "B1";
     const body = wrapParts(boundary, [responsePart("b", 200, { id: "b" }), responsePart("a", 200, { id: "a" })]);
     const parts = parseBatchResponseBody(body, boundary);
     expect(parts).toHaveLength(2);
     expect(parts.find((p) => p.contentId === "a")?.body).toEqual({ id: "a" });
     expect(parts.find((p) => p.contentId === "b")?.body).toEqual({ id: "b" });
-  });
-
-  it("preserves mixed status codes (2xx, 404, 429, 5xx)", () => {
+  } },
+      { name: "preserves mixed status codes (2xx, 404, 429, 5xx)", run: () => {
     const boundary = "B1";
     const body = wrapParts(boundary, [
       responsePart("ok", 200, { id: "ok" }),
@@ -86,9 +91,8 @@ describe("parseBatchResponseBody", () => {
     expect(byId.get("missing")).toBe(404);
     expect(byId.get("throttled")).toBe(429);
     expect(byId.get("outage")).toBe(503);
-  });
-
-  it("flags a part with no Content-ID rather than silently dropping it", () => {
+  } },
+      { name: "flags a part with no Content-ID rather than silently dropping it", run: () => {
     const boundary = "B1";
     const malformedPart =
       `Content-Type: application/http\r\n\r\n` + `HTTP/1.1 200 OK\r\n\r\n` + `{"id":"x"}\r\n`;
@@ -97,9 +101,8 @@ describe("parseBatchResponseBody", () => {
     expect(parts).toHaveLength(1);
     expect(parts[0]!.contentId).toBeNull();
     expect(parts[0]!.parseError).not.toBeNull();
-  });
-
-  it("flags a part with a non-JSON body instead of throwing", () => {
+  } },
+      { name: "flags a part with a non-JSON body instead of throwing", run: () => {
     const boundary = "B1";
     const malformedPart =
       `Content-Type: application/http\r\n` +
@@ -110,18 +113,54 @@ describe("parseBatchResponseBody", () => {
     const parts = parseBatchResponseBody(body, boundary);
     expect(parts[0]!.contentId).toBe("a");
     expect(parts[0]!.parseError).not.toBeNull();
-  });
-
-  it("ignores the preamble and closing marker, never treating them as parts", () => {
+  } },
+      { name: "ignores the preamble and closing marker, never treating them as parts", run: () => {
     const boundary = "B1";
     const body = `preamble text\r\n--${boundary}\r\n${responsePart("a", 200, {})}--${boundary}--\r\n`;
     const parts = parseBatchResponseBody(body, boundary);
     expect(parts).toHaveLength(1);
+  } }
+    ]);
   });
 });
 
 describe("sendGmailMessagesBatch", () => {
-  it("returns an empty result without making a network call for zero ids", async () => {
+  it("preserves all 10 scenarios", async () => {
+    await runScenarios([
+      { name: "rejects duplicate, unexpected, mismatched and empty success parts", run: async () => {
+    const client = fakeOAuthClient(async () => ({
+      data: wrapParts("B1", [
+        responsePart("a", 200, { id: "a" }), responsePart("a", 200, { id: "a" }),
+        responsePart("extra", 200, { id: "extra" }), responsePart("b", 200, { id: "different" }),
+        responsePart("c", 200)
+      ]), headers: { "content-type": "multipart/mixed; boundary=B1" }
+    }));
+    const result = await sendGmailMessagesBatch(client, ["a", "b", "c"], { fields: "id" });
+    expect(result.succeeded.size).toBe(0);
+    expect([...result.failed.keys()].sort()).toEqual(["a", "b", "c"]);
+    expect([...result.failed.values()].every((failure) => failure.retryable)).toBe(true);
+  } },
+      { name: "recognizes quota 403 reasons and Retry-After while leaving permission errors terminal", run: async () => {
+    const quotaPart = responsePart("quota", 403, { error: { errors: [{ reason: "userRateLimitExceeded" }] } })
+      .replace("HTTP/1.1 403 X\r\n", "HTTP/1.1 403 X\r\nRetry-After: 7\r\n");
+    const client = fakeOAuthClient(async () => ({
+      data: wrapParts("B1", [quotaPart, responsePart("denied", 403, { error: { errors: [{ reason: "forbidden" }] } })]),
+      headers: { "content-type": "multipart/mixed; boundary=B1" }
+    }));
+    const result = await sendGmailMessagesBatch(client, ["quota", "denied"], { fields: "id" });
+    expect(result.failed.get("quota")).toMatchObject({ retryable: true, quotaPressure: true, retryAfterMs: 7000 });
+    expect(result.failed.get("denied")).toMatchObject({ retryable: false });
+  } },
+      { name: "preserves boundary-looking content inside JSON and accepts spaced boundary parameters", run: async () => {
+    const client = fakeOAuthClient(async () => ({
+      data: wrapParts("B1", [responsePart("a", 200, { id: "a", snippet: "keep --B1 here" })]),
+      headers: { "content-type": "multipart/mixed; boundary = B1 ; charset=UTF-8" }
+    }));
+    const result = await sendGmailMessagesBatch(client, ["a"], { fields: "id,snippet" });
+    expect(result.succeeded.get("a")).toEqual({ id: "a", snippet: "keep --B1 here" });
+    expect(result.decodedResponseBytes).toBeGreaterThan(0);
+  } },
+      { name: "returns an empty result without making a network call for zero ids", run: async () => {
     let called = false;
     const client = fakeOAuthClient(async () => {
       called = true;
@@ -131,9 +170,8 @@ describe("sendGmailMessagesBatch", () => {
     expect(result.succeeded.size).toBe(0);
     expect(result.failed.size).toBe(0);
     expect(called).toBe(false);
-  });
-
-  it("sends Accept-Encoding: gzip and a gzip-tagged User-Agent, and posts multipart/mixed", async () => {
+  } },
+      { name: "sends Accept-Encoding: gzip and a gzip-tagged User-Agent, and posts multipart/mixed", run: async () => {
     let capturedOpts: Record<string, unknown> | undefined;
     const boundary = "resp1";
     const client = fakeOAuthClient(async (opts) => {
@@ -150,9 +188,8 @@ describe("sendGmailMessagesBatch", () => {
     expect(String(headers["Content-Type"])).toContain("multipart/mixed");
     expect(capturedOpts?.["method"]).toBe("POST");
     expect(String(capturedOpts?.["data"])).toContain("GET /gmail/v1/users/me/messages/m1");
-  });
-
-  it("sorts 2xx into succeeded and 404/429/5xx into failed with the right retryable flag", async () => {
+  } },
+      { name: "sorts 2xx into succeeded and 404/429/5xx into failed with the right retryable flag", run: async () => {
     const boundary = "resp1";
     const client = fakeOAuthClient(async () => ({
       data: wrapParts(boundary, [
@@ -168,9 +205,8 @@ describe("sendGmailMessagesBatch", () => {
     expect(result.failed.get("gone")).toMatchObject({ status: 404, retryable: false });
     expect(result.failed.get("throttled")).toMatchObject({ status: 429, retryable: true });
     expect(result.failed.get("outage")).toMatchObject({ status: 503, retryable: true });
-  });
-
-  it("accounts for a requested id whose part never came back at all, as retryable", async () => {
+  } },
+      { name: "accounts for a requested id whose part never came back at all, as retryable", run: async () => {
     const boundary = "resp1";
     const client = fakeOAuthClient(async () => ({
       data: wrapParts(boundary, [responsePart("a", 200, { id: "a" })]),
@@ -179,25 +215,24 @@ describe("sendGmailMessagesBatch", () => {
     const result = await sendGmailMessagesBatch(client, ["a", "b"], { fields: "id" });
     expect(result.succeeded.has("a")).toBe(true);
     expect(result.failed.get("b")).toMatchObject({ retryable: true });
-  });
-
-  it("throws BatchTransportError when the outer request itself fails", async () => {
+  } },
+      { name: "throws BatchTransportError when the outer request itself fails", run: async () => {
     const client = fakeOAuthClient(async () => {
       throw Object.assign(new Error("network down"), { status: 503 });
     });
     await expect(sendGmailMessagesBatch(client, ["a"], { fields: "id" })).rejects.toBeInstanceOf(BatchTransportError);
-  });
-
-  it("throws BatchTransportError when the response content-type has no parseable boundary", async () => {
+  } },
+      { name: "throws BatchTransportError when the response content-type has no parseable boundary", run: async () => {
     const client = fakeOAuthClient(async () => ({ data: "garbage", headers: { "content-type": "text/plain" } }));
     await expect(sendGmailMessagesBatch(client, ["a"], { fields: "id" })).rejects.toBeInstanceOf(BatchTransportError);
-  });
-
-  it("throws BatchTransportError when the multipart body has zero parseable parts (malformed boundary content)", async () => {
+  } },
+      { name: "throws BatchTransportError when the multipart body has zero parseable parts (malformed boundary content)", run: async () => {
     const client = fakeOAuthClient(async () => ({
       data: "not actually multipart content",
       headers: { "content-type": "multipart/mixed; boundary=B1" }
     }));
     await expect(sendGmailMessagesBatch(client, ["a"], { fields: "id" })).rejects.toBeInstanceOf(BatchTransportError);
+  } }
+    ]);
   });
 });

@@ -1,3 +1,4 @@
+import type { Statement } from "better-sqlite3";
 import type { GmailAgentDatabase } from "../database.js";
 
 /**
@@ -38,7 +39,7 @@ export interface CachedMessageRecord {
   assessmentHadEvent: boolean | null;
 }
 
-type CachedMessageUpsert = Omit<CachedMessageRecord, "assessmentHadEvent"> & {
+export type CachedMessageUpsert = Omit<CachedMessageRecord, "assessmentHadEvent"> & {
   /** Optional for compatibility with callers that do not yet produce this cache-safety metadata. */
   assessmentHadEvent?: boolean | null;
 };
@@ -92,12 +93,18 @@ function fromRow(row: MessageRow): CachedMessageRecord {
 }
 
 export class MessagesRepository {
-  constructor(private readonly db: GmailAgentDatabase) {}
+  private readonly getStatement: Statement;
+  private readonly deleteStatement: Statement;
+  private readonly upsertStatement: Statement;
+
+  constructor(private readonly db: GmailAgentDatabase) {
+    this.getStatement = db.prepare("SELECT * FROM messages WHERE account_hash = ? AND gmail_message_id = ?");
+    this.deleteStatement = db.prepare("DELETE FROM messages WHERE account_hash = ? AND gmail_message_id = ?");
+    this.upsertStatement = db.prepare(UPSERT_SQL);
+  }
 
   get(accountHash: string, gmailMessageId: string): CachedMessageRecord | null {
-    const row = this.db
-      .prepare("SELECT * FROM messages WHERE account_hash = ? AND gmail_message_id = ?")
-      .get(accountHash, gmailMessageId) as MessageRow | undefined;
+    const row = this.getStatement.get(accountHash, gmailMessageId) as MessageRow | undefined;
     return row ? fromRow(row) : null;
   }
 
@@ -125,39 +132,34 @@ export class MessagesRepository {
 
   /** Removes cache projections Gmail has proven deleted or outside the Inbox/Spam working set. */
   delete(accountHash: string, gmailMessageId: string): boolean {
-    return (
-      this.db
-        .prepare("DELETE FROM messages WHERE account_hash = ? AND gmail_message_id = ?")
-        .run(accountHash, gmailMessageId).changes > 0
-    );
+    return this.deleteStatement.run(accountHash, gmailMessageId).changes > 0;
+  }
+
+  /** Persists a bounded hydration chunk with one durable SQLite commit. */
+  applyCacheBatch(
+    accountHash: string,
+    records: readonly CachedMessageUpsert[],
+    deletedMessageIds: readonly string[] = []
+  ): void {
+    if (records.length === 0 && deletedMessageIds.length === 0) return;
+    this.db.transaction(() => {
+      for (const record of records) {
+        if (record.accountHash !== accountHash) throw new Error("Cache batch spans multiple accounts.");
+        this.upsert(record);
+      }
+      for (const id of deletedMessageIds) this.delete(accountHash, id);
+    })();
+  }
+
+  upsertMany(records: readonly CachedMessageUpsert[]): void {
+    if (records.length === 0) return;
+    this.db.transaction(() => {
+      for (const record of records) this.upsert(record);
+    })();
   }
 
   upsert(record: CachedMessageUpsert): void {
-    this.db
-      .prepare(
-        `INSERT INTO messages (account_hash, gmail_message_id, gmail_thread_id, content_hash, label_snapshot, classifier_version, prompt_version, schema_version, policy_version, assessment_kind, assessment_confidence, importance_score, importance_confidence, reason_codes, processed_at, subject, sender_display, internal_date, category, assessment_had_event)
-         VALUES (@accountHash, @gmailMessageId, @gmailThreadId, @contentHash, @labelSnapshot, @classifierVersion, @promptVersion, @schemaVersion, @policyVersion, @assessmentKind, @assessmentConfidence, @importanceScore, @importanceConfidence, @reasonCodes, @processedAt, @subject, @senderDisplay, @internalDate, @category, @assessmentHadEvent)
-         ON CONFLICT(account_hash, gmail_message_id) DO UPDATE SET
-           gmail_thread_id = excluded.gmail_thread_id,
-           content_hash = excluded.content_hash,
-           label_snapshot = excluded.label_snapshot,
-           classifier_version = excluded.classifier_version,
-           prompt_version = excluded.prompt_version,
-           schema_version = excluded.schema_version,
-           policy_version = excluded.policy_version,
-           assessment_kind = excluded.assessment_kind,
-           assessment_confidence = excluded.assessment_confidence,
-           importance_score = excluded.importance_score,
-           importance_confidence = excluded.importance_confidence,
-           reason_codes = excluded.reason_codes,
-           processed_at = excluded.processed_at,
-           subject = excluded.subject,
-           sender_display = excluded.sender_display,
-           internal_date = excluded.internal_date,
-           category = excluded.category,
-           assessment_had_event = excluded.assessment_had_event`
-      )
-      .run({
+    this.upsertStatement.run({
         accountHash: record.accountHash,
         gmailMessageId: record.gmailMessageId,
         gmailThreadId: record.gmailThreadId,
@@ -184,3 +186,25 @@ export class MessagesRepository {
       });
   }
 }
+
+const UPSERT_SQL = `INSERT INTO messages (account_hash, gmail_message_id, gmail_thread_id, content_hash, label_snapshot, classifier_version, prompt_version, schema_version, policy_version, assessment_kind, assessment_confidence, importance_score, importance_confidence, reason_codes, processed_at, subject, sender_display, internal_date, category, assessment_had_event)
+         VALUES (@accountHash, @gmailMessageId, @gmailThreadId, @contentHash, @labelSnapshot, @classifierVersion, @promptVersion, @schemaVersion, @policyVersion, @assessmentKind, @assessmentConfidence, @importanceScore, @importanceConfidence, @reasonCodes, @processedAt, @subject, @senderDisplay, @internalDate, @category, @assessmentHadEvent)
+         ON CONFLICT(account_hash, gmail_message_id) DO UPDATE SET
+           gmail_thread_id = excluded.gmail_thread_id,
+           content_hash = excluded.content_hash,
+           label_snapshot = excluded.label_snapshot,
+           classifier_version = excluded.classifier_version,
+           prompt_version = excluded.prompt_version,
+           schema_version = excluded.schema_version,
+           policy_version = excluded.policy_version,
+           assessment_kind = excluded.assessment_kind,
+           assessment_confidence = excluded.assessment_confidence,
+           importance_score = excluded.importance_score,
+           importance_confidence = excluded.importance_confidence,
+           reason_codes = excluded.reason_codes,
+           processed_at = excluded.processed_at,
+           subject = excluded.subject,
+           sender_display = excluded.sender_display,
+           internal_date = excluded.internal_date,
+           category = excluded.category,
+           assessment_had_event = excluded.assessment_had_event`;

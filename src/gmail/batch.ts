@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { OAuth2Client } from "google-auth-library";
+import { isGoogleQuotaError, retryAfterMs } from "../core/api-retry.js";
 
 /**
  * Dedicated Gmail multipart-batch read transport (CLAUDE.md's "Planned
@@ -50,6 +51,8 @@ export interface BatchPartFailure {
   status: number | null;
   /** True for a transient-shaped failure (429/5xx, or a part this response couldn't safely attribute) worth retrying; false for a terminal one (404/400) that a retry cannot fix. */
   retryable: boolean;
+  quotaPressure?: boolean;
+  retryAfterMs?: number;
   detail: string;
 }
 
@@ -58,6 +61,8 @@ export interface BatchSendResult {
   succeeded: Map<string, unknown>;
   /** Gmail message ID -> failure detail. Every id passed in ends up in exactly one of `succeeded`/`failed`, even one this response never actually accounted for. */
   failed: Map<string, BatchPartFailure>;
+  /** Uncompressed response bytes; never includes payload content. */
+  decodedResponseBytes: number;
 }
 
 /** Builds the `GET /gmail/v1/users/me/messages/<id>?...` relative path Gmail's batch protocol expects for one inner call. */
@@ -81,16 +86,18 @@ export function buildBatchRequestBody(ids: readonly string[], pathFor: (id: stri
     lines.push("");
     lines.push(`GET ${pathFor(id)} HTTP/1.1`);
     lines.push("");
+    lines.push("");
   }
   lines.push(`--${boundary}--`);
-  return lines.join("\r\n");
+  return `${lines.join("\r\n")}\r\n`;
 }
 
 /** Extracts the `boundary` parameter from a `Content-Type: multipart/mixed; boundary=...` header value. */
 export function extractBoundary(contentType: string | undefined | null): string | null {
-  if (!contentType) return null;
-  const match = /boundary="?([^";]+)"?/i.exec(contentType);
-  return match ? match[1]! : null;
+  if (!contentType || !/^multipart\/mixed\s*(?:;|$)/i.test(contentType)) return null;
+  const match = /;\s*boundary\s*=\s*(?:"([^"\r\n]+)"|([^;\s]+))/i.exec(contentType);
+  const boundary = match?.[1] ?? match?.[2];
+  return boundary && boundary.length <= 70 && !/[\r\n]/.test(boundary) ? boundary : null;
 }
 
 export interface ParsedBatchPart {
@@ -98,6 +105,7 @@ export interface ParsedBatchPart {
   status: number | null;
   body: unknown;
   parseError: string | null;
+  retryAfterMs?: number;
 }
 
 /**
@@ -111,32 +119,32 @@ export interface ParsedBatchPart {
  * the caller against the full requested-id list, never silently dropped.
  */
 export function parseBatchResponseBody(rawBody: string, boundary: string): ParsedBatchPart[] {
-  const delimiter = `--${boundary}`;
-  const segments = rawBody.split(delimiter);
+  const escaped = boundary.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const delimiters = [...rawBody.matchAll(new RegExp(`(?:^|\\r?\\n)--${escaped}(--)?[ \\t]*(?:\\r?\\n|$)`, "g"))];
   const parts: ParsedBatchPart[] = [];
-  for (const rawSegment of segments) {
-    const segment = rawSegment.replace(/^\r\n/, "");
-    // The final segment after the closing "--boundary--" marker, any MIME
-    // preamble/epilogue text outside the boundary structure, and unrelated
-    // garbage that never contained a real batch part are not parts at all
-    // — only a segment that actually looks like one (carries the
-    // `Content-Type: application/http` marker every real batch part has)
-    // is handed to parseOnePart.
-    if (!/^Content-Type:\s*application\/http/im.test(segment)) {
-      continue;
-    }
-    parts.push(parseOnePart(segment));
+  for (let i = 0; i < delimiters.length; i += 1) {
+    const delimiter = delimiters[i]!;
+    if (delimiter[1] === "--") break;
+    const next = delimiters[i + 1];
+    const segment = rawBody.slice(delimiter.index! + delimiter[0].length, next?.index);
+    const outerHeaders = segment.split(/\r?\n\r?\n/, 1)[0] ?? "";
+    if (!/^Content-Type:\s*application\/http\s*(?:;.*)?$/im.test(outerHeaders)) continue;
+    const part = parseOnePart(segment);
+    if (!next) part.parseError = "unterminated batch part";
+    parts.push(part);
   }
   return parts;
 }
 
 function parseOnePart(segment: string): ParsedBatchPart {
-  const outerSplit = segment.indexOf("\r\n\r\n");
+  // MIME uses CRLF; accepting LF also handles proxies that normalize lines.
+  segment = segment.replace(/\r\n/g, "\n");
+  const outerSplit = segment.indexOf("\n\n");
   if (outerSplit === -1) {
     return { contentId: null, status: null, body: null, parseError: "missing outer header/body separator" };
   }
   const outerHeaders = segment.slice(0, outerSplit);
-  const innerHttp = segment.slice(outerSplit + 4);
+  const innerHttp = segment.slice(outerSplit + 2);
 
   const contentIdMatch = /^Content-ID:\s*<(.+?)>\s*$/im.exec(outerHeaders);
   let contentId = contentIdMatch ? contentIdMatch[1]! : null;
@@ -144,16 +152,18 @@ function parseOnePart(segment: string): ParsedBatchPart {
     contentId = contentId.slice(RESPONSE_CONTENT_ID_PREFIX.length);
   }
 
-  const statusLineEnd = innerHttp.indexOf("\r\n");
+  const statusLineEnd = innerHttp.indexOf("\n");
   const statusLine = statusLineEnd === -1 ? innerHttp : innerHttp.slice(0, statusLineEnd);
-  const statusMatch = /^HTTP\/[\d.]+\s+(\d{3})/i.exec(statusLine);
+  const statusMatch = /^HTTP\/[\d.]+\s+([1-5]\d{2})(?:\s|$)/i.exec(statusLine);
   const status = statusMatch ? Number(statusMatch[1]) : null;
 
-  const innerSplit = innerHttp.indexOf("\r\n\r\n");
-  const bodyText = innerSplit === -1 ? "" : innerHttp.slice(innerSplit + 4).trim();
+  const innerSplit = innerHttp.indexOf("\n\n");
+  const bodyText = innerSplit === -1 ? "" : innerHttp.slice(innerSplit + 2).trim();
+  const retryAfter = /^Retry-After:[ \t]*(.+)$/im.exec(innerHttp.slice(0, innerSplit));
+  const delay = retryAfterMs({ response: { headers: { "retry-after": retryAfter?.[1] } } });
 
   let body: unknown = null;
-  let parseError: string | null = null;
+  let parseError: string | null = innerSplit === -1 ? "missing HTTP header/body separator" : null;
   if (bodyText.length > 0) {
     try {
       body = JSON.parse(bodyText);
@@ -167,7 +177,8 @@ function parseOnePart(segment: string): ParsedBatchPart {
   if (status === null) {
     parseError = parseError ?? "missing or unparseable status line in batch part";
   }
-  return { contentId, status, body, parseError };
+  if ([...outerHeaders.matchAll(/^Content-ID:/gim)].length > 1) parseError = "duplicate Content-ID header";
+  return { contentId, status, body, parseError, ...(delay === null ? {} : { retryAfterMs: delay }) };
 }
 
 export interface SendGmailMessagesBatchOptions {
@@ -191,7 +202,7 @@ export async function sendGmailMessagesBatch(
   options: SendGmailMessagesBatchOptions
 ): Promise<BatchSendResult> {
   if (messageIds.length === 0) {
-    return { succeeded: new Map(), failed: new Map() };
+    return { succeeded: new Map(), failed: new Map(), decodedResponseBytes: 0 };
   }
   const format = options.format ?? "full";
   const boundary = `batch_${randomBytes(12).toString("hex")}`;
@@ -209,6 +220,8 @@ export async function sendGmailMessagesBatch(
       },
       data: body,
       responseType: "text",
+      // Retries belong to the quota-aware driver, including every attempt.
+      retry: false,
       timeout: options.timeoutMs ?? 20_000
     });
   } catch (error) {
@@ -218,7 +231,7 @@ export async function sendGmailMessagesBatch(
     );
   }
 
-  const contentType = response.headers["content-type"] as string | undefined;
+  const contentType = Object.entries(response.headers).find(([name]) => name.toLowerCase() === "content-type")?.[1] as string | undefined;
   const responseBoundary = extractBoundary(contentType);
   if (!responseBoundary) {
     throw new BatchTransportError(
@@ -234,21 +247,32 @@ export async function sendGmailMessagesBatch(
   const succeeded = new Map<string, unknown>();
   const failed = new Map<string, BatchPartFailure>();
   const seen = new Set<string>();
+  const requested = new Set(messageIds);
 
   for (const part of parts) {
-    if (part.contentId === null || seen.has(part.contentId)) {
-      // Unattributable (missing or duplicate Content-ID) — reconciled
-      // below against the full requested-id list instead of being matched
-      // here, since we don't know which requested id this was for.
+    if (part.contentId === null || !requested.has(part.contentId)) continue;
+    if (seen.has(part.contentId)) {
+      succeeded.delete(part.contentId);
+      failed.set(part.contentId, { status: null, retryable: true, detail: "duplicate response Content-ID" });
       continue;
     }
     seen.add(part.contentId);
+    const quotaPressure = isGoogleQuotaError({ status: part.status, response: { data: part.body } });
+    const retryDetails = {
+      ...(quotaPressure ? { quotaPressure: true } : {}),
+      ...(part.retryAfterMs === undefined ? {} : { retryAfterMs: part.retryAfterMs })
+    };
     if (part.parseError !== null || part.status === null) {
-      failed.set(part.contentId, { status: part.status, retryable: true, detail: part.parseError ?? "unparseable batch part" });
+      failed.set(part.contentId, { status: part.status, retryable: true, detail: part.parseError ?? "unparseable batch part", ...retryDetails });
     } else if (part.status >= 200 && part.status < 300) {
-      succeeded.set(part.contentId, part.body);
-    } else if (part.status === 429 || part.status >= 500) {
-      failed.set(part.contentId, { status: part.status, retryable: true, detail: `HTTP ${part.status}` });
+      const message = part.body as { id?: unknown } | null;
+      if (!message || typeof message !== "object" || Array.isArray(message) || message.id !== part.contentId) {
+        failed.set(part.contentId, { status: part.status, retryable: true, detail: "invalid or mismatched message body" });
+      } else {
+        succeeded.set(part.contentId, part.body);
+      }
+    } else if (quotaPressure || part.status >= 500) {
+      failed.set(part.contentId, { status: part.status, retryable: true, detail: `HTTP ${part.status}`, ...retryDetails });
     } else {
       failed.set(part.contentId, { status: part.status, retryable: false, detail: `HTTP ${part.status}` });
     }
@@ -260,5 +284,5 @@ export async function sendGmailMessagesBatch(
     }
   }
 
-  return { succeeded, failed };
+  return { succeeded, failed, decodedResponseBytes: Buffer.byteLength(rawBody, "utf8") };
 }

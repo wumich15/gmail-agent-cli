@@ -57,6 +57,72 @@ function newTestLimiter(): GoogleApiRateLimiter {
 }
 
 describe("hydrateMessagesBatched", () => {
+  it("gives later messages their own retry budget and deduplicates IDs across chunks", async () => {
+    const attempts = new Map<string, number>();
+    const oauthClient = fakeOAuthClient(async (opts) => {
+      const requested = [...String((opts as { data: string }).data).matchAll(/Content-ID: <([^>]+)>/g)].map((match) => match[1]!);
+      return {
+        data: wrapParts("B1", requested.map((id) => {
+          const count = (attempts.get(id) ?? 0) + 1;
+          attempts.set(id, count);
+          return responsePart(id, count === 1 ? 503 : 200, { id });
+        })), headers: { "content-type": "multipart/mixed; boundary=B1" }
+      };
+    });
+    const results = vi.fn();
+    const diagnostics = await hydrateMessagesBatched(explodingGmailClient(), oauthClient, ["a", "a", "b", "c"], results,
+      { rateLimiter: newTestLimiter(), initialBatchSize: 1, maxBatchRetryRounds: 1, maxRetryDelayMs: 0 });
+    expect([...attempts.values()]).toEqual([2, 2, 2]);
+    expect(results).toHaveBeenCalledTimes(3);
+    expect(diagnostics).toMatchObject({ batchSucceeded: 3, individualFallback: 0, retriedMessages: 3 });
+  });
+
+  it("propagates callback errors without refetching or invoking the callback twice", async () => {
+    const oauthClient = fakeOAuthClient(async () => ({
+      data: wrapParts("B1", [responsePart("a", 200, { id: "a" })]),
+      headers: { "content-type": "multipart/mixed; boundary=B1" }
+    }));
+    const callback = vi.fn(() => { throw new Error("database unavailable"); });
+    await expect(hydrateMessagesBatched(explodingGmailClient(), oauthClient, ["a"], callback,
+      { rateLimiter: newTestLimiter() })).rejects.toThrow("database unavailable");
+    expect(callback).toHaveBeenCalledTimes(1);
+  });
+
+  it("hydrates 525 messages exactly once with 11 quota-weighted batches", async () => {
+    const oauthClient = fakeOAuthClient(async (opts) => {
+      const ids = [...String((opts as { data: string }).data).matchAll(/Content-ID: <([^>]+)>/g)].map((match) => match[1]!);
+      return { data: wrapParts("B1", ids.map((id) => responsePart(id, 200, { id }))),
+        headers: { "content-type": "multipart/mixed; boundary=B1" } };
+    });
+    const results = vi.fn();
+    const limiter = newTestLimiter();
+    const acquire = vi.spyOn(limiter, "acquire");
+    const diagnostics = await hydrateMessagesBatched(explodingGmailClient(), oauthClient,
+      Array.from({ length: 525 }, (_, i) => String(i)), results, { rateLimiter: limiter });
+    expect(results).toHaveBeenCalledTimes(525);
+    expect(diagnostics).toMatchObject({ outerBatchRequests: 11, batchSucceeded: 525, individualFallback: 0 });
+    expect(acquire.mock.calls.reduce((sum, [weight]) => sum + weight!, 0)).toBe(525);
+  });
+
+  it("uses bounded concurrent fallbacks and stops calling a broken batch endpoint", async () => {
+    const oauthClient = fakeOAuthClient(vi.fn(async () => { throw new Error("batch unavailable"); }));
+    let active = 0;
+    let peak = 0;
+    const gmailClient = { users: { messages: { get: async ({ id }: { id: string }) => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      active -= 1;
+      return { data: { id } };
+    } } } } as unknown as GmailClient;
+    const results = vi.fn();
+    const diagnostics = await hydrateMessagesBatched(gmailClient, oauthClient, ["a", "b", "c", "d", "e"], results,
+      { rateLimiter: newTestLimiter(), initialBatchSize: 1, fallbackConcurrency: 3 });
+    expect(peak).toBe(3);
+    expect(results).toHaveBeenCalledTimes(5);
+    expect(diagnostics).toMatchObject({ outerBatchRequests: 1, individualFallback: 5 });
+  });
+
   it("hydrates every id via one batch call when everything succeeds, calling onResult once per id", async () => {
     const boundary = "B1";
     const oauthClient = fakeOAuthClient(async () => ({
@@ -74,7 +140,7 @@ describe("hydrateMessagesBatched", () => {
       (id, message) => {
         results.set(id, message);
       },
-      { rateLimiter: newTestLimiter() }
+      { maxRetryDelayMs: 0, rateLimiter: newTestLimiter() }
     );
     expect(results.get("a")).toEqual({ id: "a" });
     expect(results.get("b")).toEqual({ id: "b" });
@@ -86,12 +152,12 @@ describe("hydrateMessagesBatched", () => {
   it("reserves quota weighted by the number of inner calls before sending, not a flat 1 per outer request", async () => {
     const boundary = "B1";
     const oauthClient = fakeOAuthClient(async () => ({
-      data: wrapParts(boundary, [responsePart("a", 200), responsePart("b", 200), responsePart("c", 200)]),
+      data: wrapParts(boundary, [responsePart("a", 200, { id: "a" }), responsePart("b", 200, { id: "b" }), responsePart("c", 200, { id: "c" })]),
       headers: { "content-type": `multipart/mixed; boundary=${boundary}` }
     }));
     const limiter = newTestLimiter();
     const acquireSpy = vi.spyOn(limiter, "acquire");
-    await hydrateMessagesBatched(explodingGmailClient(), oauthClient, ["a", "b", "c"], () => {}, { rateLimiter: limiter });
+    await hydrateMessagesBatched(explodingGmailClient(), oauthClient, ["a", "b", "c"], () => {}, { maxRetryDelayMs: 0, rateLimiter: limiter });
     expect(acquireSpy).toHaveBeenCalledWith(3);
   });
 
@@ -111,7 +177,7 @@ describe("hydrateMessagesBatched", () => {
       oauthClient,
       ["gone"],
       (id, message) => { results.set(id, message); },
-      { rateLimiter: newTestLimiter() }
+      { maxRetryDelayMs: 0, rateLimiter: newTestLimiter() }
     );
     expect(results.get("gone")).toBeNull();
     expect(diagnostics.batchFailedTerminal).toBe(1);
@@ -151,7 +217,7 @@ describe("hydrateMessagesBatched", () => {
       wrappedOauth,
       ["ok", "flaky"],
       (id, message) => { results.set(id, message); },
-      { rateLimiter: newTestLimiter() }
+      { maxRetryDelayMs: 0, rateLimiter: newTestLimiter() }
     );
     expect(results.get("ok")).toEqual({ id: "ok" });
     expect(results.get("flaky")).toEqual({ id: "flaky", retried: true });
@@ -172,7 +238,7 @@ describe("hydrateMessagesBatched", () => {
       oauthClient,
       ["a"],
       () => {},
-      { rateLimiter: limiter, maxBatchRetryRounds: 0 }
+      { maxRetryDelayMs: 0, rateLimiter: limiter, maxBatchRetryRounds: 0 }
     );
     expect(pressureSpy).toHaveBeenCalled();
   });
@@ -192,7 +258,7 @@ describe("hydrateMessagesBatched", () => {
       oauthClient,
       ["a", "b"],
       (id, message) => { results.set(id, message); },
-      { rateLimiter: newTestLimiter() }
+      { maxRetryDelayMs: 0, rateLimiter: newTestLimiter() }
     );
     expect([...fetched].sort()).toEqual(["a", "b"]);
     expect(results.get("a")).toEqual({ id: "a" });
@@ -220,7 +286,7 @@ describe("hydrateMessagesBatched", () => {
       oauthClient,
       ["a", "b"],
       (id, message) => { results.set(id, message); },
-      { rateLimiter: newTestLimiter(), initialBatchSize: 1 }
+      { maxRetryDelayMs: 0, rateLimiter: newTestLimiter(), initialBatchSize: 1 }
     );
     expect(results.get("a")).toEqual({ id: "a" });
     expect(results.get("b")).toEqual({ id: "b" });
@@ -243,7 +309,7 @@ describe("hydrateMessagesBatched", () => {
       oauthClient,
       ["always-flaky"],
       (id, message) => { results.set(id, message); },
-      { rateLimiter: newTestLimiter(), maxBatchRetryRounds: 2 }
+      { maxRetryDelayMs: 0, rateLimiter: newTestLimiter(), maxBatchRetryRounds: 2 }
     );
     expect(individualFetchCount).toBe(1);
     expect(results.get("always-flaky")).toEqual({ id: "always-flaky" });
@@ -261,8 +327,48 @@ describe("hydrateMessagesBatched", () => {
       oauthClient,
       ["a"],
       (id) => { callCounts.set(id, (callCounts.get(id) ?? 0) + 1); },
-      { rateLimiter: newTestLimiter() }
+      { maxRetryDelayMs: 0, rateLimiter: newTestLimiter() }
     );
     expect(callCounts.get("a")).toBe(1);
   });
+});
+
+it("keeps full batches after quota/transient errors and sustains six 50-read batches per minute", async () => {
+  // A quota failure must only alter admission timing, not transport capacity.
+  const sizes: number[] = [];
+  let outerAttempt = 0;
+  const oauth = fakeOAuthClient(async (opts) => {
+    const ids = [...String((opts as { data: string }).data).matchAll(/Content-ID: <([^>]+)>/g)].map((match) => match[1]!);
+    sizes.push(ids.length);
+    if (++outerAttempt === 1) throw Object.assign(new Error("temporary outage"), { status: 503 });
+    return { data: wrapParts("B1", ids.map((id, index) =>
+      responsePart(id, outerAttempt === 2 && index === 0 ? 429 : 200, { id }))),
+      headers: { "content-type": "multipart/mixed; boundary=B1" } };
+  });
+  const results = vi.fn();
+  await hydrateMessagesBatched(explodingGmailClient(), oauth, Array.from({ length: 150 }, (_, i) => String(i)), results,
+    { rateLimiter: newTestLimiter(), maxRetryDelayMs: 0 });
+  expect(sizes).toEqual([50, 50, 50, 50, 1]);
+  expect(results).toHaveBeenCalledTimes(150);
+
+  vi.useFakeTimers();
+  try {
+    const starts: number[] = [];
+    const start = Date.now();
+    const pacedOAuth = fakeOAuthClient(async (opts) => {
+      const ids = [...String((opts as { data: string }).data).matchAll(/Content-ID: <([^>]+)>/g)].map((match) => match[1]!);
+      expect(ids).toHaveLength(50);
+      starts.push(Date.now() - start);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      return { data: wrapParts("B1", ids.map((id) => responsePart(id, 200, { id }))),
+        headers: { "content-type": "multipart/mixed; boundary=B1" } };
+    });
+    const run = hydrateMessagesBatched(explodingGmailClient(), pacedOAuth,
+      Array.from({ length: 600 }, (_, i) => String(i)), () => {},
+      { rateLimiter: new GoogleApiRateLimiter(5, 4000, 5, 300) });
+    await vi.advanceTimersByTimeAsync(120_000);
+    const diagnostics = await run;
+    expect(starts).toEqual(Array.from({ length: 12 }, (_, i) => i * 10_000));
+    expect(diagnostics).toMatchObject({ batchReadAttempts: 600, fullBatchRequests: 12, smallestBatch: 50, largestBatch: 50 });
+  } finally { vi.useRealTimers(); }
 });
