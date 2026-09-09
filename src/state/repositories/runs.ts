@@ -202,6 +202,26 @@ export class ActionsRepository {
     return rows.map(actionFromRow);
   }
 
+  /**
+   * Failed transient writes must be rehydrated on the next run even when
+   * Gmail's history feed has no new event for the still-unchanged message.
+   * Returning the recorded thread ID keeps this retry local and avoids a
+   * second mailbox listing.
+   */
+  listRetryableMessageStubs(accountHash: string): Array<{ id: string; threadId: string }> {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT target_gmail_message_id AS message_id, target_gmail_thread_id AS thread_id
+         FROM actions
+         WHERE account_hash = ?
+           AND status = 'failed_retryable'
+           AND target_gmail_message_id IS NOT NULL
+           AND target_gmail_thread_id IS NOT NULL`
+      )
+      .all(accountHash) as Array<{ message_id: string; thread_id: string }>;
+    return rows.map((row) => ({ id: row.message_id, threadId: row.thread_id }));
+  }
+
   listForRun(runId: string): PlannedAction[] {
     const rows = this.db.prepare("SELECT * FROM actions WHERE run_id = ?").all(runId) as ActionRow[];
     return rows.map(actionFromRow);

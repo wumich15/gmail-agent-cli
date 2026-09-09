@@ -295,6 +295,50 @@ describe("withGoogleApiRetry", () => {
       quotaPressure.mockRestore();
     }
   });
+
+  it("does not impose an artificial cooldown on a quota error with no server Retry-After — only halves the pace", async () => {
+    // Regression: this used to fall back to a flat 10-second hard cooldown
+    // (blocking every in-flight/queued Gmail worker, not just the failed
+    // call) whenever Google's quota error carried no parseable Retry-After
+    // — which is the common case — making a single quota-shaped failure
+    // stall the whole run for 10s on top of the already-halved pace.
+    const quotaPressure = vi.spyOn(googleApiRateLimiter, "reportQuotaPressure");
+    try {
+      const fn = vi.fn().mockRejectedValueOnce(gaxiosLikeError(429)).mockResolvedValue("ok");
+      await withGoogleApiRetry(fn, { baseDelayMs: 1, maxDelayMs: 2 });
+      expect(quotaPressure).toHaveBeenCalledWith(0);
+    } finally {
+      quotaPressure.mockRestore();
+    }
+  });
+
+  it("still honors a real, server-provided Retry-After on a quota error", async () => {
+    const quotaPressure = vi.spyOn(googleApiRateLimiter, "reportQuotaPressure");
+    try {
+      const fn = vi.fn().mockRejectedValueOnce(gaxiosLikeError(429, 3)).mockResolvedValue("ok");
+      await withGoogleApiRetry(fn, { baseDelayMs: 1, maxDelayMs: 5_000 });
+      expect(quotaPressure).toHaveBeenCalledWith(3000);
+    } finally {
+      quotaPressure.mockRestore();
+    }
+  });
+
+  it("pauses for the full rolling window on an explicit per-minute quota error without reducing the sustainable pace", async () => {
+    const pause = vi.spyOn(googleApiRateLimiter, "pauseForQuotaWindow").mockImplementation(() => {});
+    const slowDown = vi.spyOn(googleApiRateLimiter, "reportQuotaPressureForAttempt");
+    try {
+      const quotaError = Object.assign(new Error(
+        "Quota exceeded for quota metric 'Total Query Cost' and limit 'Units per minute per user' of service 'gmail.googleapis.com'."
+      ), { status: 403 });
+      const fn = vi.fn().mockRejectedValueOnce(quotaError).mockResolvedValue("ok");
+      await expect(withGoogleApiRetry(fn, { baseDelayMs: 1, maxDelayMs: 2 })).resolves.toBe("ok");
+      expect(pause).toHaveBeenCalledWith(60_000);
+      expect(slowDown).not.toHaveBeenCalled();
+    } finally {
+      pause.mockRestore();
+      slowDown.mockRestore();
+    }
+  });
 });
 
 
@@ -339,4 +383,34 @@ describe("shared quota recovery", () => {
       expect(admitted).toHaveBeenCalledTimes(1);
     } finally { vi.useRealTimers(); }
   });
+
+  it("holds a per-minute quota wave without ratcheting the configured request rate down", async () => {
+    vi.useFakeTimers();
+    try {
+      const limiter = new GoogleApiRateLimiter(10);
+      await limiter.acquire();
+      const before = limiter.currentRequestsPerSecond;
+      const admitted = vi.fn();
+      const queued = limiter.acquire().then(admitted);
+      limiter.pauseForQuotaWindow(60_000);
+      limiter.pauseForQuotaWindow(60_000);
+      expect(limiter.currentRequestsPerSecond).toBe(before);
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(admitted).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await queued;
+      expect(admitted).toHaveBeenCalledTimes(1);
+      expect(limiter.currentRequestsPerSecond).toBe(before);
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+
+it("halves once for a wave of failed individual reads without adding an artificial cooldown", () => {
+  const limiter = new GoogleApiRateLimiter(5);
+  for (let i = 0; i < 8; i++) limiter.reportQuotaPressureForAttempt(5, 0);
+  expect(limiter.currentRequestsPerSecond).toBe(2.5);
+  expect(limiter.quotaCooldownRemainingMs).toBe(0);
+  limiter.reportQuotaPressureForAttempt(2.5, 0);
+  expect(limiter.currentRequestsPerSecond).toBe(1.25);
 });

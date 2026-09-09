@@ -7,7 +7,9 @@ export interface UserLabel {
 }
 
 const LABEL_MUTATION_REQUEST_OPTIONS = { timeout: 20_000 } as const;
-const LABEL_MUTATION_RETRY_OPTIONS = { maxAttempts: 2, baseDelayMs: 750, maxDelayMs: 5_000 } as const;
+// Label creation is a Gmail write too; let a transient per-minute quota
+// window refill instead of silently dropping the label from this run.
+const LABEL_MUTATION_RETRY_OPTIONS = { maxAttempts: 7, baseDelayMs: 1_000, maxDelayMs: 30_000 } as const;
 
 /**
  * Lists only the user's own custom labels (Gmail's system labels like
@@ -17,8 +19,11 @@ const LABEL_MUTATION_RETRY_OPTIONS = { maxAttempts: 2, baseDelayMs: 750, maxDela
 export async function listUserLabels(client: GmailClient): Promise<UserLabel[]> {
   const { data } = await withGoogleApiRetry(
     () => client.users.labels.list({ userId: "me" }, { timeout: 20_000 }),
-    { maxAttempts: 3, baseDelayMs: 750, maxDelayMs: 10_000 },
-    0.05
+    // Reads share the same minute-spanning retry horizon as scanner reads;
+    // abandoning this inexpensive call after a few seconds can prevent the
+    // whole work scan from starting while the quota window is recoverable.
+    { maxAttempts: 7, baseDelayMs: 1_000, maxDelayMs: 30_000 },
+    0.05, "gmail.labels.list"
   );
   const labels: UserLabel[] = [];
   for (const label of data.labels ?? []) {
@@ -54,7 +59,7 @@ export async function getOrCreateLabelId(
           requestBody: { name, labelListVisibility: "labelShow", messageListVisibility: "show" }
         }, LABEL_MUTATION_REQUEST_OPTIONS),
       LABEL_MUTATION_RETRY_OPTIONS,
-      0.25
+      0.25, "gmail.labels.create"
     );
     if (!data.id) {
       throw new Error(`Gmail did not return an ID for newly created label "${name}".`);

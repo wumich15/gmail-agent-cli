@@ -129,8 +129,9 @@ src/
 `src/core/policy.ts` (`evaluateMessagePolicy`) is the single place that
 decides what happens to a message, applied in this precedence order:
 
-1. An explicit local **spam** rule match plans Trash and nothing else —
-   unless the message is protected (see below), which always wins.
+1. An explicit local **spam** rule match plans Trash and nothing else. An
+   explicit `gmail add spam` request can override an actionable/calendar
+   safety guard and wins an overlap with an older important rule.
 2. Unprotected native Gmail Spam plans Trash without any AI call.
 3. An authenticated high-risk signal (security/financial/etc.) gates the
    promotion/automated-low-value Trash path behind a real, usable
@@ -166,30 +167,21 @@ enumerable via `gmail summary <run-id>` (no truncation) and reversible via
    archived — even if it was starred or used to create an event. Trash is
    the only outcome mutually exclusive with everything else.
 
-"Protected" means: a user-created important rule matches, or the message
-carries a `STARRED`/`IMPORTANT` label this app's own ledger cannot
-attribute to itself. Protected messages are never auto-trashed. This is
-enforced in `policy.ts` and covered by unit tests in
-`tests/unit/policy.test.ts` (e.g. "never trashes a protected message even
-with an explicit spam rule").
+"Protected" means the classified message contains an actionable signal or a
+Calendar intent. Important assessment kinds already avoid the promotion Trash
+path; a bare important rule or preexisting `STARRED`/`IMPORTANT` label is not
+enough by itself. `gmail add spam` is the explicit override path.
+The pure policy function still retains a defensive conflict reason for
+callers that pass a protected message without the override flag; the real
+orchestrator marks explicit spam rules as intentional overrides.
 
 **Fixed bug (protection was blocking event/label extraction, not just
 trash/star):** `evaluateMessagePolicy` used to gate its *entire*
 AI-derived block — trash, star, Calendar event, and label — behind a
-single `!isProtected` check, even though `CLAUDE.md` is explicit that
-protection ("an important rule... can bypass importance classification
-but not event extraction") should only suppress trash and the redundant
-AI-derived star. Since Gmail's own ML frequently marks transactional and
-appointment mail `IMPORTANT` on its own — exactly the mail most likely to
-contain a real calendar event — this silently dropped calendar-event (and
-topical-label) creation for a large, non-obvious slice of messages,
-independent of confidence or any other setting. Trash-eligibility and the
-AI-derived star/important addition are now gated behind `!isProtected`
-individually inside the assessment block, while event extraction and
-topical labeling are evaluated unconditionally whenever a usable
-assessment exists — matching the precedence list above and the explicit
-spec language. `POLICY_VERSION` was bumped (`policy-v4`) to invalidate
-any assessment cached under the old behavior.
+single `!isProtected` check. Content protection now comes from actionable or
+Calendar assessment signals, suppresses only unsafe Trash and redundant AI
+importance actions, and never suppresses event or topical-label extraction.
+An explicit spam rule remains an intentional user override.
 
 ## Data model (SQLite, ordered migrations under `src/state/migrations/`)
 
@@ -367,11 +359,11 @@ be quietly filed under a friendly label.
 Gmail-read concurrency and classifier-call concurrency are separate:
 `OrchestratorDeps.concurrency` takes `{ gmailReads, aiCalls }`, and
 `runWorkScan` (`core/orchestrator.ts`) processes messages in three
-phases — fetch+normalize+rule-match (batched at `gmailReads`), then
-classify only the non-bypassed subset (bounded at `aiCalls` via
-`core/concurrency.ts`'s `mapWithConcurrency`, independent of the fetch
-batch size), then pure policy evaluation. Gmail and an AI provider are
-unrelated rate-limit domains, so sizing one off the other's batch size
+phases — fetch+normalize+rule-match through a bounded `gmailReads` worker
+pool, then classify only the non-bypassed subset (bounded at `aiCalls` via
+`core/concurrency.ts`'s `mapWithConcurrency`, independent of the Gmail
+worker pool), then pure policy evaluation. Gmail and an AI provider are
+unrelated rate-limit domains, so sizing one off the other's worker pool
 was a bug; `work.ts` reads `aiCalls` from config (default 5 — raised
 from an initial 2 once `OpenAiClassifier` itself gained retry/backoff,
 so the higher concurrency doesn't cost accuracy under rate-limit
@@ -874,9 +866,8 @@ than tuned away by guessing:
   at 20 units plus an unconditional `threads.get` at 40 units, vs. 20
   alone) and adding a full extra network round trip per message.
   `core/orchestrator.ts`'s `finalizeOutcome` now defers this call: it
-  first evaluates policy using only the cheap, already-known protection
-  signals (explicit important rule, a preexisting `STARRED`/`IMPORTANT`
-  label not attributable to this app), and only calls (and memoizes,
+  first evaluates policy using the classified actionable/calendar signals,
+  and only calls (and memoizes,
   per-thread, across the whole run) `fetchThreadHasUserSentMessage` when
   that first pass would actually plan a Trash action — the one case where
   the extra signal can change the outcome. Every non-Trash-bound message
@@ -1046,8 +1037,10 @@ production strategy therefore avoids unnecessary 40-unit thread reads:
   delay or crash the run.
 - The shared limiter paces calls by quota weight, including cheap list,
   history, and label calls plus expensive batch modifications and sends.
-  Concurrent reservations remain globally spaced, and quota errors reduce
-  throughput without allowing repeated retries to amplify the same burst.
+  Concurrent reservations remain globally spaced. Generic/concurrency quota
+  errors reduce throughput without allowing repeated retries to amplify the
+  same burst; an error explicitly naming the per-minute bucket instead pauses
+  the queue for the rolling window and resumes at the configured pace.
 - `gmail work` reports classifier progress continuously, previews the
   planned actions before mutations, and appends a complete plaintext
   important-email paragraph after every run. Timing diagnostics remain
@@ -1058,72 +1051,79 @@ production strategy therefore avoids unnecessary 40-unit thread reads:
   the shared weighted limiter remains the quota safety boundary, so this does
   not create an uncontrolled request burst.
 
-## Sixth fix pass: Gmail read-transport optimization (batching and partial responses)
+## Sixth fix pass: Gmail read transport (individual reads and partial responses)
 
-Implements CLAUDE.md's "Planned Gmail read-transport optimization" plan.
-Batching and gzip are transport optimizations, not quota bypasses — none of
-this reduces the quota units a run consumes; it reduces HTTP setup overhead
-and response bytes for the same quota cost.
+The live-account investigation retired the custom multipart read transport.
+Gzip remains enabled through the official Google client, and partial-response
+fields reduce response bytes without changing Gmail quota units.
 
 - **Partial responses** (`gmail/scanner.ts`): every read call
   (`getProfile`, `messages.list`, `messages.get` in both `metadata` and
   `full` format, `labels.get`, `threads.get`, `history.list`) now passes a
-  `fields` selector narrowing the response to exactly what normalization
-  and policy consume. `MESSAGE_FULL_FIELDS` is built programmatically to a
-  bounded MIME-part-tree depth (6 levels) rather than hand-written, since
-  partial response has no true recursive selector — a fixture test
+  `fields` selector narrowing the response to what normalization and policy
+  consume. `MESSAGE_FULL_FIELDS` keeps the recursive inline MIME tree needed
+  for body extraction; attachment endpoints are never fetched. A fixture test
   (`tests/unit/scanner.test.ts`) proves a response pre-trimmed to exactly
   this selector normalizes identically to an untrimmed one carrying extra
   real-world fields (`sizeEstimate`, `payload.partId`/`filename`) the
   selector deliberately excludes.
-- **A dedicated multipart batch transport** (`gmail/batch.ts`), scoped
-  narrowly to batching `messages.get` reads (not a generic multi-endpoint
-  batch client, per the plan). Built on `OAuth2Client.request` — the same
-  gaxios/node-fetch pipeline `googleapis`-generated clients use — rather
-  than a raw `fetch`, so real gzip response decompression works
-  transparently; the module explicitly sets `Accept-Encoding: gzip` and a
-  gzip-tagged `User-Agent` itself, since those are added by
-  `googleapis-common`'s wrapper (confirmed by reading
-  `apirequest.js`), which this transport bypasses.
-  `tests/unit/gzip-batch.test.ts` proves this end-to-end against a real
-  local HTTP server returning a real gzip-compressed multipart body —
-  deliberately not a fake, since the property under test is that the real
-  decompression pipeline works, not that the code calls the right function
-  names. Response parsing maps parts by `Content-ID` (never array
-  position), and unit tests cover every scenario CLAUDE.md's acceptance
-  gate names: mixed 2xx/404/429/5xx statuses, out-of-order parts, a part
-  with no `Content-ID` at all, and a non-multipart/garbage body (throws
-  `BatchTransportError` rather than silently returning wrong data).
-- **Quota-aware batching driver** (`gmail/batch-hydrate.ts`) owns the
-  policy `batch.ts` deliberately doesn't: it reserves quota for every inner
-  call in the shared limiter before sending an outer batch (an outer batch
-  is never accounted as one cheap request), retries only the specific
-  parts that came back retryable (429/5xx) — never a successful part or the
-  whole batch — shrinks subsequent batch size on quota pressure, bounds the
-  total number of retry rounds so hydration always terminates, and falls
-  back to individual `fetchMessageFull` reads for a whole chunk when the
-  outer HTTP request fails structurally (malformed response, network
-  error, non-2xx envelope) — without losing any other chunk's
-  already-successful results. The rate limiter is injectable
-  (`BatchHydrationOptions.rateLimiter`) purely for test isolation; the real
-  singleton is the default.
-- **`gmail cache` wiring**: hydration logic was factored into a shared
-  `upsertHydratedMessage` helper used by both the existing per-message
-  `fetchMessageFull` loop and the new batched path, so the "preserve a
-  still-valid cached assessment" fix from the previous pass exists once,
-  not twice. Batching is strictly opt-in via `GMAIL_AGENT_BATCH_HYDRATION=1`
-  — CLAUDE.md's acceptance gate requires a live-account 200/500-message
-  benchmark proving a wall-clock/request-count improvement with no higher
-  429 rate before this can default on, and this development environment has
-  no live Gmail account to run that benchmark against. The individual-read
-  path remains the unconditional default.
-- **Explicitly not done in this pass**: the finer-grained instrumentation
-  CLAUDE.md's step 1 describes (response byte counts, time spent waiting on
-  the quota limiter versus Gmail network time, distinguishing "quota
-  cooldown" from "hung request" in the progress display) — `gmail cache`'s
-  batch path currently reports only outer-batch-request and
-  individual-fallback counts. The live-account benchmark itself (step 6's
-  acceptance gate) also remains outstanding for the same reason.
+- **Individual bounded reads**: `gmail` uses `messages.get` through the
+  configured Gmail worker pool (default 5), while `gmail cache` uses 8.
+  The shared weighted limiter paces every attempt, and completed messages
+  advance the progress display immediately. The custom multipart transport
+  and its tests were removed after live diagnostics showed that batching
+  added head-of-line waits without improving the real account's throughput.
+- **Gzip and fields**: the official Google client handles gzip response
+  decompression. `MESSAGE_FULL_FIELDS` keeps IDs, labels, dates, headers,
+  snippets, and the recursive inline MIME tree needed for normalization and
+  policy; attachment endpoints are never fetched. Smaller partial responses
+  reduce transport bytes but do not change Gmail quota cost.
+- **Mutation reconciliation**: Trash and label changes use grouped
+  `messages.batchModify` calls of at most 50 IDs. The full scan's labels are
+  the mutation precondition, so the write phase does not issue a second
+  `messages.get` for every Trash candidate. A later history/incremental run
+  observes labels changed concurrently by the user.
+- **Diagnostics**: persistent logs record Google operation names, retry and
+  quota classes, limiter wait, network time, phase heartbeats, classifier
+  activity, and oldest/newest hydrated `internalDate` values without mail
+  content. This makes quota stalls and recent-mail gaps diagnosable from a
+  real run.
+
+## Seventh pass: codebase simplification and test-count reduction
+
+A dead-code sweep (`ts-prune`, cross-checked manually) found the source tree
+essentially clean: every flagged "unused" export is either genuinely used
+elsewhere, or belongs to the `spam`/`important`/`rules`/`summary`/`undo`/
+`auth`/`config`/`doctor` commands `cli.ts` deliberately keeps as working
+code pending re-wiring (see that file's own comment) — none of that was
+touched, since it isn't redundancy, it's intentionally-deferred scope. One
+real gap surfaced along the way, left alone as out of scope for a
+simplification pass: `unsubscribe/safe-http.ts`'s `postOneClickUnsubscribe`
+(the RFC 8058 one-click POST) has no caller anywhere — `gmail spam`'s flow
+parses `List-Unsubscribe`/one-click headers but never actually executes the
+POST.
+
+Test count: `tests/helpers/scenarios.ts`'s `runScenarios` helper (already
+used by `policy.test.ts`, `event-policy.test.ts`, `normalize.test.ts`,
+`rules.test.ts`, `executor.test.ts`, `ids.test.ts`, `build-summary.test.ts`)
+runs every named scenario regardless of an earlier failure and reports every
+failure via one `AggregateError`, so collapsing many `it()` blocks into one
+never hides a failing case or loses per-case diagnosability — it only
+changes how many top-level tests Vitest reports. Extended to
+`unsubscribe.test.ts`, `scanner.test.ts`, `auth-signals.test.ts`, and
+`logger.test.ts` — all hook-free, pure-function-style suites with no
+genuine case-to-case duplication (every case already covered a distinct
+input/edge case; none were deleted, only regrouped). Total: 267 → 206
+reported tests, with identical assertions and identical failure semantics.
+
+Deliberately left as separate `it()` blocks: `api-retry.test.ts` (33) and
+`orchestrator.test.ts` (28) mix real timers, fake timers, and per-case
+async fixtures (fake Gmail clients/classifiers) where isolating each case
+in its own `it()` gives clearer setup/teardown boundaries and failure
+output for genuinely complex, safety-relevant scenarios; `openai-classifier.test.ts`
+(19) and `prompt.test.ts` (20) exercise real timing-sensitive retry paths.
+Consolidating these further was judged higher-risk than the reporting-count
+benefit justifies without a slower, more careful per-file pass.
 
 ## Known deviations from the full design (as of this writing)
 

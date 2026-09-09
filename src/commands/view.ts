@@ -1,94 +1,261 @@
 import * as p from "@clack/prompts";
 import pc from "picocolors";
+import { createInterface } from "node:readline/promises";
 import { bootstrap } from "../core/bootstrap.js";
-import { resolveAccount } from "./shared.js";
+import { resolveAccountSigningInIfNeeded } from "./shared.js";
+import { runCache } from "./cache.js";
 import { MessagesRepository, type CachedMessageRecord } from "../state/repositories/messages.js";
+import { AccountsRepository } from "../state/repositories/accounts.js";
+import { SETTING_KEYS, SettingsRepository } from "../state/repositories/settings.js";
 import { fetchMessageFull, headersFromMessage } from "../gmail/scanner.js";
 import { buildNormalizedMessage, extractBodyParts } from "../gmail/normalize.js";
 import { GMAIL_LABELS, isRead } from "../gmail/labels.js";
-import { buildReplyTarget, sendReply, type ReplyTarget } from "../gmail/reply.js";
-import { draftReply } from "../ai/draft-reply.js";
+import { buildComposeTarget, buildReplyTarget, sendReply, type ReplyTarget } from "../gmail/reply.js";
+import { draftNewEmail, draftReply } from "../ai/draft-reply.js";
 import { resolveOpenAiCredentials } from "../ai/resolve-classifier.js";
 import { waitForKeypress } from "../core/keypress.js";
 import { ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 import { EXIT_CODES } from "../core/errors.js";
+import { withGoogleApiRetry } from "../core/api-retry.js";
 import type { GmailClient } from "../gmail/client.js";
-import type { NormalizedMessage } from "../core/models.js";
+import type { AccountRecord, NormalizedMessage } from "../core/models.js";
+import { projectHydratedCacheMessage } from "../gmail/cache-projection.js";
+import { refreshViewCache } from "../gmail/view-sync.js";
+import { listUserLabels } from "../gmail/custom-labels.js";
+import { loadSentStyleExamples, type SentStyleExample } from "../gmail/sent-style.js";
 
 export interface ViewOptions {
   limit?: number;
+  /** Use the existing cache immediately instead of reconciling Gmail history on startup. */
+  previous?: boolean;
 }
 
 const DEFAULT_PAGE_SIZE = 20;
+const PAGE_SIZE_STEPS = [5, 10, 20, 50, 100] as const;
 
-/**
- * `gmail view` — a read-only terminal browser over `gmail cache`'s local
- * data (see CLAUDE.md's "gmail view"). Opening a message and sending a
- * reply are the only live Gmail calls it makes; the list itself never
- * touches the network.
- */
+interface ListViewSnapshot {
+  page: number;
+  pageSize: number;
+  selectedTags: Set<string>;
+  search: string;
+}
+
+/** `gmail view` — an interactive terminal inbox with live incremental refresh, reading, composing, and replies. */
 export async function runView(options: ViewOptions): Promise<number> {
-  const ctx = bootstrap();
-  const { account, gmailClient } = await resolveAccount(ctx);
-
-  const all = new MessagesRepository(ctx.db).listForAccount(account.accountHash);
-  if (all.length === 0) {
-    console.log(pc.yellow("No cached messages yet. Run `gmail cache` first, then `gmail view`."));
-    return EXIT_CODES.ok;
-  }
   if (!process.stdin.isTTY) {
     console.error(pc.red("gmail view is interactive and requires a terminal (stdin is not a TTY)."));
     return EXIT_CODES.safetyBlocked;
   }
 
-  const allTags = collectDistinctTags(all);
-  const hiddenTags = new Set<string>();
+  const ctx = bootstrap();
+  let { account, gmailClient } = await resolveAccountSigningInIfNeeded(ctx);
+  const initialCachedCount = new MessagesRepository(ctx.db).countForAccount(account.accountHash);
+  let refresh: Awaited<ReturnType<typeof refreshViewCache>> | null = null;
+  if (options.previous) {
+    console.error(pc.dim("Using the previous Gmail cache without refreshing it."));
+  } else {
+    const settings = new SettingsRepository(ctx.db);
+    const lastCacheAt = settings.get(account.accountHash, SETTING_KEYS.cacheLastRunAt);
+    console.error(pc.dim(lastCacheAt ? `Updating mail cached ${formatAge(lastCacheAt)}...` : "Updating cached mail..."));
+
+    refresh = await refreshViewCacheLocked(ctx, gmailClient, account);
+    if (refresh.kind === "full_required") {
+      console.error(
+        pc.dim(
+          (initialCachedCount > 0
+            ? `The cache contains ${initialCachedCount} message(s), but it has no usable history checkpoint; refreshing the Inbox once. `
+            : "There is no usable cache history checkpoint; refreshing the Inbox once. ") +
+            "Use --previous to open the existing cache immediately."
+        )
+      );
+      const cacheCode = await runCache();
+      if (cacheCode !== EXIT_CODES.ok) {
+        console.error(pc.yellow("The refresh was incomplete; showing every message that was cached successfully."));
+      }
+      account = new AccountsRepository(ctx.db).get(account.accountHash) ?? account;
+    } else if (refresh.added + refresh.updated + refresh.removed > 0 || refresh.failed > 0) {
+      console.error(
+        pc.dim(
+          `Inbox updated: ${refresh.added} new, ${refresh.updated} changed, ${refresh.removed} removed` +
+            (refresh.failed > 0 ? `, ${refresh.failed} will retry later` : "") + "."
+        )
+      );
+    } else {
+      console.error(pc.dim("Inbox is up to date."));
+    }
+  }
+
+  const messagesRepo = new MessagesRepository(ctx.db);
+  let all = messagesRepo.listForAccount(account.accountHash);
+  if (all.length === 0) {
+    console.log(pc.yellow("No Inbox or Spam messages are currently cached."));
+    return EXIT_CODES.ok;
+  }
+
+  let labelNames = options.previous ? systemLabelNames() : await loadLabelNames(gmailClient);
+  let selectedTags = new Set<string>(
+    all.some((message) => message.labelSnapshot.includes(GMAIL_LABELS.inbox)) ? [GMAIL_LABELS.inbox] : []
+  );
+  let search = "";
   let pageSize = options.limit ?? DEFAULT_PAGE_SIZE;
   let page = 0;
+  const backStack: ListViewSnapshot[] = [];
+  const forwardStack: ListViewSnapshot[] = [];
+  const snapshotView = (): ListViewSnapshot => ({ page, pageSize, selectedTags: new Set(selectedTags), search });
+  const restoreView = (snapshot: ListViewSnapshot): void => {
+    page = snapshot.page;
+    pageSize = snapshot.pageSize;
+    selectedTags = new Set(snapshot.selectedTags);
+    search = snapshot.search;
+  };
+  const rememberView = (): void => {
+    backStack.push(snapshotView());
+    if (backStack.length > 50) backStack.shift();
+    forwardStack.length = 0;
+  };
+  let stylePromise: Promise<SentStyleExample[]> | null = null;
+  const getStyleExamples = (): Promise<SentStyleExample[]> => {
+    stylePromise ??= loadSentStyleExamples(gmailClient, account.emailDisplay ?? "");
+    return stylePromise;
+  };
 
   for (;;) {
-    const visible = all.filter((m) => !m.labelSnapshot.some((l) => hiddenTags.has(l)));
+    const visible = filterMessages(all, selectedTags, search);
     const totalPages = Math.max(1, Math.ceil(visible.length / pageSize));
     page = Math.min(page, totalPages - 1);
     const pageItems = visible.slice(page * pageSize, (page + 1) * pageSize);
 
-    renderList(pageItems, { page, totalPages, pageSize, total: visible.length, hiddenTags });
-
+    renderList(pageItems, { page, totalPages, pageSize, total: visible.length, selectedTags, search, labelNames });
     const input = await p.text({
       message: "Command",
-      placeholder: "number to open · n/p page · l <n> limit · t tags · q quit"
+      placeholder: "number open · n/p page · [ back · ] forward · +/- size · f filter · s search · c/a compose · q"
     });
     if (p.isCancel(input)) break;
     const cmd = input.trim();
 
-    if (cmd === "q" || cmd === "") {
-      if (cmd === "q") break;
-      continue;
-    }
+    if (cmd === "q") break;
+    if (cmd === "") continue;
     if (cmd === "n") {
+      if (page < totalPages - 1) rememberView();
       page = Math.min(page + 1, totalPages - 1);
       continue;
     }
     if (cmd === "p") {
+      if (page > 0) rememberView();
       page = Math.max(page - 1, 0);
+      continue;
+    }
+    if (cmd === "[") {
+      const previous = backStack.pop();
+      if (previous) {
+        forwardStack.push(snapshotView());
+        restoreView(previous);
+      } else {
+        console.log(pc.dim("No earlier view."));
+      }
+      continue;
+    }
+    if (cmd === "]") {
+      const next = forwardStack.pop();
+      if (next) {
+        backStack.push(snapshotView());
+        restoreView(next);
+      } else {
+        console.log(pc.dim("No later view."));
+      }
+      continue;
+    }
+    if (cmd === "+" || cmd === "-") {
+      const nextSize = adjustPageSize(pageSize, cmd === "+" ? "larger" : "smaller");
+      if (nextSize !== pageSize) {
+        const firstVisibleIndex = page * pageSize;
+        rememberView();
+        pageSize = nextSize;
+        page = Math.floor(firstVisibleIndex / pageSize);
+      }
       continue;
     }
     const limitMatch = /^l\s+(\d+)$/.exec(cmd);
     if (limitMatch) {
-      pageSize = Math.max(1, Number(limitMatch[1]));
-      page = 0;
+      const nextSize = Math.max(1, Number(limitMatch[1]));
+      if (nextSize !== pageSize) {
+        const firstVisibleIndex = page * pageSize;
+        rememberView();
+        pageSize = nextSize;
+        page = Math.floor(firstVisibleIndex / pageSize);
+      }
       continue;
     }
-    if (cmd === "t") {
-      await toggleTags(allTags, hiddenTags);
-      page = 0;
+    if (cmd === "f" || cmd === "t") {
+      const nextTags = await chooseTags(collectDistinctTags(all), selectedTags, labelNames);
+      if (!sameSet(nextTags, selectedTags)) {
+        rememberView();
+        selectedTags = nextTags;
+        page = 0;
+      }
+      continue;
+    }
+    if (cmd === "s") {
+      if (search) {
+        rememberView();
+        search = "";
+        page = 0;
+      }
+      continue;
+    }
+    const searchMatch = /^s\s+(.+)$/.exec(cmd);
+    if (searchMatch) {
+      const nextSearch = searchMatch[1]!.trim();
+      if (nextSearch !== search) {
+        rememberView();
+        search = nextSearch;
+        page = 0;
+      }
+      continue;
+    }
+    if (cmd === "u") {
+      const latestAccount = new AccountsRepository(ctx.db).get(account.accountHash) ?? account;
+      refresh = await refreshViewCacheLocked(ctx, gmailClient, latestAccount);
+      if (refresh.kind === "full_required") await runCache();
+      account = new AccountsRepository(ctx.db).get(account.accountHash) ?? account;
+      all = messagesRepo.listForAccount(account.accountHash);
+      labelNames = await loadLabelNames(gmailClient);
+      if (page !== 0) {
+        rememberView();
+        page = 0;
+      }
+      console.log(pc.green("Inbox updated."));
+      continue;
+    }
+    if (cmd === "c") {
+      await handleCompose(gmailClient, account.accountHash, false, ctx, getStyleExamples);
+      continue;
+    }
+    if (cmd === "a" || cmd === ";c") {
+      await handleCompose(gmailClient, account.accountHash, true, ctx, getStyleExamples);
       continue;
     }
     const index = Number(cmd);
     if (Number.isInteger(index) && index >= 1 && index <= pageItems.length) {
-      const chosen = pageItems[index - 1]!;
-      await openMessage(gmailClient, account.accountHash, chosen, ctx);
+      let messageIndex = page * pageSize + index - 1;
+      const browsingItems = visible;
+      for (;;) {
+        const navigation = await openMessage(
+          gmailClient,
+          account.accountHash,
+          account.emailDisplay ?? "",
+          browsingItems[messageIndex]!,
+          ctx,
+          getStyleExamples,
+          messageIndex > 0,
+          messageIndex < browsingItems.length - 1
+        );
+        if (navigation === "previous") messageIndex -= 1;
+        else if (navigation === "next") messageIndex += 1;
+        else break;
+      }
+      all = messagesRepo.listForAccount(account.accountHash);
       continue;
     }
     console.log(pc.yellow(`Unrecognized command: "${cmd}"`));
@@ -97,14 +264,83 @@ export async function runView(options: ViewOptions): Promise<number> {
   return EXIT_CODES.ok;
 }
 
-function collectDistinctTags(messages: readonly CachedMessageRecord[]): string[] {
-  const tags = new Set<string>();
-  for (const m of messages) {
-    for (const label of m.labelSnapshot) {
-      tags.add(label);
-    }
+export function adjustPageSize(current: number, direction: "larger" | "smaller"): number {
+  if (direction === "larger") {
+    if (current >= 500) return current;
+    return PAGE_SIZE_STEPS.find((size) => size > current) ?? Math.min(500, current * 2);
   }
-  return [...tags].sort();
+  return [...PAGE_SIZE_STEPS].reverse().find((size) => size < current) ?? 1;
+}
+
+function sameSet(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
+  return left.size === right.size && [...left].every((value) => right.has(value));
+}
+
+async function refreshViewCacheLocked(
+  ctx: ReturnType<typeof bootstrap>,
+  gmailClient: GmailClient,
+  account: AccountRecord
+): Promise<Awaited<ReturnType<typeof refreshViewCache>>> {
+  const lock = new ProcessLock(lockFilePath(account.accountHash));
+  lock.acquire();
+  try {
+    return await refreshViewCache(ctx.db, gmailClient, account, ctx.clock.nowIso());
+  } finally {
+    lock.release();
+  }
+}
+
+export function filterMessages(
+  messages: readonly CachedMessageRecord[],
+  selectedTags: ReadonlySet<string>,
+  search: string
+): CachedMessageRecord[] {
+  const needle = search.trim().toLocaleLowerCase();
+  return messages.filter((message) => {
+    const labelMatch = selectedTags.size === 0 || message.labelSnapshot.some((label) => selectedTags.has(label));
+    const textMatch =
+      !needle || `${message.subject ?? ""}\n${message.senderDisplay ?? ""}`.toLocaleLowerCase().includes(needle);
+    return labelMatch && textMatch;
+  });
+}
+
+function formatAge(iso: string): string {
+  const elapsedMs = Math.max(0, Date.now() - Date.parse(iso));
+  const minutes = Math.floor(elapsedMs / 60_000);
+  if (minutes < 1) return "less than a minute ago";
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
+}
+
+async function loadLabelNames(client: GmailClient): Promise<Map<string, string>> {
+  const names = systemLabelNames();
+  try {
+    for (const label of await listUserLabels(client)) names.set(label.id, label.name);
+  } catch {
+    // Raw IDs remain usable if this cosmetic lookup fails.
+  }
+  return names;
+}
+
+function systemLabelNames(): Map<string, string> {
+  return new Map<string, string>([
+    [GMAIL_LABELS.inbox, "Inbox"],
+    [GMAIL_LABELS.spam, "Spam"],
+    [GMAIL_LABELS.unread, "Unread"],
+    [GMAIL_LABELS.starred, "Starred"],
+    [GMAIL_LABELS.important, "Important"],
+    [GMAIL_LABELS.categoryPromotions, "Promotions"],
+    [GMAIL_LABELS.categorySocial, "Social"],
+    [GMAIL_LABELS.categoryUpdates, "Updates"],
+    [GMAIL_LABELS.categoryForums, "Forums"]
+  ]);
+}
+
+function collectDistinctTags(messages: readonly CachedMessageRecord[]): string[] {
+  return [...new Set(messages.flatMap((message) => [...message.labelSnapshot]))].sort();
 }
 
 interface ListRenderState {
@@ -112,96 +348,133 @@ interface ListRenderState {
   totalPages: number;
   pageSize: number;
   total: number;
-  hiddenTags: ReadonlySet<string>;
+  selectedTags: ReadonlySet<string>;
+  search: string;
+  labelNames: ReadonlyMap<string, string>;
 }
 
 function renderList(items: readonly CachedMessageRecord[], state: ListRenderState): void {
   console.log("");
-  console.log(pc.bold(`Inbox cache — ${state.total} message(s), page ${state.page + 1}/${state.totalPages} (page size ${state.pageSize})`));
-  if (state.hiddenTags.size > 0) {
-    console.log(pc.dim(`Hidden tags: ${[...state.hiddenTags].join(", ")}`));
-  }
+  console.log(
+    pc.bold(`Gmail — ${state.total} message(s), page ${state.page + 1}/${state.totalPages} (page size ${state.pageSize})`)
+  );
+  const filters = [...state.selectedTags].map((tag) => state.labelNames.get(tag) ?? tag);
+  if (filters.length > 0) console.log(pc.dim(`Labels: ${filters.join(", ")} (matching any)`));
+  if (state.search) console.log(pc.dim(`Search: ${state.search}`));
   console.log("");
-  if (items.length === 0) {
-    console.log(pc.dim("  (no messages on this page)"));
-  }
-  items.forEach((m, i) => {
-    const unread = !m.labelSnapshot.includes(GMAIL_LABELS.unread) ? " " : "*";
-    const subject = m.subject || "(no subject)";
-    const sender = m.senderDisplay ?? "(unknown sender)";
-    console.log(`  ${String(i + 1).padStart(2)}. ${unread} ${subject} — ${pc.dim(sender)}`);
+  if (items.length === 0) console.log(pc.dim("  (no matching messages)"));
+  items.forEach((message, index) => {
+    const unread = message.labelSnapshot.includes(GMAIL_LABELS.unread) ? pc.bold("●") : " ";
+    const date = message.internalDate ? new Date(Number(message.internalDate)).toLocaleDateString() : "";
+    console.log(
+      `  ${String(index + 1).padStart(2)}. ${unread} ${message.subject || "(no subject)"} — ${pc.dim(message.senderDisplay ?? "unknown")} ${pc.dim(date)}`
+    );
   });
   console.log("");
 }
 
-async function toggleTags(allTags: readonly string[], hiddenTags: Set<string>): Promise<void> {
-  if (allTags.length === 0) {
-    console.log(pc.dim("No tags found in the cache."));
-    return;
-  }
+async function chooseTags(
+  allTags: readonly string[],
+  current: ReadonlySet<string>,
+  labelNames: ReadonlyMap<string, string>
+): Promise<Set<string>> {
+  if (allTags.length === 0) return new Set();
   const selected = await p.multiselect({
-    message: "Visible tags (deselect to hide)",
-    options: allTags.map((tag) => ({ value: tag, label: tag })),
-    initialValues: allTags.filter((tag) => !hiddenTags.has(tag)),
+    message: "Show messages carrying any selected label (select none for all mail)",
+    options: allTags.map((tag) => ({ value: tag, label: labelNames.get(tag) ?? tag })),
+    initialValues: [...current],
     required: false
   });
-  if (p.isCancel(selected)) {
-    return;
-  }
-  hiddenTags.clear();
-  for (const tag of allTags) {
-    if (!selected.includes(tag)) {
-      hiddenTags.add(tag);
-    }
-  }
+  return p.isCancel(selected) ? new Set(current) : new Set(selected);
 }
 
 async function openMessage(
   gmailClient: GmailClient,
   accountHash: string,
+  userEmail: string,
   cached: CachedMessageRecord,
-  ctx: ReturnType<typeof bootstrap>
-): Promise<void> {
+  ctx: ReturnType<typeof bootstrap>,
+  getStyleExamples: () => Promise<SentStyleExample[]>,
+  canGoPrevious: boolean,
+  canGoNext: boolean
+): Promise<"back" | "previous" | "next"> {
   let raw;
+  const lock = new ProcessLock(lockFilePath(accountHash));
   try {
+    // Keep the live read and its possible mark-read/cache projection in one
+    // bounded critical section so a concurrent work run cannot archive or
+    // trash the message between our fetch and local cache update.
+    lock.acquire();
     raw = await fetchMessageFull(gmailClient, cached.gmailMessageId);
+    let currentLabelIds = raw.labelIds ?? [];
+    if (currentLabelIds.includes(GMAIL_LABELS.unread)) {
+      try {
+        await withGoogleApiRetry(
+          () =>
+            gmailClient.users.messages.modify({
+              userId: "me",
+              id: cached.gmailMessageId,
+              requestBody: { removeLabelIds: [GMAIL_LABELS.unread] }
+            }),
+          {},
+          0.25,
+          "gmail.messages.mark_read"
+        );
+        currentLabelIds = currentLabelIds.filter((label) => label !== GMAIL_LABELS.unread);
+        const projected = projectHydratedCacheMessage(
+          accountHash,
+          userEmail,
+          ctx.clock.nowIso(),
+          { id: cached.gmailMessageId, threadId: cached.gmailThreadId },
+          { ...raw, labelIds: currentLabelIds },
+          cached
+        );
+        if (projected) new MessagesRepository(ctx.db).upsert(projected);
+      } catch (error) {
+        console.error(
+          pc.yellow(`Message opened, but it could not be marked read: ${error instanceof Error ? error.message : String(error)}`)
+        );
+      }
+    }
+    raw = { ...raw, labelIds: currentLabelIds };
   } catch (error) {
-    console.error(pc.red(`Could not fetch this message: ${error instanceof Error ? error.message : String(error)}`));
-    return;
+    console.error(pc.red(`Could not open this message: ${error instanceof Error ? error.message : String(error)}`));
+    return "back";
+  } finally {
+    lock.release();
   }
-  const headers = headersFromMessage(raw);
+
   const labelIds = raw.labelIds ?? [];
   const { plain, html } = extractBodyParts(raw.payload ?? undefined);
   const message = buildNormalizedMessage({
     gmailMessageId: cached.gmailMessageId,
-    gmailThreadId: cached.gmailThreadId,
+    gmailThreadId: raw.threadId ?? cached.gmailThreadId,
     historyId: raw.historyId ?? "0",
     internalDate: raw.internalDate ?? cached.internalDate ?? "0",
     labelIds,
     snippet: raw.snippet ?? "",
-    headers,
+    headers: headersFromMessage(raw),
     htmlBody: html,
     plainBody: plain,
-    userEmail: "",
+    userEmail,
     threadHasUserSentMessage: false
   });
-
   renderMessage(message, labelIds);
 
   for (;;) {
-    console.log(pc.dim("\n[esc] back to list   [r] reply   [;][r] AI-drafted reply"));
+    console.log(pc.dim("\n[esc] list   [←/p] previous   [→/n] next   [r] reply   [;][r] AI reply"));
     const action = await waitForViewerAction();
-    if (action === "back") {
-      return;
+    if (action === "back") return "back";
+    if (action === "previous") {
+      if (canGoPrevious) return "previous";
+      console.log(pc.dim("Already at the first message in this view."));
     }
-    if (action === "reply") {
-      await handleManualReply(gmailClient, accountHash, ctx, message);
-      continue;
+    if (action === "next") {
+      if (canGoNext) return "next";
+      console.log(pc.dim("Already at the last message in this view."));
     }
-    if (action === "ai_reply") {
-      await handleAiReply(gmailClient, accountHash, ctx, message);
-      continue;
-    }
+    if (action === "reply") await handleManualReply(gmailClient, accountHash, message);
+    if (action === "ai_reply") await handleAiReply(gmailClient, accountHash, ctx, message, getStyleExamples);
   }
 }
 
@@ -210,37 +483,68 @@ function renderMessage(message: NormalizedMessage, labelIds: readonly string[]):
   console.log(pc.bold(message.subject || "(no subject)"));
   console.log(`From: ${message.from.displayName ?? message.from.address ?? "unknown"}`);
   if (message.to.length > 0) {
-    console.log(`To: ${message.to.map((a) => a.displayName ?? a.address ?? "unknown").join(", ")}`);
+    console.log(`To: ${message.to.map((address) => address.displayName ?? address.address ?? "unknown").join(", ")}`);
   }
-  if (message.dateHeader) {
-    console.log(`Date: ${message.dateHeader}`);
-  }
+  if (message.dateHeader) console.log(`Date: ${message.dateHeader}`);
   console.log(pc.dim(`Read: ${isRead(labelIds) ? "yes" : "no"}`));
   console.log("");
   const content = message.bodyText ?? message.snippet;
   console.log(content.length > 0 ? content : pc.dim("(no content)"));
 }
 
-type ViewerAction = "back" | "reply" | "ai_reply";
+type ViewerAction = "back" | "previous" | "next" | "reply" | "ai_reply";
 
-/** Detects the ";" then "r" sequence (within 1s) for an AI-drafted reply, vs. a bare "r" for a manual one. */
 async function waitForViewerAction(): Promise<ViewerAction> {
   let lastName: string | null = null;
   let lastAt = 0;
   for (;;) {
     const key = await waitForKeypress();
-    if (key.name === "escape") {
-      return "back";
-    }
-    if (key.name === "r" && lastName === ";" && Date.now() - lastAt < 1000) {
-      return "ai_reply";
-    }
-    if (key.name === "r") {
-      return "reply";
-    }
+    if (key.name === "escape") return "back";
+    if (key.name === "left" || key.name === "p") return "previous";
+    if (key.name === "right" || key.name === "n") return "next";
+    if (key.name === "r" && lastName === ";" && Date.now() - lastAt < 1000) return "ai_reply";
+    if (key.name === "r") return "reply";
     lastName = key.name;
     lastAt = Date.now();
   }
+}
+
+async function promptBody(message: string): Promise<string | null> {
+  console.log("");
+  console.log(pc.bold(message));
+  console.log(pc.dim("Enter plain text on as many lines as needed. Finish with a single . on its own line."));
+  const readline = createInterface({ input: process.stdin, output: process.stdout });
+  const lines: string[] = [];
+  try {
+    for (;;) {
+      const line = await readline.question(lines.length === 0 ? "> " : "| ");
+      if (line === ".") break;
+      lines.push(line);
+    }
+  } catch {
+    return null;
+  } finally {
+    readline.close();
+  }
+  const body = lines.join("\n").trim();
+  return body || null;
+}
+
+async function reviewAiDraft(draft: string): Promise<string | null> {
+  console.log("");
+  console.log(pc.bold("AI draft"));
+  console.log(draft);
+  console.log("");
+  const choice = await p.select({
+    message: "What next?",
+    options: [
+      { value: "use", label: "Use this draft" },
+      { value: "replace", label: "Replace the body" },
+      { value: "discard", label: "Discard" }
+    ]
+  });
+  if (p.isCancel(choice) || choice === "discard") return null;
+  return choice === "replace" ? promptBody("Replacement body") : draft;
 }
 
 async function confirmAndSend(
@@ -250,23 +554,17 @@ async function confirmAndSend(
   body: string
 ): Promise<void> {
   console.log("");
-  console.log(pc.bold("Reply preview"));
+  console.log(pc.bold(target.threadId ? "Reply preview" : "Message preview"));
   console.log(`To: ${target.to}`);
   console.log(`Subject: ${target.subject}`);
   console.log("");
   console.log(body);
   console.log("");
-
-  const confirmed = await p.confirm({ message: "Send this reply?", initialValue: false });
+  const confirmed = await p.confirm({ message: "Send this exact message?", initialValue: false });
   if (p.isCancel(confirmed) || !confirmed) {
     console.log(pc.dim("Not sent."));
     return;
   }
-
-  // Locked for the send itself only — gmail view is otherwise a read-heavy
-  // interactive session with no reason to hold an exclusive lock for its
-  // whole lifetime, but the actual outbound send is a real Gmail mutation
-  // and must not race a concurrent gmail/gmail work run.
   const lock = new ProcessLock(lockFilePath(accountHash));
   lock.acquire();
   try {
@@ -279,19 +577,14 @@ async function confirmAndSend(
   }
 }
 
-async function handleManualReply(
-  gmailClient: GmailClient,
-  accountHash: string,
-  ctx: ReturnType<typeof bootstrap>,
-  message: NormalizedMessage
-): Promise<void> {
+async function handleManualReply(gmailClient: GmailClient, accountHash: string, message: NormalizedMessage): Promise<void> {
   const target = buildReplyTarget(message);
   if (!target) {
     console.log(pc.red("This message has no usable address to reply to."));
     return;
   }
-  const body = await p.text({ message: `Reply to ${target.to}` });
-  if (p.isCancel(body) || body.trim().length === 0) {
+  const body = await promptBody(`Reply to ${target.to}`);
+  if (!body) {
     console.log(pc.dim("Cancelled."));
     return;
   }
@@ -302,7 +595,8 @@ async function handleAiReply(
   gmailClient: GmailClient,
   accountHash: string,
   ctx: ReturnType<typeof bootstrap>,
-  message: NormalizedMessage
+  message: NormalizedMessage,
+  getStyleExamples: () => Promise<SentStyleExample[]>
 ): Promise<void> {
   const target = buildReplyTarget(message);
   if (!target) {
@@ -315,33 +609,70 @@ async function handleAiReply(
     config: ctx.config
   });
   if (!credentials) {
-    console.log(pc.yellow("AI is not configured (no API key found) — use \"r\" for a manual reply instead."));
+    console.log(pc.yellow("AI is not configured (no API key found) — use r for a manual reply instead."));
     return;
   }
-
+  const guidance = await p.text({ message: "Optional guidance for the reply", placeholder: "Press Enter to let AI decide" });
+  if (p.isCancel(guidance)) return;
   const spinner = p.spinner();
-  spinner.start("Drafting a reply with AI");
-  const draft = await draftReply(message, credentials);
-  spinner.stop(draft ? "Draft ready." : "Could not draft a reply.");
-  if (!draft) {
-    return;
-  }
-
-  console.log("");
-  console.log(pc.bold("AI-drafted reply"));
-  console.log(draft);
-
-  const choice = await p.select({
-    message: "What next?",
-    options: [
-      { value: "send", label: "Send this reply" },
-      { value: "discard", label: "Discard" }
-    ]
-  });
-  if (p.isCancel(choice) || choice === "discard") {
+  spinner.start("Learning your style from recent Sent mail and drafting");
+  const styleExamples = await getStyleExamples();
+  const draft = await draftReply(message, credentials, { styleExamples, guidance });
+  spinner.stop(draft ? `Draft ready (${styleExamples.length} style example(s)).` : "Could not draft a reply.");
+  if (!draft) return;
+  const edited = await reviewAiDraft(draft);
+  if (!edited) {
     console.log(pc.dim("Discarded."));
     return;
   }
+  await confirmAndSend(gmailClient, accountHash, target, edited);
+}
 
-  await confirmAndSend(gmailClient, accountHash, target, draft);
+async function handleCompose(
+  gmailClient: GmailClient,
+  accountHash: string,
+  useAi: boolean,
+  ctx: ReturnType<typeof bootstrap>,
+  getStyleExamples: () => Promise<SentStyleExample[]>
+): Promise<void> {
+  const to = await p.text({ message: "To" });
+  if (p.isCancel(to)) return;
+  const subject = await p.text({ message: "Subject" });
+  if (p.isCancel(subject)) return;
+  const target = buildComposeTarget(to, subject);
+  if (!target) {
+    console.log(pc.red("Enter valid email addresses separated by commas; headers cannot contain line breaks."));
+    return;
+  }
+  let body: string | null;
+  if (!useAi) {
+    body = await promptBody("Message body");
+  } else {
+    const purpose = await p.text({ message: "What should this email say?" });
+    if (p.isCancel(purpose) || !purpose.trim()) return;
+    const credentials = await resolveOpenAiCredentials({
+      accountHash,
+      credentialStore: ctx.credentialStore,
+      config: ctx.config
+    });
+    if (!credentials) {
+      console.log(pc.yellow("AI is not configured; use c to compose manually."));
+      return;
+    }
+    const spinner = p.spinner();
+    spinner.start("Learning your style from recent Sent mail and drafting");
+    const styleExamples = await getStyleExamples();
+    const draft = await draftNewEmail(
+      { to: target.to, subject: target.subject, purpose },
+      credentials,
+      { styleExamples }
+    );
+    spinner.stop(draft ? `Draft ready (${styleExamples.length} style example(s)).` : "Could not draft the email.");
+    body = draft ? await reviewAiDraft(draft) : null;
+  }
+  if (!body) {
+    console.log(pc.dim("Cancelled."));
+    return;
+  }
+  await confirmAndSend(gmailClient, accountHash, target, body);
 }

@@ -274,6 +274,36 @@ export class GoogleApiRateLimiter {
     await admission;
   }
 
+  /** Failures from requests admitted at the old pace are one pressure wave. */
+  reportQuotaPressureForAttempt(requestRate: number, cooldownMs: number): void {
+    if (requestRate <= this.currentRequestsPerSecond) {
+      this.reportQuotaPressure(cooldownMs);
+    } else if (cooldownMs > this.quotaCooldownRemainingMs) {
+      // Still honor a real server Retry-After, without halving once per worker.
+      this.cooldownUntil = Date.now() + Math.min(cooldownMs, 60_000);
+      for (const listener of this.quotaWaitListeners) listener(this.quotaCooldownRemainingMs);
+    }
+  }
+
+  /**
+   * A named per-minute rejection means the current rolling quota window is
+   * already full; it does not prove that our sustainable configured pace is
+   * too high. This commonly happens when a cache run starts less than a
+   * minute after another CLI process consumed quota. Hold all queued work
+   * until that external window can clear without permanently ratcheting the
+   * process down to the 0.25 req/s floor.
+   */
+  pauseForQuotaWindow(cooldownMs: number): void {
+    if (!Number.isFinite(cooldownMs) || cooldownMs <= 0) return;
+    const now = Date.now();
+    this.consecutiveSuccesses = 0;
+    // Treat failures from requests already in flight as one pressure wave;
+    // they must not keep extending the same one-minute pause.
+    if (this.cooldownUntil > now) return;
+    this.cooldownUntil = now + Math.min(cooldownMs, 60_000);
+    for (const listener of this.quotaWaitListeners) listener(this.quotaCooldownRemainingMs);
+  }
+
   reportQuotaPressure(cooldownMs = 0): void {
     const now = Date.now();
     // All failures in one in-flight wave share one slowdown. Repeatedly
@@ -367,8 +397,9 @@ export const googleApiRateLimiter = new GoogleApiRateLimiter(
 /**
  * `withApiRetry`, but for Gmail/Calendar calls specifically: paces every
  * attempt (including retries) through the shared `googleApiRateLimiter`
- * first, and feeds that limiter's adaptive backoff from whether each
- * attempt hit a retryable (quota-shaped) failure or not.
+ * first, and feeds that limiter's adaptive backoff from whether the first
+ * attempt of the logical request hit a retryable (quota-shaped) failure or
+ * not. Retries share that request's pressure signal.
  *
  * `weight` is this call's Gmail quota-unit cost relative to the baseline
  * `messages.get` (20 units = weight 1) the limiter's requests/second
@@ -382,20 +413,97 @@ export const googleApiRateLimiter = new GoogleApiRateLimiter(
  * *every* message about to be trashed and was therefore the one omission
  * that could actually double a typical run's real unit cost.
  */
-export async function withGoogleApiRetry<T>(fn: () => Promise<T>, options: RetryOptions = {}, weight = 1): Promise<T> {
+export interface GoogleApiAttemptEvent {
+  requestId: number;
+  attempt: number;
+  operation: string;
+  stage: "queued" | "started" | "succeeded" | "failed";
+  quotaWeight: number;
+  limiterWaitMs?: number;
+  networkMs?: number;
+  status?: number;
+  errorClass?: "quota" | "network" | "http" | "unknown";
+  quotaReason?: "concurrent_requests" | "per_minute" | "bandwidth" | "rate_limit";
+  requestsPerSecond: number;
+}
+function quotaReason(error: unknown): NonNullable<GoogleApiAttemptEvent["quotaReason"]> {
+  const value = error as { message?: string; response?: { data?: { error?: { message?: string } } } } | undefined;
+  const message = value?.response?.data?.error?.message ?? value?.message ?? "";
+  if (/concurrent/i.test(message)) return "concurrent_requests";
+  if (/per minute/i.test(message)) return "per_minute";
+  if (/bandwidth/i.test(message)) return "bandwidth";
+  return "rate_limit";
+}
+const PER_MINUTE_QUOTA_WINDOW_MS = 60_000;
+const attemptListeners = new Set<(event: GoogleApiAttemptEvent) => void>();
+let nextRequestId = 0;
+export function subscribeGoogleApiAttempts(listener: (event: GoogleApiAttemptEvent) => void): () => void {
+  attemptListeners.add(listener);
+  return () => { attemptListeners.delete(listener); };
+}
+function emitAttempt(event: GoogleApiAttemptEvent): void {
+  for (const listener of attemptListeners) listener(event);
+}
+
+export async function withGoogleApiRetry<T>(fn: () => Promise<T>, options: RetryOptions = {}, weight = 1, operation = "google.api"): Promise<T> {
+  const requestId = ++nextRequestId;
+  let attempt = 0;
   return withApiRetry(async () => {
+    const queuedAt = performance.now();
+    const base = { requestId, attempt: ++attempt, operation, quotaWeight: weight };
+    emitAttempt({ ...base, stage: "queued", requestsPerSecond: googleApiRateLimiter.currentRequestsPerSecond });
     await googleApiRateLimiter.acquire(weight);
+    const networkStartedAt = performance.now();
+    const limiterWaitMs = Math.round(networkStartedAt - queuedAt);
+    emitAttempt({ ...base, stage: "started", limiterWaitMs, requestsPerSecond: googleApiRateLimiter.currentRequestsPerSecond });
+    const admittedRate = googleApiRateLimiter.currentRequestsPerSecond;
     try {
       const result = await fn();
       googleApiRateLimiter.reportSuccess(weight);
+      emitAttempt({ ...base, stage: "succeeded", limiterWaitMs, networkMs: Math.round(performance.now() - networkStartedAt), requestsPerSecond: googleApiRateLimiter.currentRequestsPerSecond });
       return result;
     } catch (error) {
+      const status = apiErrorStatus(error);
+      const detectedQuotaReason = isGoogleQuotaError(error) ? quotaReason(error) : undefined;
+      emitAttempt({ ...base, stage: "failed", limiterWaitMs, networkMs: Math.round(performance.now() - networkStartedAt),
+        ...(status !== undefined ? { status } : {}),
+        ...(detectedQuotaReason !== undefined ? { quotaReason: detectedQuotaReason } : {}),
+        errorClass: detectedQuotaReason !== undefined ? "quota" : isRetryableNetworkError(error) ? "network" : status !== undefined ? "http" : "unknown",
+        requestsPerSecond: googleApiRateLimiter.currentRequestsPerSecond });
       // 5xx responses remain retryable in withApiRetry, but they indicate a
       // provider outage rather than quota pressure. Slowing every later
       // Gmail call after a transient 500/503 only compounds that outage.
       if (isGoogleQuotaError(error)) {
+        // A generic quota error without Retry-After only slows future
+        // admissions; the old unconditional flat cooldown stalled all work
+        // without knowing which window was full. The one deliberate fallback
+        // is an error that explicitly names the per-minute bucket: pausing a
+        // full rolling minute is then more accurate than repeatedly halving
+        // an otherwise-valid sustained rate.
+        const serverRetryAfterMs = retryAfterMs(error);
         const cap = options.maxDelayMs ?? DEFAULT_OPTIONS.maxDelayMs;
-        googleApiRateLimiter.reportQuotaPressure(Math.min(retryAfterMs(error) ?? 10_000, cap));
+        // Retries belong to the same logical request. Halving the shared
+        // limiter once for every retry made one quota incident cascade into
+        // 4.58 -> 2.29 -> 1.14 requests/sec and slowed unrelated workers.
+        // The first failed attempt is enough to signal this pressure wave;
+        // the retry loop itself already waits before trying again.
+        if (attempt === 1) {
+          if (detectedQuotaReason === "per_minute") {
+            // A prior CLI process or another consumer can have filled the
+            // provider's rolling window even though this process is pacing
+            // below 6,000 units/minute. Wait out that window as a group;
+            // halving once per newly admitted request caused the observed
+            // 4.58 -> 0.25 req/s cache crawl after only ~100 messages.
+            googleApiRateLimiter.pauseForQuotaWindow(
+              serverRetryAfterMs !== null ? Math.min(serverRetryAfterMs, cap) : PER_MINUTE_QUOTA_WINDOW_MS
+            );
+          } else {
+            googleApiRateLimiter.reportQuotaPressureForAttempt(
+              admittedRate,
+              serverRetryAfterMs !== null ? Math.min(serverRetryAfterMs, cap) : 0
+            );
+          }
+        }
       } else {
         googleApiRateLimiter.reportNetworkError();
       }

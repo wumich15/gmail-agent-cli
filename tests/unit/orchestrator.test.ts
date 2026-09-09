@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { resolvePostScanHistoryMarker, runWorkScan, type CachedAssessmentSnapshot } from "../../src/core/orchestrator.js";
+import { googleApiRateLimiter } from "../../src/core/api-retry.js";
 import { SystemClock } from "../../src/core/clock.js";
 import { buildNormalizedMessage, headerMapFromList } from "../../src/gmail/normalize.js";
 import type { Classifier } from "../../src/ai/classifier.js";
@@ -193,11 +194,19 @@ describe("runWorkScan", () => {
         schemaVersion: "test"
       }
     });
-    const { outcomes } = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
-    expect(outcomes).toHaveLength(1);
-    expect(outcomes[0]!.decision.actions.some((a) => a.type === "trash")).toBe(false);
-    expect(outcomes[0]!.decision.needsReview).toBe(true);
-    expect(outcomes[0]!.decision.reviewReason).toBe("thread_reply_check_failed");
+    // Production deliberately leaves the shared queue paused after this
+    // error. Stub only that cross-request side effect so this unit test does
+    // not leak a real 60-second cooldown into the remaining test cases.
+    const pause = vi.spyOn(googleApiRateLimiter, "pauseForQuotaWindow").mockImplementation(() => {});
+    try {
+      const { outcomes } = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
+      expect(outcomes).toHaveLength(1);
+      expect(outcomes[0]!.decision.actions.some((a) => a.type === "trash")).toBe(false);
+      expect(outcomes[0]!.decision.needsReview).toBe(true);
+      expect(outcomes[0]!.decision.reviewReason).toBe("thread_reply_check_failed");
+    } finally {
+      pause.mockRestore();
+    }
   });
 
   it("vetoes AI-derived trash for an authenticated, high-risk-content message instead of trashing it", async () => {

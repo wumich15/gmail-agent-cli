@@ -1,7 +1,4 @@
-import type { OAuth2Client } from "google-auth-library";
 import type { gmail_v1 } from "googleapis";
-import { hydrateMessagesBatched, type BatchHydrationDiagnostics } from "../gmail/batch-hydrate.js";
-import { batchHydrationEnabled, configuredBatchSize } from "../gmail/hydration-options.js";
 import type { Classifier } from "../ai/classifier.js";
 import type { GmailClient } from "../gmail/client.js";
 import {
@@ -17,11 +14,11 @@ import {
   type MessageStub
 } from "../gmail/scanner.js";
 import { buildNormalizedMessage, extractBodyParts } from "../gmail/normalize.js";
-import { GMAIL_LABELS, hasUnattributedProtectionLabel, isInInbox, isNativeSpam, isRead } from "../gmail/labels.js";
-import { findMatchingRuleGroups } from "../rules/matcher.js";
+import { GMAIL_LABELS, hasBulkHeaderSignal, isInInbox, isNativeSpam, isRead } from "../gmail/labels.js";
+import { findMatchingRuleGroups, normalizeAddress, normalizeListId } from "../rules/matcher.js";
 import { evaluateMessagePolicy, POLICY_VERSION, type MessagePolicyInput, type PolicyThresholds } from "./policy.js";
 import { hasAuthenticatedHighRiskSignal } from "./high-risk-signal.js";
-import { buildRunSummary, type MessageOutcome, type RunSummary } from "../summary/build-summary.js";
+import { buildRunSummary, type AutomaticSpamRuleCandidate, type MessageOutcome, type RunSummary } from "../summary/build-summary.js";
 import { sourceEvidencePresent, validateEventCandidate, type ValidatedEvent } from "../calendar/event-policy.js";
 import { mapWithConcurrency } from "./concurrency.js";
 import { buildDeterministicSummary } from "../ai/prompt.js";
@@ -38,7 +35,6 @@ import type { Clock } from "./clock.js";
 
 export interface OrchestratorDeps {
   gmailClient: GmailClient;
-  oauthClient?: OAuth2Client;
   classifier: Classifier;
   ruleGroups: readonly RuleGroup[];
   userEmail: string;
@@ -62,8 +58,6 @@ export interface OrchestratorDeps {
    */
   limit?: number;
   policyThresholds?: PolicyThresholds;
-  /** Message IDs the app's own ledger has starred/marked-important, for protection detection. */
-  appAttributedLabelsByMessageId?: ReadonlyMap<string, ReadonlySet<"STARRED" | "IMPORTANT">>;
   /** The user's current custom Gmail label names, passed to the classifier so it prefers reusing one. */
   existingLabels?: readonly string[];
   /**
@@ -154,7 +148,6 @@ export interface OrchestratorDeps {
   /** Optional progress sink used by the CLI; omitted by library/test callers. */
   progress?: ClassifierProgress;
   readProgress?: ReadProgress;
-  onBatchDiagnostics?: (diagnostics: BatchHydrationDiagnostics) => void;
 }
 
 export interface ReadProgress {
@@ -220,6 +213,11 @@ export interface MessageCacheUpdate {
  */
 export const MIN_LABEL_BATCH_SIZE = 10;
 
+/** Three unread messages from the same narrow bulk identity are enough to persist a spam rule. */
+export const MIN_AUTOMATIC_SPAM_RULE_MESSAGES = 3;
+/** Old routine mail is only auto-trashed after a long retention window. */
+const OLD_LOW_VALUE_DAYS = 90;
+
 /** One category name's cumulative-count bookkeeping to persist after a run — see `priorLabelCandidateCounts`. */
 export interface LabelCandidateUpdate {
   normalizedName: string;
@@ -268,6 +266,9 @@ export interface ScanDiagnostics {
   threadChecks: number;
   threadCheckFailures: number;
   cachedBacklogQueued: number;
+  /** Epoch-millisecond bounds of successfully hydrated messages, for diagnosing a stale/recent-mail gap. */
+  oldestMessageInternalDate: string | null;
+  newestMessageInternalDate: string | null;
 }
 
 function emptyScanDiagnostics(): ScanDiagnostics {
@@ -286,8 +287,26 @@ function emptyScanDiagnostics(): ScanDiagnostics {
     assessmentCacheHits: 0,
     threadChecks: 0,
     threadCheckFailures: 0,
-    cachedBacklogQueued: 0
+    cachedBacklogQueued: 0,
+    oldestMessageInternalDate: null,
+    newestMessageInternalDate: null
   };
+}
+
+function recordMessageDateBounds(
+  diagnostics: ScanDiagnostics,
+  messages: readonly PreprocessedMessage[]
+): void {
+  const dates = messages
+    .map((message) => message.normalized.internalDate)
+    .filter((date) => /^\d+$/.test(date));
+  if (dates.length === 0) return;
+  diagnostics.oldestMessageInternalDate = dates.reduce((oldest, date) =>
+    BigInt(date) < BigInt(oldest) ? date : oldest
+  );
+  diagnostics.newestMessageInternalDate = dates.reduce((newest, date) =>
+    BigInt(date) > BigInt(newest) ? date : newest
+  );
 }
 
 export function dedupeStubs(stubs: readonly MessageStub[]): MessageStub[] {
@@ -344,7 +363,7 @@ export async function runWorkScan(deps: OrchestratorDeps): Promise<WorkScanResul
   return result;
 }
 
-/** Phase 1: fetch + normalize + rule-match every stub, batched at gmailReads concurrency, sorted most-recent-first. */
+/** Phase 1: fetch + normalize + rule-match every stub through a bounded worker pool, sorted most-recent-first. */
 async function fetchAndNormalizeAll(
   stubs: readonly MessageStub[],
   deps: OrchestratorDeps,
@@ -370,20 +389,12 @@ async function fetchAndNormalizeAll(
     deps.readProgress?.onProgress(++completed, stubs.length, failed.length);
   };
   try {
-    if (deps.oauthClient && batchHydrationEnabled()) {
-      const byId = new Map(stubs.map((stub) => [stub.id, stub]));
-      const batchDiagnostics = await hydrateMessagesBatched(deps.gmailClient, deps.oauthClient, [...byId.keys()],
-        (id, raw) => record(byId.get(id)!, raw), { initialBatchSize: configuredBatchSize() });
-      deps.readProgress?.onFinish(failed.length === 0);
-      deps.onBatchDiagnostics?.(batchDiagnostics);
-    } else {
-      await mapWithConcurrency(stubs, deps.concurrency.gmailReads, async (stub) => {
-        let raw: gmail_v1.Schema$Message | null;
-        try { raw = await fetchMessageFull(deps.gmailClient, stub.id); }
-        catch { raw = null; }
-        record(stub, raw);
-      });
-    }
+    await mapWithConcurrency(stubs, deps.concurrency.gmailReads, async (stub) => {
+      let raw: gmail_v1.Schema$Message | null;
+      try { raw = await fetchMessageFull(deps.gmailClient, stub.id); }
+      catch { raw = null; }
+      record(stub, raw);
+    });
   } finally {
     deps.readProgress?.onFinish(completed === stubs.length && failed.length === 0);
   }
@@ -609,6 +620,7 @@ async function runFullScan(
   const stubs = dedupeStubs([...spamResult.messages, ...inboxResult.messages]);
   const fetchStartedAt = performance.now();
   const { messages: fetched, failed } = await fetchAndNormalizeAll(stubs, deps, profile.emailAddress);
+  recordMessageDateBounds(diagnostics, fetched);
   const preprocessed = fetched.filter((pre) => isInInbox(pre.labelIds) || isNativeSpam(pre.labelIds));
   diagnostics.messageFetchMs = performance.now() - fetchStartedAt;
   diagnostics.messagesFetched = stubs.length - failed.length;
@@ -679,6 +691,7 @@ async function runIncrementalScan(
 
   const fetchStartedAt = performance.now();
   const { messages: preprocessedAll, failed } = await fetchAndNormalizeAll(stubs, deps, userEmail);
+  recordMessageDateBounds(diagnostics, preprocessedAll);
   diagnostics.messageFetchMs = performance.now() - fetchStartedAt;
   diagnostics.messagesFetched = stubs.length - failed.length;
   diagnostics.messagesFailed = failed.length;
@@ -855,16 +868,6 @@ interface PreprocessedMessage {
   nativeSpam: boolean;
   explicitRule: { action: RuleAction; ruleGroupId: string } | null;
   authFailedImportantRule: boolean;
-  /**
-   * Protection from cheap, already-available signals only (explicit
-   * important rule, a preexisting unattributed STARRED/IMPORTANT label) —
-   * does NOT yet reflect thread-reply status, which is deliberately
-   * deferred to `finalizeOutcome` and only checked for a message that's
-   * actually about to be trashed (see that function's doc comment). This
-   * field alone is therefore NOT the full protection determination; do not
-   * treat it as such outside this file.
-   */
-  isProtected: boolean;
   /** True when native spam or an explicit spam rule means the classifier must never be called for this message. */
   bypassed: boolean;
 }
@@ -894,8 +897,8 @@ function normalizeFetchedMessage(
     plainBody: plain,
     userEmail,
     // Real thread-reply status is resolved lazily in finalizeOutcome, only
-    // for a message that's actually about to be trashed — see this
-    // struct's isProtected doc comment. This placeholder mirrors every
+    // for a message that's actually about to be trashed — see that function's
+    // content-protection logic. This placeholder mirrors every
     // other call site that builds a NormalizedMessage outside this
     // pipeline (view.ts, cache.ts, spam.ts, important.ts).
     threadHasUserSentMessage: false
@@ -903,19 +906,20 @@ function normalizeFetchedMessage(
 
   const nativeSpam = isNativeSpam(labelIds);
   const ruleMatches = findMatchingRuleGroups(deps.ruleGroups, normalized);
-  const matched = ruleMatches.find((r) => r.result === "matched");
+  // An explicit spam rule is a direct user instruction and wins an overlap
+  // with an older important rule. `gmail add spam` is the deliberate escape
+  // hatch for correcting an over-broad protection rule.
+  const matched =
+    ruleMatches.find((r) => r.result === "matched" && r.ruleGroup.action === "spam") ??
+    ruleMatches.find((r) => r.result === "matched");
   const explicitRule = matched ? { action: matched.ruleGroup.action, ruleGroupId: matched.ruleGroup.id } : null;
   // A structurally-matching important rule whose stored DKIM/DMARC binding
   // failed to verify must not be silently ignored — that's exactly the
   // spoofed-sender case the binding exists to catch — so it forces Review
   // rather than letting the message fall through to ordinary handling.
-  const authFailedImportantRule = ruleMatches.some(
+  const authFailedImportantRule = explicitRule?.action !== "spam" && ruleMatches.some(
     (r) => r.result === "auth_failed" && r.ruleGroup.action === "important"
   );
-
-  const appAttributed = deps.appAttributedLabelsByMessageId?.get(stub.id) ?? new Set<"STARRED" | "IMPORTANT">();
-  const isProtected =
-    explicitRule?.action === "important" || hasUnattributedProtectionLabel(labelIds, appAttributed);
 
   return {
     stub: resolvedStub,
@@ -924,7 +928,6 @@ function normalizeFetchedMessage(
     nativeSpam,
     explicitRule,
     authFailedImportantRule,
-    isProtected,
     bypassed: explicitRule?.action === "spam" || nativeSpam
   };
 }
@@ -934,9 +937,9 @@ function normalizeFetchedMessage(
  * needed to decide whether a message that WOULD otherwise be trashed
  * (native spam, an explicit spam rule, or a high-confidence AI verdict)
  * should instead be protected because the user has replied in its thread.
- * For every other message — the large majority of a normal inbox — the
- * cheap signals `PreprocessedMessage.isProtected` already carries are
- * sufficient, so no extra Gmail call happens at all. This is what lets the
+ * Content protection itself is derived from actionable/calendar assessment
+ * signals after classification; labels alone do not block cleanup. This is
+ * what lets the
  * thread-reply-protection fix from an earlier pass avoid roughly doubling
  * Gmail call volume on every run.
  */
@@ -952,20 +955,31 @@ async function finalizeOutcome(
   const assessment = assessmentResult?.ok ? assessmentResult.assessment : null;
   const assessmentUnavailable = !pre.bypassed && assessmentResult !== null && !assessmentResult.ok;
 
+  const contentIsActionableOrCalendar = assessment !== null && (
+    assessment.event.intent !== "none" ||
+    assessment.reasonCodes.some((reason) =>
+      ["security", "financial", "reservation", "deadline", "user_action_required", "direct_question"].includes(reason)
+    )
+  );
+  // An explicit spam rule is a direct user instruction. The command path
+  // marks it as an intentional override of the content safety guard,
+  // including an actionable/calendar assessment.
+  const protectedForPolicy = contentIsActionableOrCalendar;
   const policyInput: MessagePolicyInput = {
     gmailMessageId: stub.id,
     isInInbox: isInInbox(labelIds),
     isRead: isRead(labelIds),
     isNativeSpam: nativeSpam,
-    isProtected: pre.isProtected,
+    isProtected: protectedForPolicy,
     explicitRule,
+    explicitSpamOverride: explicitRule?.action === "spam",
     hasAuthenticatedHighRiskSignal: hasAuthenticatedHighRiskSignal(normalized),
     assessment,
     assessmentUnavailable
   };
   let rawDecision = evaluateMessagePolicy(policyInput, deps.policyThresholds);
 
-  if (!pre.isProtected && rawDecision.actions.some((a) => a.type === "trash")) {
+  if (explicitRule?.action !== "spam" && !protectedForPolicy && rawDecision.actions.some((a) => a.type === "trash")) {
     let threadHasUserSentMessagePromise: Promise<boolean>;
     if (deps.sentThreadIndexUnavailable) {
       // An incomplete protection index is not evidence that the thread is
@@ -1073,6 +1087,61 @@ async function finalizeOutcome(
     decision = { ...decision, needsReview: true, reviewReason: "important_rule_auth_failed" };
   }
 
+  // Reduce the long tail of low-value mail without weakening the existing
+  // protection rules. This only applies after a full usable assessment, a
+  // 90-day retention window, and no critical signal/event. It deliberately
+  // catches both read and unread messages that would otherwise remain
+  // unchanged forever.
+  const ageMs = Number(normalized.internalDate) > 0
+    ? Math.max(0, deps.clock.now().getTime() - Number(normalized.internalDate))
+    : 0;
+  const ageDays = ageMs / 86_400_000;
+  const oldLowValue =
+    decision.actions.length === 0 &&
+    !decision.needsReview &&
+    !protectedForPolicy &&
+    !nativeSpam &&
+    explicitRule === null &&
+    ageDays >= OLD_LOW_VALUE_DAYS &&
+    assessment !== null &&
+    (assessment.kind === "personal_routine" || assessment.kind === "automated_low_value") &&
+    assessment.confidence >= 0.8 &&
+    !hasAuthenticatedHighRiskSignal(normalized) &&
+    assessment.event.intent === "none" &&
+    !assessment.reasonCodes.some((reason) =>
+      ["security", "financial", "reservation", "receipt", "deadline", "user_action_required", "direct_question"].includes(reason)
+    );
+  if (oldLowValue) {
+    decision = { actions: [{ type: "trash", reasonCode: "old_low_value" }], needsReview: false, reviewReason: null };
+  }
+
+  let automaticSpamRuleCandidate: AutomaticSpamRuleCandidate | null = null;
+  const bulkIdentity = normalized.listId
+    ? { kind: "list_id" as const, normalizedValue: normalizeListId(normalized.listId) }
+    : normalized.from.address
+      ? { kind: "from_address" as const, normalizedValue: normalizeAddress(normalized.from.address) }
+      : null;
+  const isRepeatedBulkCandidate =
+    assessment !== null &&
+    !protectedForPolicy &&
+    !nativeSpam &&
+    !normalized.isFromUser &&
+    explicitRule === null &&
+    !isRead(labelIds) &&
+    !decision.needsReview &&
+    decision.actions.some((action) => action.type === "trash") &&
+    (assessment.kind === "promotion" || assessment.kind === "automated_low_value") &&
+    assessment.confidence >= 0.9 &&
+    !hasAuthenticatedHighRiskSignal(normalized) &&
+    hasBulkHeaderSignal(normalized) &&
+    bulkIdentity !== null;
+  if (isRepeatedBulkCandidate && bulkIdentity !== null) {
+    automaticSpamRuleCandidate = {
+      categoryName: `Auto spam: ${bulkIdentity.normalizedValue}`,
+      matcher: { kind: bulkIdentity.kind, normalizedValue: bulkIdentity.normalizedValue, authBinding: null }
+    };
+  }
+
   return {
     gmailMessageId: stub.id,
     gmailThreadId: stub.threadId,
@@ -1084,6 +1153,7 @@ async function finalizeOutcome(
     validatedEvent,
     classifierVersion: assessment?.classifierVersion ?? null,
     internalDate: normalized.internalDate,
-    isUnread: !isRead(labelIds)
+    isUnread: !isRead(labelIds),
+    automaticSpamRuleCandidate
   };
 }

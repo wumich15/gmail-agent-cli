@@ -1,3 +1,4 @@
+import { startRunDiagnostics } from "../logging/run-diagnostics.js";
 import pc from "picocolors";
 import type { gmail_v1 } from "googleapis";
 import { bootstrap } from "../core/bootstrap.js";
@@ -15,12 +16,11 @@ import {
   listAllMessageIds,
   type MessageStub
 } from "../gmail/scanner.js";
-import { formatBatchDiagnostics, hydrateMessagesBatched } from "../gmail/batch-hydrate.js";
 import { projectHydratedCacheMessage } from "../gmail/cache-projection.js";
-import { batchHydrationEnabled, configuredBatchSize } from "../gmail/hydration-options.js";
 import { GMAIL_LABELS } from "../gmail/labels.js";
 import { googleApiRateLimiter } from "../core/api-retry.js";
 import { createReadProgress, type ReadProgressDisplay } from "./progress.js";
+import { SETTING_KEYS, SettingsRepository } from "../state/repositories/settings.js";
 
 // Full-message hydration is still paced by the shared, quota-weighted Gmail
 // limiter. Keeping a few more reads in flight overlaps network latency without
@@ -91,16 +91,18 @@ export interface CacheOptions {
 
 export async function runCache(options: CacheOptions = {}): Promise<number> {
   const ctx = bootstrap();
-  const { account, gmailClient, oauthClient } = await resolveAccountSigningInIfNeeded(ctx);
+  const { account, gmailClient } = await resolveAccountSigningInIfNeeded(ctx);
 
   const lock = new ProcessLock(lockFilePath(account.accountHash));
   lock.acquire();
+  const diagnosticsLog = startRunDiagnostics(ctx.logger, "cache", options.limit);
   const progress = createCacheProgress();
   const unsubscribeQuotaWait = googleApiRateLimiter.subscribeQuotaWait((waitMs) => progress.read.onQuotaWait(waitMs));
   progress.start();
   try {
     const profile = await fetchProfile(gmailClient);
 
+    diagnosticsLog.phase("discovery");
     progress.discovering();
     let spamDiscovered = 0;
     let inboxDiscovered = 0;
@@ -147,14 +149,9 @@ export async function runCache(options: CacheOptions = {}): Promise<number> {
       );
     }
 
-    const useBatchHydration = batchHydrationEnabled();
-    progress.read.writeMessage(
-      pc.dim(
-        useBatchHydration
-          ? `Caching ${stubs.length} message(s) via multipart batches of up to ${configuredBatchSize()}...`
-          : `Caching ${stubs.length} message(s) with ${GMAIL_CACHE_READ_CONCURRENCY} concurrent, quota-paced reads...`
-      )
-    );
+    progress.read.writeMessage(pc.dim(
+      `Caching ${stubs.length} message(s) with ${GMAIL_CACHE_READ_CONCURRENCY} concurrent, quota-paced reads...`
+    ));
 
     const messagesRepo = new MessagesRepository(ctx.db);
     const existingRows = messagesRepo.listForAccount(account.accountHash);
@@ -205,49 +202,24 @@ export async function runCache(options: CacheOptions = {}): Promise<number> {
       if (pendingRows.length + pendingDeletes.length >= 50) flushCache();
       progress.hydrationProgress(completedIds.size, cached, failed);
     };
-    let batchSummary = "";
+    diagnosticsLog.phase("hydration");
     progress.hydrationStart(stubs.length);
     try {
-      if (useBatchHydration) {
-        const stubById = new Map(stubs.map((stub) => [stub.id, stub]));
-        const batchDiagnostics = await hydrateMessagesBatched(
-          gmailClient,
-          oauthClient,
-          stubs.map((stub) => stub.id),
-          (id, message) => {
-            const stub = stubById.get(id);
-            if (stub !== undefined) acceptResult(stub, message);
-          },
-          { initialBatchSize: configuredBatchSize() }
-        );
-        batchSummary = formatBatchDiagnostics(batchDiagnostics);
-        ctx.logger.info({ ...batchDiagnostics }, "cache_batch_reads_complete");
-      } else {
-        await mapWithConcurrency(stubs, GMAIL_CACHE_READ_CONCURRENCY, async (stub) => {
-          let raw: gmail_v1.Schema$Message | null;
-          try {
-            raw = await fetchMessageFull(gmailClient, stub.id);
-          } catch {
-            raw = null;
-          }
-          acceptResult(stub, raw);
-        });
-      }
+      await mapWithConcurrency(stubs, GMAIL_CACHE_READ_CONCURRENCY, async (stub) => {
+        let raw: gmail_v1.Schema$Message | null;
+        try { raw = await fetchMessageFull(gmailClient, stub.id); }
+        catch { raw = null; }
+        acceptResult(stub, raw);
+      });
     } finally {
       flushCache();
       progress.hydrationProgress(completedIds.size, cached, failed);
-    }
-    if (useBatchHydration) {
-      progress.read.writeMessage(
-        pc.dim(
-          batchSummary
-        )
-      );
     }
 
     // Reuse the pre-scan fence; the next incremental run reconciles changes
     // during hydration without another history request here.
     const snapshotComplete = failed === 0 && completedIds.size === stubs.length && !spamResult.truncated && !inboxResult.truncated;
+    diagnosticsLog.phase("checkpoint");
     progress.finalizing();
     const newHistoryMarker = snapshotComplete
       ? await resolvePostScanHistoryMarker(gmailClient, profile.historyId)
@@ -260,6 +232,8 @@ export async function runCache(options: CacheOptions = {}): Promise<number> {
         messagesRepo.applyCacheBatch(account.accountHash, [], staleIds);
       }
       new AccountsRepository(ctx.db).updateHistoryMarker(account.accountHash, newHistoryMarker, ctx.clock.nowIso());
+      const completedAt = ctx.clock.nowIso();
+      new SettingsRepository(ctx.db).set(account.accountHash, SETTING_KEYS.cacheLastRunAt, completedAt, completedAt);
     })();
 
     progress.finish(failed === 0);
@@ -277,6 +251,7 @@ export async function runCache(options: CacheOptions = {}): Promise<number> {
     // instead of a progress bar that appears to hang forever.
     progress.finish(false);
     unsubscribeQuotaWait();
+    diagnosticsLog.finish();
     lock.release();
   }
 }

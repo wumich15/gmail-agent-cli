@@ -22,6 +22,8 @@ export interface SpamOptions {
   allMail: boolean;
   allowMailto: boolean;
   retryUnsubscribe: boolean;
+  /** Explicit `gmail add spam` is allowed to override an existing important rule. */
+  overrideImportant?: boolean;
 }
 
 /** Bounds how many search hits get fetched/considered per invocation; --limit-style safety cap, not a design limit. */
@@ -146,7 +148,7 @@ async function runSpamLocked(
   }
 
   const conflict = findConflictingRuleGroup(existingGroups, "spam", matchers);
-  if (conflict) {
+  if (conflict && !options.overrideImportant) {
     console.error(
       pc.red(
         `Refusing: this overlaps the existing important rule "${conflict.categoryName}" [${conflict.id}]. ` +
@@ -154,6 +156,13 @@ async function runSpamLocked(
       )
     );
     throw new RuleConflictError(`Spam rule for "${category}" conflicts with important rule ${conflict.id}`);
+  }
+  if (conflict && options.overrideImportant) {
+    console.log(
+      pc.yellow(
+        `Explicit spam request overrides the important rule "${conflict.categoryName}" [${conflict.id}].`
+      )
+    );
   }
 
   if (!options.yes) {

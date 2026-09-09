@@ -57,7 +57,8 @@ async function runOne(type: RuleType, category: string | undefined, options: Add
         yes: options.yes,
         allMail: false,
         allowMailto: false,
-        retryUnsubscribe: false
+        retryUnsubscribe: false,
+        overrideImportant: true
       });
     }
     return await runImportant(category, { yes: options.yes });

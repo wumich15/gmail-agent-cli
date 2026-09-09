@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { draftReply } from "../../src/ai/draft-reply.js";
+import { draftNewEmail, draftReply } from "../../src/ai/draft-reply.js";
 import { buildNormalizedMessage, headerMapFromList } from "../../src/gmail/normalize.js";
 
 function message(overrides: Partial<Parameters<typeof buildNormalizedMessage>[0]> = {}) {
@@ -79,5 +79,49 @@ describe("draftReply", () => {
     );
     const result = await draftReply(message(), { apiKey: "sk-test", model: "gpt-5.4-mini" });
     expect(result).toBeNull();
+  });
+
+  it("includes bounded Sent-mail examples in input for style matching, never in instructions", async () => {
+    let capturedParams: Record<string, unknown> | undefined;
+    vi.mocked(OpenAI).mockImplementation(
+      () =>
+        ({
+          responses: {
+            create: vi.fn().mockImplementation(async (params: Record<string, unknown>) => {
+              capturedParams = params;
+              return { output_text: "Talk soon!" };
+            })
+          }
+        }) as unknown as OpenAI
+    );
+    await draftReply(message(), { apiKey: "sk-test", model: "gpt-5.4-mini" }, {
+      styleExamples: [{ subject: "Checking in", body: "Hey! Quick note. Talk soon!" }]
+    });
+    const input = capturedParams?.["input"] as { content: string }[];
+    expect(input[0]!.content).toContain("Hey! Quick note. Talk soon!");
+    expect(capturedParams?.["instructions"]).not.toContain("Hey! Quick note. Talk soon!");
+  });
+
+  it("drafts a new email body with user-controlled addressing context and store:false", async () => {
+    let capturedParams: Record<string, unknown> | undefined;
+    vi.mocked(OpenAI).mockImplementation(
+      () =>
+        ({
+          responses: {
+            create: vi.fn().mockImplementation(async (params: Record<string, unknown>) => {
+              capturedParams = params;
+              return { output_text: "  Could we meet Tuesday?  " };
+            })
+          }
+        }) as unknown as OpenAI
+    );
+    const result = await draftNewEmail(
+      { to: "alice@example.com", subject: "Meeting", purpose: "Ask for a Tuesday meeting" },
+      { apiKey: "sk-test", model: "gpt-5.4-mini" }
+    );
+    expect(result).toBe("Could we meet Tuesday?");
+    expect(capturedParams?.["store"]).toBe(false);
+    const input = capturedParams?.["input"] as { content: string }[];
+    expect(input[0]!.content).toContain("Ask for a Tuesday meeting");
   });
 });

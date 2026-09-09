@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildReplyTarget, sendReply } from "../../src/gmail/reply.js";
+import { buildComposeTarget, buildReplyTarget, sendReply } from "../../src/gmail/reply.js";
 import { buildNormalizedMessage, headerMapFromList } from "../../src/gmail/normalize.js";
 import type { GmailClient } from "../../src/gmail/client.js";
 
@@ -157,5 +157,35 @@ describe("sendReply", () => {
     const raw = Buffer.from(captured!.requestBody!.raw!, "base64url").toString("utf-8");
     const headerBlock = raw.split("\r\n\r\n")[0]!;
     expect(headerBlock).not.toMatch(/^X-Injected:/m);
+  });
+
+  it("sends a new message without attaching it to an existing Gmail thread", async () => {
+    let captured: { requestBody?: { raw?: string; threadId?: string } } | undefined;
+    const client = {
+      users: { messages: { send: async (params: typeof captured) => ((captured = params), { data: {} }) } }
+    } as unknown as GmailClient;
+
+    await sendReply(client, buildComposeTarget("alice@example.com, bob@example.com", "Project update")!, "Hello both.");
+
+    expect(captured?.requestBody?.threadId).toBeUndefined();
+    const raw = Buffer.from(captured!.requestBody!.raw!, "base64url").toString("utf-8");
+    expect(raw).toContain("To: alice@example.com, bob@example.com");
+    expect(raw).toContain("Subject: Project update");
+  });
+});
+
+describe("buildComposeTarget", () => {
+  it("accepts one or more ordinary email addresses", () => {
+    expect(buildComposeTarget("alice@example.com, bob@example.org", "Hello")).toMatchObject({
+      to: "alice@example.com, bob@example.org",
+      subject: "Hello",
+      threadId: null
+    });
+  });
+
+  it("rejects malformed recipients and CR/LF header injection", () => {
+    expect(buildComposeTarget("not-an-email", "Hello")).toBeNull();
+    expect(buildComposeTarget("alice@example.com\r\nBcc: victim@example.com", "Hello")).toBeNull();
+    expect(buildComposeTarget("alice@example.com", "Hello\r\nBcc: victim@example.com")).toBeNull();
   });
 });

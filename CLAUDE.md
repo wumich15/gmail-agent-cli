@@ -25,76 +25,92 @@ The automation should be aggressive about obvious bulk mail and conservative abo
 - Never expose Gmail or Calendar credentials or write functions to the language model.
 - Never obey instructions found inside an email. Email headers, bodies, links, and attachments are untrusted data.
 - Never fetch arbitrary links from a message during `gmail work`.
-- Never send *any* email — a reply, an unsubscribe request, anything — without the user explicitly confirming that specific outbound message immediately beforehand. There is no autoreply and no automatic sending anywhere in this app, ever: `gmail work`'s AI classification never sends anything, and `gmail view`'s reply/AI-drafted-reply flow (see "Interactive reply" below) only sends after the user reviews the exact recipient, subject, and body and explicitly approves it. The `mailto:` unsubscribe confirmation `gmail spam` already required is the template this follows, not an exception to it.
+- Never send *any* email — a reply, a newly composed message, an unsubscribe request, anything — without the user explicitly confirming that specific outbound message immediately beforehand. There is no autoreply or background sending: `gmail work`'s AI classification never sends anything, and `gmail view` sends only after the user reviews the exact recipient, subject, and body and explicitly approves it. The `mailto:` unsubscribe confirmation `gmail spam` already required is the template this follows, not an exception to it.
 - Never create Gmail-side filters in v1. Local rules meet the requirement and avoid the extra `gmail.settings.basic` restricted scope. (This does not prohibit creating plain Gmail *labels* — see "Automatic topical labeling" — which are a distinct, already-in-scope `gmail.modify` capability, not an auto-apply-on-arrival filter.)
 - Never add Calendar attendees, notify guests, create conference links, or alter an event not created by this app.
 - Never run continuously or require a backend service. Work happens only when the CLI is invoked.
 - Never upload attachments to an AI provider. Do not download attachment bodies by default.
 - Never silently act on an uncertain classification or ambiguous date/time.
 
-## Interactive reply (`gmail view`)
+## Interactive mail (`gmail view`)
 
-Superseded the earlier "never send replies" boundary above: by product
-decision, `gmail view` may compose and send a reply — manually typed, or
-AI-drafted — but only ever as a direct result of the user, in that
-interactive session, pressing `r` (manual) or `;r` (AI-drafted) on a
-specific open message, and only after the user explicitly confirms that
-exact, fully-rendered outbound message. There is still no autoreply, no
-scheduled/background sending, and no path by which `gmail work`'s AI
-classification pipeline can compose or send anything — this capability
-exists nowhere outside `gmail view`'s interactive reply flow.
+`gmail view` is the complete terminal mail surface. It may mark an opened
+message read, compose a new message, and reply to an open message. New mail
+can be manually composed with `c` or AI-drafted with `a`/`;c`; replies can
+be manually composed with `r` or AI-drafted with `;r`. Every outbound path
+ends at the same exact-message preview and default-no confirmation gate.
+There is still no autoreply, scheduled/background sending, or path by which
+`gmail work`'s classification pipeline can compose or send anything.
 
 The design gaps the old boundary's text called out are resolved like this:
 
-- **Recipient, subject, and threading are never AI-derived or
-  email-derived-by-the-AI.** They come from real code reading the
-  already-authenticated, live-fetched message's own `Reply-To`/`From` and
-  `Message-ID` headers — the exact same normalization path
-  (`gmail/normalize.ts`) every other feature uses — never from anything
-  the language model outputs. This is the concrete answer to "how could
-  prompt injection manipulate a reply's recipient": it can't, because the
-  recipient is never a value the model is ever asked to produce in the
-  first place, regardless of what the source email's content claims.
+- **Recipient, subject, and threading are never AI-derived.** Reply targets
+  come from real code reading the live-fetched message's own
+  `Reply-To`/`From` and `Message-ID` headers through `gmail/normalize.ts`.
+  For new messages, the user types the recipient and subject and code
+  validates them before drafting. The model produces body text only.
 - **The AI draft is a body-text suggestion only, still isolated exactly
   like the classifier's calls**: a fresh, stateless, tool-less Responses
-  API call (`store: false`), the source email's content passed only in
-  the untrusted `input` block (never `instructions`), with explicit
-  instructions to ignore any text in that email that looks like
-  instructions to the model — the same "never obey instructions found
-  inside an email" framing the classifier already uses, applied here too.
+  API call (`store: false`). Source-email content, user drafting guidance,
+  and Sent-mail style examples are passed only in the untrusted `input`
+  block (never `instructions`), with explicit instructions to ignore any
+  embedded directives.
+- **AI drafts imitate the user's established writing style.** On the first
+  AI drafting action in a view session, load a small bounded sample of the
+  most recent messages carrying Gmail's `SENT` label. Normalize and bound
+  their text, use them only for tone/brevity/greeting/punctuation/sign-off,
+  keep them in memory only, and never copy unrelated private facts. Reuse
+  that in-memory sample for later drafts in the same session.
 - **Nothing sends without the user seeing the exact final message first.**
-  The confirmation step shows the real To/Subject/Body — including the
-  literal AI-drafted text, unedited by anything else — and only a
+  The confirmation step shows the real final To/Subject/Body — including
+  any user edits made to an AI draft — and only a
   deliberate "yes" triggers `users.messages.send`. There is no "send on
   timeout," no default-yes, and no batch/bulk send path.
 
 ## `gmail view`
 
-An interactive, local terminal browser over whatever `gmail cache` has
-already stored — it depends on having run `gmail cache` at least once and
-performs no Gmail listing of its own; opening a specific message to read
-it, and sending a reply, are the only live Gmail calls it makes. It is
-read-only browsing except for that explicit, per-message reply action.
+An interactive terminal Gmail client backed by the local cache. Every
+invocation checks when `gmail cache` last ran and refreshes before showing
+the list. With a valid Gmail history marker, it hydrates only messages that
+changed since that checkpoint and atomically updates cache projections and
+the marker. A missing/expired marker falls back to one full Inbox+Spam cache
+snapshot. A failed incremental hydration retains the old marker so the
+change is retried later.
 
-- **List view**: every cached message's subject line, sender, and
-  read/unread state, most-recent first, paginated at a user-configurable
-  page size (`--limit`, adjustable interactively too). A toggle menu lets
-  the user show/hide messages by label (`INBOX`, `STARRED`, `IMPORTANT`,
-  `CATEGORY_*`, any custom label) using the label snapshot `gmail cache`
-  already records — no extra Gmail calls needed for filtering.
+- **List view**: cached message subject, sender, date, and read/unread state,
+  most-recent first, paginated at a user-configurable page size (`--limit`,
+  adjustable interactively with `+`/`-` convenience steps or exact
+  `l <number>` input). `n`/`p` move between pages. `[` and `]` move backward
+  and forward through up to 50 prior list states, including pages, searches,
+  filters, and page-size changes. Local search covers subject/sender. The
+  label picker supports `INBOX`, `UNREAD`, `STARRED`, `IMPORTANT`,
+  `CATEGORY_*`, and custom labels resolved to display names. Multiple
+  selected labels use OR semantics; selecting none shows all cached
+  Inbox+Spam mail. The initial filter is Inbox.
 - **Read view**: selecting a message does one live `format=full` fetch
   (never persisted — bodies stay out of SQLite exactly as everywhere
-  else in this app) and renders it as bounded plain text, the same
-  HTML-to-text normalization the classifier already relies on. `esc`
-  returns to the list.
-- **Reply (`r`)** and **AI-drafted reply (`;r`)**: see "Interactive
-  reply" above for the send-safety design. Both are only reachable from
-  an open message in the read view, never from the list.
+  else in this app), marks the Gmail message read, updates its local label
+  projection, and renders bounded plain text using the classifier's same
+  HTML normalization. Left/right arrows (or `p`/`n`) open the previous/next
+  message in the current filtered view without returning to the list;
+  `esc` returns to the list.
+- **Compose (`c`)** and **AI compose (`a`/`;c`)**: prompt for a user-owned
+  recipient and subject, accept or draft body text, then show the shared
+  confirmation preview.
+- **Reply (`r`)** and **AI reply (`;r`)**: available only on an open
+  message and use deterministic reply targeting/thread headers.
+- **Update (`u`)**: repeats the same quick history reconciliation during
+  a long-running view session.
+- **Previous cache (`--previous`)**: skip startup history reconciliation,
+  custom-label listing, and full-cache fallback and immediately browse the
+  rows already in SQLite, even when the cache has no valid history marker.
+  Opening a selected message still performs the required live full fetch
+  because bodies are never stored; reply/send behavior is unchanged. An
+  explicit `u` still refreshes during the session.
 
-Because `gmail view` reads from `gmail cache`'s local data, it only ever
-shows what that cache last captured — running `gmail`/`gmail work`/`gmail
-cache` again afterward refreshes it. `gmail view` itself never writes to
-the `messages` table.
+Message bodies and Sent-mail style samples are never persisted. The view
+does write non-body cache projections/history markers during refresh and
+after marking a message read.
 
 ## Firm technology decisions
 
@@ -126,7 +142,7 @@ gmail important [CATEGORY...] [--yes]
 gmail category <NAME...>
 gmail cache [--limit N]
 gmail uncache [--yes]
-gmail view [--limit N]
+gmail view [--limit N] [--previous]
 gmail rules list [--json]
 gmail rules remove <RULE_GROUP_ID>
 gmail summary [RUN_ID] [--json]
@@ -161,7 +177,7 @@ With no category, show an interactive list of recent promotional/automated sende
 1. Search recent non-Trash mail and resolve candidate subscriptions.
 2. Prefer `List-ID` as identity; otherwise use an exact normalized sender address. Never infer a whole registrable domain without showing it and obtaining explicit confirmation.
 3. Show every matcher, subscription identity, and exact unsubscribe method/endpoint, then obtain confirmation for the selected HTTPS and/or `mailto:` requests. A company can operate multiple lists; do not claim that unsubscribing from one list unsubscribes from the whole company.
-4. Reject overlap with an important/protected rule until the user explicitly removes or replaces the conflicting rule.
+4. Reject overlap with an important/protected rule for ordinary rule creation. The explicit `gmail add spam` command is the intentional override path and takes precedence for matching messages.
 5. Persist the local spam rule group first, then attempt unsubscribe once per subscription identity.
 6. Trash matching messages currently in Inbox or native Spam. `--all-mail` explicitly widens this to archived mail.
 7. Report unsubscribe and trash outcomes separately. A failed unsubscribe must not prevent the local rule from handling future messages.
@@ -178,10 +194,11 @@ With no category, show an interactive message/sender picker. With a category str
 
 - store an important rule group;
 - add `STARRED` and `IMPORTANT` to matching current Inbox messages;
-- protect future matches from automatic trash;
+- preserve the content-based safety veto for future actionable/calendar matches;
+- allow an explicit later `gmail add spam` rule to override the important matcher;
 - continue to archive a protected message if it is read, because the explicit requirement is to archive all read mail.
 
-User-created important rules and preexisting `STARRED`/`IMPORTANT` labels that the action ledger cannot attribute to this app outrank AI cleanup. Adding a spam rule that overlaps an important rule must fail with a clear conflict rather than silently selecting one.
+Protection is content-based: only a classified actionable message or a message with a Calendar candidate receives the content safety veto. A bare important rule or preexisting `STARRED`/`IMPORTANT` label does not make an otherwise low-value promotion immune to cleanup. `gmail add spam` is an explicit user override: it may overlap an important rule, wins rule matching for that sender/list, and sends current matches to Trash.
 
 A persistent important matcher is not allowed to trust display name, `From`, or domain alone. At rule creation, bind it to an aligned passing DMARC identity or passing aligned DKIM signing domain observed on the selected message. Future messages must satisfy the matcher and the stored authentication binding; an authentication failure/mismatch disables that rule for the message and routes it to Review. A one-time, explicitly selected message can still be starred without creating a persistent sender rule.
 
@@ -376,7 +393,7 @@ Evaluate these before calling AI:
 - whether the thread contains a message sent by the user;
 - authenticated transactional signals for account security, fraud, payments, travel, medical, legal, deliveries, appointments, deadlines, and receipts.
 
-A user reply in the thread, a user important rule, or any preexisting `STARRED`/`IMPORTANT` label not attributable to this app's action ledger creates a protected message. Gmail does not reveal whether its classifier or the user applied `IMPORTANT`, so conservatively protect both. Protected mail is never auto-trashed. Authenticated high-risk transactional signals create a safety veto: the app must classify the message or route it to Review before any promotion/automation rule can trash it. A keyword alone is not enough for this veto because a malicious sender could use it to evade cleanup. Avoid the People API and its extra scope; sent-thread evidence and explicit rules are the v1 relationship signals.
+A classified actionable signal (`security`, `financial`, `reservation`, `deadline`, `user_action_required`, or `direct_question`) or any Calendar intent creates a content protection veto. Important assessment kinds already avoid the promotion Trash path; they do not need a second broad label-based veto. A bare user reply, important rule, or preexisting `STARRED`/`IMPORTANT` label is not enough by itself. An explicit spam rule created through `gmail add spam` overrides this veto. Authenticated high-risk transactional signals still route uncertain mail to Review when no explicit spam override exists. Avoid the People API and its extra scope; sent-thread evidence remains a separate conservative check for AI-derived cleanup.
 
 ## AI assessment contract
 
@@ -463,7 +480,7 @@ Label actions are recorded in the action ledger like any other mutation (see "Lo
 
 `gmail category <NAME...>` is the explicit, no-threshold counterpart: it creates (or reuses, case-insensitively) one or more real Gmail labels immediately, with no message search and no 10-message batch requirement — it exists purely so a user can pre-create a category they want the AI to start reusing on the very next `gmail`/`gmail work` run, rather than waiting for the AI to invent one from scratch and clear the batch threshold.
 
-`gmail cache` performs a full, read-only Inbox+Spam snapshot with no AI calls and no Gmail/Calendar mutations, recording IDs, content hashes, label snapshots, and low-sensitivity list metadata but never message bodies. It establishes a fresh Gmail history-marker baseline only when the snapshot is complete (not limited and with no failed message fetches) — see "Incremental synchronization" above. The next `gmail`/`gmail work` run unions those unassessed cached IDs into its incremental work set: it avoids another full mailbox listing, but still performs one live full-message hydration/classification pass because the cache intentionally has no body or assessment from which to decide. Successfully evaluated rows then leave that backlog, and matching event-free assessments can suppress redundant later OpenAI calls.
+`gmail cache` performs a full, read-only Inbox+Spam snapshot with no AI calls and no Gmail/Calendar mutations, recording IDs, content hashes, label snapshots, low-sensitivity list metadata, and the command's last-run timestamp, but never message bodies. It establishes a fresh Gmail history-marker baseline only when the snapshot is complete (not limited and with no failed message fetches) — see "Incremental synchronization" above. The next `gmail`/`gmail work` run unions those unassessed cached IDs into its incremental work set: it avoids another full mailbox listing, but still performs one live full-message hydration/classification pass because the cache intentionally has no body or assessment from which to decide. `gmail view` also consumes that marker to reconcile only new/changed mail before listing. Successfully evaluated rows then leave the work backlog, and matching event-free assessments can suppress redundant later OpenAI calls.
 
 Both `gmail` and `gmail cache` render read progress for preparation, discovery, hydration, and finalization on stderr, including completed/failed counts, elapsed time, and shared quota cooldowns. JSON/noninteractive output uses sparse plaintext without terminal redraws. Cache projections commit in transactions of up to 50 results using reusable prepared statements. Unchanged content and labels preserve completed assessments; changed labels requeue evaluation, archived/trashed projections are evicted, and incomplete snapshots clear the baseline.
 
@@ -485,8 +502,8 @@ Do not tune these further by intuition after launch; change them only from label
 
 Apply this precedence per message:
 
-1. Reject contradictory explicit rules. A user important rule or a preexisting `STARRED`/`IMPORTANT` label not attributable to this app protects the message from Trash.
-2. An explicit local spam rule plans Trash and no star/event/archive action.
+1. Resolve explicit rules with spam precedence when the user has explicitly added the spam rule; ordinary conflicting rule creation is rejected.
+2. An explicit local spam rule plans Trash and no star/event/archive action, including when it overrides content protection.
 3. Unprotected native Gmail Spam plans Trash without an AI call.
 4. Before promotion/automation cleanup, apply the authenticated high-risk safety veto. Vetoed messages must receive event/importance assessment or go to Review; a promotional Gmail label alone cannot override the veto.
 5. An unprotected, non-vetoed Gmail promotion or high-confidence AI `promotion`/`automated_low_value` plans Trash.
@@ -497,17 +514,33 @@ Apply this precedence per message:
 10. A message that gets a real Calendar event created also gets the deterministic "Calendar" label and is removed from `INBOX`, regardless of read state (see "Automatic topical labeling").
 11. Finally, every remaining non-Trash message that lacks `UNREAD` has `INBOX` removed, even if it was starred, labeled, or used to create an event.
 
+Repeated bulk cleanup is deterministic and narrow. When at least three unread,
+unprotected, high-confidence `promotion`/`automated_low_value` messages share
+an exact `List-ID` (preferred) or sender address and carry a bulk-mail header,
+the run creates an enabled `Auto spam: ...` spam rule for that exact matcher.
+Those messages already in the run are sent through the normal reversible Trash
+plan, and later runs use the saved rule without another AI decision. Existing
+important rules and authenticated high-risk signals always veto this shortcut;
+conflicting rule groups are never created.
+
+To reduce the unchanged backlog, an unprotected, non-critical `personal_routine`
+or `automated_low_value` message with a usable high-confidence assessment is
+sent to reversible Trash after 90 days. Security, financial, reservation,
+receipt, deadline, direct-question, user-action-required, event, native-Spam,
+explicit rule, and authenticated high-risk signals are excluded. This cleanup is
+deliberately applied to both read and unread mail that would otherwise remain
+unchanged.
+
 Calendar creation, labeling, and starring may all coexist. Archive and star may coexist. Trash is mutually exclusive with every other message or Calendar action, including a topical label.
 
 Do not use read state or an important rule as a reason to skip event extraction. A non-Trash read message must be checked for importance/event cues before archiving; an important rule can bypass importance classification but not event extraction when event cues exist. Only explicit spam and unprotected native-spam decisions bypass all AI work.
 
-Immediately before applying a plan, refetch or otherwise validate current label state:
-
-- skip AI-derived Trash if the user starred/marked important after the snapshot;
-- archive only if `UNREAD` is still absent and `INBOX` is still present;
-- do not remove a star/important label the user added;
-- do not act on a message that no longer matches the explicit rule;
-- never widen a rule based on a model suggestion during execution.
+The scan's full label snapshot is the mutation precondition. Re-reading every
+Trash candidate immediately before mutation consumed the same Gmail quota as a
+second scan and caused the observed long tail of failures, so the executor now
+uses the snapshot and records every result in the action ledger. A later
+incremental run observes concurrent user changes. Never widen a rule based on a
+model suggestion during execution.
 
 ## Gmail mutations
 
@@ -665,42 +698,46 @@ Always distinguish “attempted,” “HTTP request accepted,” and “unsubscr
 
 ## Reliability, quotas, and performance
 
-- Acquire the same exclusive per-account process lock for every command that can mutate Gmail, Calendar, rules, credentials, migrations, or undo state: `work`, `spam`, `important`, mutating `rules`, `undo`, and `auth login/logout`. Hold it from before the first snapshot/state write through final ledger commit. Read-only `summary`, `status`, and `doctor` may use a shared/read-only path.
-- Default to one multipart hydration batch of up to 50 inner reads at a time for `gmail` and `gmail cache`. Individual fallback uses bounded workers (8 in the batch driver/cache; 5 in work's explicitly selected individual mode). AI retains its independent concurrency budget. Completed reads immediately advance progress.
+- Acquire the same exclusive per-account process lock for every command that can mutate Gmail, Calendar, rules, credentials, migrations, cache/history state, or undo state: `work`, `spam`, `important`, mutating `rules`, `undo`, `auth login/logout`, and each bounded `view` refresh/mark-read/send operation. Hold it around the complete bounded mutation. The interactive view must not hold the lock while waiting for user input. Read-only `summary`, `status`, and `doctor` may use a shared/read-only path.
+- Gmail reads use individual `messages.get` requests in a bounded worker pool: `gmail` uses configured `concurrency.gmailReads` (default 5), and `gmail cache` uses 8. A slow message occupies only one worker; completed messages advance progress immediately. AI retains its separate concurrency budget. Multipart read batching is removed from these execution paths. Trash actions reuse the labels fetched for the scan when building the durable action plan; they do not issue a second `messages.get` per candidate after classification.
 - Cache assessments using content and version hashes, including enabled-rule/custom-label context. Cache-only stale/unassessed rows receive one live hydration pass; matching event-free assessments can skip AI, while event-bearing assessments cannot be reused without their deliberately unpersisted payload/evidence. Explicit spam/native-spam and intentionally no-AI evaluations record completed versions so they do not loop through the backlog forever.
-- Bound Gmail read and mutation attempts as well as concurrency: scanner reads and custom-label listing use a 20-second per-attempt timeout with at most 3 attempts and a 10-second backoff/`Retry-After` cap; destructive Gmail mutations use the same timeout with at most 2 attempts. The safety-only legacy `threads.get` fallback does not retry a quota failure; the normal path uses the cheaper Sent-thread index. Pagination can still require multiple bounded page calls.
-- Pace attempts through one shared weighted limiter targeting 275 `messages.get` equivalents/minute (5,500 of the published 6,000 quota units), deliberately short of the 300/6,000-unit theoretical ceiling so the same rolling per-minute budget still has room for auxiliary calls (list/history/labels/profile) and retries without immediately exceeding the account's real quota. This is a pacing target, not a guaranteed benchmark: network latency, failures, classification, and writes affect wall-clock throughput. `GMAIL_AGENT_RATE_LIMIT_RPS` overrides the pace for a verified custom/legacy quota. One wave of quota failures triggers one shared bounded cooldown and slowdown; already queued requests recheck it. Clean reads recover toward the configured pace, never above it.
-- Retry Google 429, 403 `rateLimitExceeded`/`userRateLimitExceeded`, per-minute quota errors, and transient 5xx responses with truncated exponential backoff and jitter. Honor `Retry-After` only within the caller's delay cap so a bad provider date cannot make a call appear hung indefinitely.
+- The action ledger is also a retry queue: messages with `failed_retryable` Gmail writes are merged into the next scan even when Gmail history has no new event, so a quota-rejected batch is retried instead of becoming an invisible unchanged cache row. `unknown_no_retry` remains a deliberate stop for ambiguous remote outcomes.
+- Bound Gmail read and mutation attempts as well as concurrency: scanner reads, custom-label listing, and destructive Gmail mutations use a 20-second per-attempt timeout with a seven-attempt quota-aware budget (normal successful operations still make one request). The retry horizon spans a complete per-minute refill window instead of abandoning cache messages after the former three short attempts. The safety-only legacy `threads.get` fallback remains single-attempt; the normal path uses the cheaper Sent-thread index. Pagination can still require multiple bounded page calls.
+- Pace attempts through one shared weighted limiter targeting 275 `messages.get` equivalents/minute (5,500 of the published 6,000 quota units), deliberately short of the 300/6,000-unit theoretical ceiling so the same rolling per-minute budget still has room for auxiliary calls (list/history/labels/profile) and retries without immediately exceeding the account's real quota. This is a pacing target, not a guaranteed benchmark: network latency, failures, classification, and writes affect wall-clock throughput. `GMAIL_AGENT_RATE_LIMIT_RPS` overrides the pace for a verified custom/legacy quota. A generic/concurrency quota-pressure wave can halve the shared pace once, and clean reads recover toward the configured pace. A provider error that explicitly names the per-minute bucket is handled differently: pause all queued workers for Google's `Retry-After`, or one complete 60-second rolling window when it omits that header, then resume at the configured pace. A per-minute rejection can reflect quota consumed by an earlier CLI process or another consumer and is not evidence that the sustainable configured rate is wrong. Never repeatedly halve newly admitted requests for that same window; that bug reduced a live cache run from 4.58 to 0.25 reads/second after roughly 100 calls and made a healthy full snapshot appear capped at 100–150 messages.
+- Retry Google 429, 403 `rateLimitExceeded`/`userRateLimitExceeded`, per-minute quota errors, and transient 5xx responses with truncated exponential backoff and jitter. A retry belongs to the same logical request, so only its first failed attempt slows the shared limiter; repeated attempts do not cascade-halving into an unusable pace. Honor `Retry-After` only within the caller's delay cap so a bad provider date cannot make a call appear hung indefinitely.
 - Do not retry authentication/permission failures as transient errors.
 - Keep list pagination resumable and never truncate silently. If a safety cap is configured, state exactly how many messages remain.
-- Group validated Trash and label mutations into `messages.batchModify` calls of up to 50 message IDs. Trash adds `TRASH` and removes `INBOX`/`SPAM`; label-only batches combine identical additions/removals. Each batchModify costs 50 quota units for the operation, unlike multipart reads which still pay per inner call. Keep per-message action-ledger outcomes and fresh label-only precondition checks. Never substitute `messages.batchDelete`: it permanently deletes messages and defeats Trash/undo semantics.
+- Group validated Trash and label mutations into `messages.batchModify` calls of up to 50 message IDs. Trash adds `TRASH` and removes `INBOX`/`SPAM`; label-only batches combine identical additions/removals. Each batchModify costs 50 quota units for the operation, unlike multipart reads which still pay per inner call. Keep per-message action-ledger outcomes. The scan snapshot is the mutation precondition; a later incremental run observes labels changed concurrently by the user. Never substitute `messages.batchDelete`: it permanently deletes messages and defeats Trash/undo semantics.
 - Continue independent actions after an isolated failure and return exit code `1` with a partial-results summary.
 - Advance Gmail history only after the ingestion/plan checkpoint is durable; unfinished mutations remain in the action ledger for reconciliation.
 - Use injected clocks and stable IDs so retry, timezone, and DST behavior are testable.
 
-### Gmail read-transport optimization (50-message batches enabled by default)
+### Gmail read transport (individual reads; multipart batching retired)
 
-The September 7 optimization request supersedes the earlier opt-in rollout gate: both `gmail cache` and `gmail` now use multipart batches of 50 by default. `GMAIL_AGENT_BATCH_HYDRATION=0` selects individual reads, and `GMAIL_AGENT_BATCH_SIZE=1..50` controls batch size independently of quota pace. Quota pressure slows admission but never shrinks batches: retry IDs are topped up with untouched IDs to keep batches at 50. Only a final remainder, retry tail, or explicit smaller-size override uses fewer. Transient outer failures retry with the per-message budget before individual fallback. No live-account throughput improvement is claimed without measurement.
+The September 8 investigation supersedes default-on multipart reads. `gmail` and `gmail cache` call `messages.get` directly through bounded concurrent workers. `GMAIL_AGENT_BATCH_HYDRATION` and `GMAIL_AGENT_BATCH_SIZE` no longer affect these commands; the unused multipart transport and its tests were removed during the refactor. Keep efficient `messages.batchModify` writes and 50-row SQLite transactions: neither is the multipart read bottleneck.
 
-Use gzip and partial responses together. Both transports send `Accept-Encoding: gzip` and a user agent containing `(gzip)`; the HTTP client decompresses responses once. Full reads request:
+Why `gmail --limit 100` is not an instantaneous 100-request operation:
+
+- A full scan limits Inbox and Spam independently, so it can select up to 200 unique messages. Incremental scans cap their combined queue at 100. The option does not cap total network requests.
+- The local limiter deliberately spaces reads at the current 275/minute target. One hundred individual reads require about 22 seconds of admission time even when Gmail has unused quota. A per-minute quota is a ceiling, not a promise of zero latency or a reason to remove pacing.
+- Classification starts after hydration and has its own bounded AI calls, latency, and retries. Cleanup then applies the durable plan in grouped Gmail/Calendar actions; it does not re-read every Trash candidate.
+- The retired multipart path waited for an entire 50-message envelope before exposing any result, processed envelopes sequentially, and could spend three 20-second outer attempts before individual fallback. Large batches can hit Gmail's separate per-user concurrency limit even below the per-minute quota. A slow or rejected envelope delayed every message in it.
+- Read timeouts, quota errors, and mutation failures can make a run exceed 60 seconds. A recent diagnostic run showed the scan itself completing normally, then spending 63 seconds on 11 redundant Trash precondition reads after Gmail returned repeated per-minute quota errors; those reads are now removed. New diagnostics include operation names, limiter waits, retry classes, and message-date bounds so a missing recent-mail report can be checked against the actual run rather than inferred from the progress bar. Never present a simulated throughput test as measured Gmail performance.
+
+Continue gzip and partial responses. The official Google client sends `Accept-Encoding: gzip` with a gzip-aware user agent and decompresses responses. Full reads request:
 
 ```text
 id,threadId,historyId,internalDate,labelIds,snippet,payload(headers,mimeType,body/data,parts)
 ```
 
-The body and Subject header are essential, but requesting only those would remove sender/authentication evidence, protection labels, thread identity, and cache data required by current behavior. Gmail `fields` selects object fields, not a single header array element by its name; retain headers and the complete recursive MIME subtree. A fixed-depth MIME selector silently loses deeply nested text. Attachment endpoints are never called. Fresh mutation-precondition reads use `format=minimal&fields=id,labelIds` and the same batching/retry path.
+Body/Subject alone omit safety metadata and cannot support current behavior. Keep headers, labels, IDs, dates, snippet fallback, and the complete recursive MIME tree; never fetch attachment endpoints. The normal mutation path reuses labels from the full read snapshot instead of issuing fresh per-message checks. Retain list/history/profile/label reads needed for discovery, incremental synchronization, counts, and protection. Failed message reads stay isolated and prevent an incomplete history checkpoint. No bodies or credentials enter logs or SQLite.
 
-Smaller responses save bytes and transport time, **not quota units**: each `messages.get` still costs 20 units. At the 275 reads/minute target, hydration alone costs 5,500 of the published 6,000 quota units/minute/user/project, leaving roughly 500 units/minute of headroom on the same rolling budget for the auxiliary reads below plus retries — pacing hydration at the full 300/6,000-unit ceiling would leave zero such headroom. Retain the few auxiliary reads that actually reduce costs or preserve behavior: paginated `messages.list` discovers IDs (5 units/page), `history.list` avoids refetching unchanged mail (2 units/page), profile supplies a full-scan fence (1 unit), labels supply count/category context (1 unit), and a lazily loaded Sent list protects replied-to threads. Remove redundant calls, not the discovery/synchronization mechanism. The production work path avoids per-message `threads.get` and makes no post-scan history call.
-
-Human output and logs report observed batch sizes, batch-read attempts/minute, quota-wait time, network time, and fallback counts. Weighted recovery counts successful inner reads consistently across transports. Batch responses map by Content-ID, validate message identity, preserve successful parts, and retry only retryable failures with an independent per-message budget. Structurally malformed/unsupported outer transport falls back once to bounded individual reads for the remaining run. Consumer/cache errors must never cause duplicate callbacks or refetch already completed messages. Diagnostics include batch/fallback counts, retry/quota counts, decoded response bytes, limiter wait, and network time; no bodies or credentials enter diagnostics.
-
-Verification covers multi-chunk 525-message hydration, mixed/out-of-order responses, duplicate and missing IDs, retry exhaustion, shared cooldown and rolling quota admission, failed-read recovery, cache invalidation, grouped Trash, and gzip decompression. A clean 200-message hydration needs four outer requests; 525 messages need eleven, with quota still charged for every inner read.
-
-References: [Gmail quotas](https://developers.google.com/workspace/gmail/api/reference/quota), [batching](https://developers.google.com/workspace/gmail/api/guides/batch), [performance](https://developers.google.com/workspace/gmail/api/guides/performance), [batchModify](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/batchModify), [batchDelete permanence](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/batchDelete).
+References: [Gmail quotas](https://developers.google.com/workspace/gmail/api/reference/quota), [concurrent-request limits](https://developers.google.com/workspace/gmail/api/guides/handle-errors#concurrent_requests), [batching](https://developers.google.com/workspace/gmail/api/guides/batch), [performance](https://developers.google.com/workspace/gmail/api/guides/performance).
 
 ## Privacy, security, and observability
 
 - Default logs contain run IDs, counts, hashed account/endpoint identifiers, reason codes, latencies, quota/retry classes, and software versions—not content.
+- Every new `gmail`/`gmail cache` invocation after account setup attaches a `diagnosticRunId` to persistent diagnostics in the existing `logs/gmail-agent.log` (macOS: `~/Library/Application Support/gmail-agent-cli/logs/gmail-agent.log`). Record each Google attempt as queued/started/succeeded/failed with operation name, attempt number, quota weight, limiter wait, network duration, status, and allowlisted error/quota class. Ten-second heartbeats record the current phase, pending requests and their age, AI calls in flight, pace, and server cooldown. Log individual AI assessment start/finish and phase boundaries for scan, Gmail/Calendar writes, and checkpoint. Scan diagnostics also record the oldest/newest hydrated `internalDate` values, which makes a recent-mail gap observable without logging content. Never record request IDs from Gmail, message bodies/subjects, raw provider errors, URLs, credentials, or model output. These logs explain new runs, including interrupted runs with no final summary; they cannot reconstruct missing detail from old runs.
 - `gmail work` prints a visible classifier progress bar and a content-free scan-timing line to stderr, and writes the same structured diagnostics: Gmail profile/history/list/fetch/Inbox-count time, AI time and call/cache-hit counts, policy/safety time and thread-check count, total time, fetched-message count, and queued-cache-backlog count. Before mutations it prints a concise executive plan; after every run it prints one plaintext paragraph listing every message marked important (or explicitly says none were identified). These measurements distinguish a Gmail stall from classifier latency without exposing mail content.
 - Apply logger redaction at construction time for authorization headers, cookies, keys, refresh/access tokens, query strings, message snippets, bodies, and Calendar descriptions.
 - Set configuration/database directory permissions before writing. Refuse to start if a secrets file is group/world-readable.
@@ -750,7 +787,7 @@ Optimize precision before recall. If a gate fails, lower automation scope or rai
 
 1. Create strict TypeScript package scaffolding, core domain types, configuration, credential-store interface, SQLite migrations, and deterministic IDs.
 2. Implement Google OAuth, read-only Gmail snapshotting, normalization, `gmail doctor`, and a fully deterministic dry-run summary.
-3. Implement the action ledger, Gmail label/trash executor, precondition checks, archive/star/important behavior, and undo. Keep AI cleanup disabled.
+3. Implement the action ledger, Gmail label/trash executor, snapshot-based mutation validation, archive/star/important behavior, and undo. Keep AI cleanup disabled.
 4. Implement explicit important/spam rule groups and safe matcher resolution. Add unsubscribe last within this phase, with controlled-endpoint tests.
 5. Add the OpenAI classifier behind the `Classifier` interface, strict Structured Outputs, caching/versioning, injection tests, and offline evaluation. Enable automatic AI actions only after release gates pass.
 6. Add Calendar duplicate detection, deterministic inserts, provenance, ETag-safe updates, and undo.

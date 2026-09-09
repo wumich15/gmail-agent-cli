@@ -4,8 +4,8 @@ gmail app
 
 ### Read performance
 
-`gmail` and `gmail cache` use gzip and partial-response fields in batches of up to 50 messages. Read progress appears on stderr, including failures and quota cooldowns. The shared quota pace targets about 300 message reads/minute; actual throughput depends on Gmail latency and retries. Smaller responses reduce bandwidth, not Gmail's per-read quota cost.
+`gmail` and `gmail cache` use gzip and partial-response fields with concurrent individual reads. Multipart read batching has been removed from both paths; old `GMAIL_AGENT_BATCH_HYDRATION`/`GMAIL_AGENT_BATCH_SIZE` settings no longer select it. Work uses configured Gmail read concurrency (default 5); cache uses 8. Progress appears on stderr.
 
-Cache writes commit in groups of 50. Valid assessments are preserved; changed labels are reevaluated, stale Inbox/Spam rows are removed, and partial reads remain recoverable. Cleanup uses reversible `messages.batchModify` Trash/label operations in groups of 50, not permanent deletion.
+The shared limiter targets 275 message-read equivalents/minute, including retry/auxiliary quota costs. One hundred reads therefore take roughly 22 seconds of pacing, plus network latency. `gmail --limit 100` can select 100 Inbox plus 100 Spam messages on a full scan, then makes AI calls and grouped writes; it does not cap the whole run to 100 API calls. An explicit per-minute quota rejection pauses the shared queue for the rolling window and retries without permanently reducing this configured pace.
 
-Optional environment controls: `GMAIL_AGENT_BATCH_HYDRATION=0` for individual reads, `GMAIL_AGENT_BATCH_SIZE=1..50` for smaller batches, and `GMAIL_AGENT_RATE_LIMIT_RPS` for a verified custom quota pace. Essential list/history and protection reads remain; redundant history reads and unnecessary Sent scans are avoided.
+Cache writes still commit in groups of 50, and reversible Trash/label changes still use `messages.batchModify`. Matching assessments are preserved, stale projections are evicted, and partial scans remain recoverable. `GMAIL_AGENT_RATE_LIMIT_RPS` overrides pacing for a verified custom quota.

@@ -4,7 +4,11 @@ import { withGoogleApiRetry } from "../core/api-retry.js";
 
 const BATCH_MODIFY_MAX_IDS = 50;
 const GMAIL_MUTATION_REQUEST_OPTIONS = { timeout: 20_000 } as const;
-const GMAIL_MUTATION_RETRY_OPTIONS = { maxAttempts: 2, baseDelayMs: 750, maxDelayMs: 5_000 } as const;
+// A 403 per-minute quota error can take a full minute to clear. The old
+// two-attempt budget converted one failed 50-ID batch into one failure per
+// message in the action ledger. Normal mutations still make one request;
+// this larger budget is paid only when Gmail returns a retryable error.
+const GMAIL_MUTATION_RETRY_OPTIONS = { maxAttempts: 7, baseDelayMs: 1_000, maxDelayMs: 30_000 } as const;
 
 export interface LabelMutation {
   addLabelIds: readonly string[];
@@ -66,7 +70,7 @@ export async function applyGroupedLabelMutations(
               }
             }, GMAIL_MUTATION_REQUEST_OPTIONS),
           GMAIL_MUTATION_RETRY_OPTIONS,
-          2.5 // batchModify = 50 quota units
+          2.5, "gmail.messages.batchModify" // batchModify = 50 quota units
         );
         succeededMessageIds.push(...chunk);
       } catch {
@@ -83,7 +87,7 @@ export async function trashMessage(client: GmailClient, messageId: string): Prom
   await withGoogleApiRetry(
     () => client.users.messages.trash({ userId: "me", id: messageId }, GMAIL_MUTATION_REQUEST_OPTIONS),
     GMAIL_MUTATION_RETRY_OPTIONS,
-    1
+    1, "gmail.messages.trash"
   );
 }
 
@@ -96,7 +100,7 @@ export async function untrashMessage(
   await withGoogleApiRetry(
     () => client.users.messages.untrash({ userId: "me", id: messageId }, GMAIL_MUTATION_REQUEST_OPTIONS),
     GMAIL_MUTATION_RETRY_OPTIONS,
-    0.25
+    0.25, "gmail.messages.untrash"
   );
   if (restoreLabelIds.length > 0) {
     await withGoogleApiRetry(
@@ -107,7 +111,7 @@ export async function untrashMessage(
           requestBody: { addLabelIds: [...restoreLabelIds] }
         }, GMAIL_MUTATION_REQUEST_OPTIONS),
       GMAIL_MUTATION_RETRY_OPTIONS,
-      0.25
+      0.25, "gmail.messages.modify"
     );
   }
 }

@@ -5,7 +5,7 @@ import { withGoogleApiRetry } from "../core/api-retry.js";
 export interface ReplyTarget {
   to: string;
   subject: string;
-  threadId: string;
+  threadId: string | null;
   inReplyTo: string | null;
   references: string | null;
 }
@@ -47,6 +47,22 @@ export function buildReplyTarget(message: NormalizedMessage): ReplyTarget | null
     threadId: message.gmailThreadId,
     inReplyTo: messageId,
     references: messageId
+  };
+}
+
+/** Builds a new-message target from values the user typed and rejects header injection or malformed addresses. */
+export function buildComposeTarget(toInput: string, subjectInput: string): ReplyTarget | null {
+  if (CONTAINS_CRLF.test(toInput) || CONTAINS_CRLF.test(subjectInput)) return null;
+  const recipients = toInput.split(",").map((value) => value.trim()).filter(Boolean);
+  if (recipients.length === 0 || recipients.some((address) => !/^[^\s<>@,]+@[^\s<>@,]+\.[^\s<>@,]+$/.test(address))) {
+    return null;
+  }
+  return {
+    to: recipients.join(", "),
+    subject: sanitizeSingleLineHeader(subjectInput) || "(no subject)",
+    threadId: null,
+    inReplyTo: null,
+    references: null
   };
 }
 
@@ -93,7 +109,7 @@ export async function sendReply(client: GmailClient, target: ReplyTarget, body: 
         userId: "me",
         requestBody: {
           raw: buildRawMessage(target, body),
-          threadId: target.threadId
+          ...(target.threadId ? { threadId: target.threadId } : {})
         }
       }),
     {},

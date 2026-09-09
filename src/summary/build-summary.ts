@@ -1,6 +1,13 @@
 import type { PolicyDecision } from "../core/policy.js";
 import type { ValidatedEvent } from "../calendar/event-policy.js";
+import type { RuleMatcher } from "../core/models.js";
 import { isInInbox } from "../gmail/labels.js";
+
+/** A repeated, unread bulk sender that can safely become a persistent spam rule. */
+export interface AutomaticSpamRuleCandidate {
+  categoryName: string;
+  matcher: RuleMatcher;
+}
 
 export interface MessageOutcome {
   gmailMessageId: string;
@@ -19,6 +26,8 @@ export interface MessageOutcome {
   internalDate: string;
   /** True when UNREAD is present at scan time. */
   isUnread: boolean;
+  /** Present when this outcome contributes to an automatic repeated-bulk spam rule. */
+  automaticSpamRuleCandidate?: AutomaticSpamRuleCandidate | null;
 }
 
 export interface ActionDetail {

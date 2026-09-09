@@ -92,7 +92,7 @@ export async function insertIdempotentEvent(
         calendarId: "primary",
         sendUpdates: "none",
         requestBody: plan.requestBody
-      })
+      }), {}, 1, "calendar.events.insert"
     );
     return { kind: "inserted", event: data };
   } catch (error: unknown) {
@@ -103,7 +103,7 @@ export async function insertIdempotentEvent(
       client.events.get({
         calendarId: "primary",
         eventId: plan.eventId
-      })
+      }), {}, 1, "calendar.events.get"
     );
     const existingProvenance = existing.extendedProperties?.private?.["payloadHash"];
     if (existingProvenance === plan.provenance.payloadHash) {

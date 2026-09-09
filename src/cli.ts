@@ -23,8 +23,8 @@ function parsePositiveInt(value: string): number {
 // (create a Gmail label directly, on demand), `gmail cache` (read-only
 // full-inbox snapshot that seeds incremental scanning), `gmail uncache`
 // (clears that local scan cache/history marker, no Gmail/Calendar changes),
-// and `gmail view` (terminal inbox browser over the cache, with reply/
-// AI-drafted-reply). The other commands (spam/important/rules/summary/
+// and `gmail view` (terminal inbox with automatic cache refresh, reading,
+// composing, replies, and Sent-style-aware AI drafts). The other commands (spam/important/rules/summary/
 // undo/auth/config/doctor) still exist as working code under
 // src/commands/ — they're just not wired up as CLI subcommands yet.
 // Re-add them here when they're back in scope.
@@ -115,12 +115,23 @@ program
 program
   .command("view")
   .description(
-    "Browse the Inbox in the terminal from gmail cache's local data: subject lines, tag filters, and reading " +
-      "a message (with reply/AI-drafted-reply). Run `gmail cache` first."
+    "Browse and refresh Gmail in the terminal: search/filter, read, compose, reply, and create Sent-style-aware AI drafts"
   )
   .option("--limit <n>", "messages per page (default: 20)", parsePositiveInt)
-  .action((opts: { limit?: number }) => {
-    withExitHandling(() => runView({ ...(opts.limit !== undefined ? { limit: opts.limit } : {}) }));
+  .option("--previous", "open the existing Gmail cache without refreshing it first", false)
+  .addHelpText(
+    "after",
+    "\nView controls:\n" +
+      "  n / p       next or previous page\n" +
+      "  [ / ]       back or forward through prior list views\n" +
+      "  + / -       increase or decrease page size\n" +
+      "  l <number>  set an exact page size\n" +
+      "  left/right  previous or next message while reading\n"
+  )
+  .action((opts: { limit?: number; previous: boolean }) => {
+    withExitHandling(() =>
+      runView({ ...(opts.limit !== undefined ? { limit: opts.limit } : {}), previous: opts.previous })
+    );
   });
 
 // Commander's root `.action()` absorbs ANY unrecognized first argument as

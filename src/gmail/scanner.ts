@@ -5,7 +5,13 @@ import { GMAIL_LABELS } from "./labels.js";
 import { apiErrorStatus, withGoogleApiRetry } from "../core/api-retry.js";
 
 const GMAIL_READ_TIMEOUT_MS = 20_000;
-const GMAIL_READ_RETRY_OPTIONS = { maxAttempts: 3, baseDelayMs: 750, maxDelayMs: 10_000 } as const;
+// A per-minute Gmail quota rejection cannot reliably clear inside the old
+// three-attempt/~2.25-second retry window. Keep each network attempt bounded,
+// but let reads use the same seven-attempt, minute-spanning retry budget as
+// the shared Google retry policy. `withGoogleApiRetry` also pauses every
+// queued worker when Gmail names the per-minute bucket, so these retries do
+// not create a second request wave while that bucket is still exhausted.
+const GMAIL_READ_RETRY_OPTIONS = { maxAttempts: 7, baseDelayMs: 1_000, maxDelayMs: 30_000 } as const;
 const GMAIL_READ_REQUEST_OPTIONS = { timeout: GMAIL_READ_TIMEOUT_MS } as const;
 const GMAIL_QUOTA_WEIGHT = {
   list: 0.25, // messages.list = 5 units vs. messages.get = 20
@@ -54,7 +60,7 @@ export async function fetchProfile(client: GmailClient): Promise<MailboxProfile>
   const { data } = await withGoogleApiRetry(
     () => client.users.getProfile({ userId: "me", fields: PROFILE_FIELDS }, GMAIL_READ_REQUEST_OPTIONS),
     GMAIL_READ_RETRY_OPTIONS,
-    GMAIL_QUOTA_WEIGHT.label
+    GMAIL_QUOTA_WEIGHT.label, "gmail.profile"
   );
   if (!data.emailAddress || !data.historyId) {
     throw new Error("Gmail profile response is missing emailAddress or historyId.");
@@ -118,7 +124,7 @@ export async function listAllMessageIds(
           GMAIL_READ_REQUEST_OPTIONS
         ),
       GMAIL_READ_RETRY_OPTIONS,
-      GMAIL_QUOTA_WEIGHT.list
+      GMAIL_QUOTA_WEIGHT.list, "gmail.messages.list"
     );
     if (estimatedTotal === null && typeof data.resultSizeEstimate === "number") {
       estimatedTotal = data.resultSizeEstimate;
@@ -163,7 +169,7 @@ export async function fetchMessageMetadata(
         GMAIL_READ_REQUEST_OPTIONS
       ),
     GMAIL_READ_RETRY_OPTIONS,
-    GMAIL_QUOTA_WEIGHT.message
+    GMAIL_QUOTA_WEIGHT.message, "gmail.messages.get.metadata"
   );
   return data;
 }
@@ -177,7 +183,7 @@ export async function fetchInboxMessageCount(client: GmailClient): Promise<numbe
   const { data } = await withGoogleApiRetry(
     () => client.users.labels.get({ userId: "me", id: "INBOX", fields: INBOX_LABEL_FIELDS }, GMAIL_READ_REQUEST_OPTIONS),
     GMAIL_READ_RETRY_OPTIONS,
-    GMAIL_QUOTA_WEIGHT.label
+    GMAIL_QUOTA_WEIGHT.label, "gmail.labels.get"
   );
   return data.messagesTotal ?? 0;
 }
@@ -214,16 +220,8 @@ export async function fetchMessageFull(
         GMAIL_READ_REQUEST_OPTIONS
       ),
     GMAIL_READ_RETRY_OPTIONS,
-    GMAIL_QUOTA_WEIGHT.message
+    GMAIL_QUOTA_WEIGHT.message, "gmail.messages.get.full"
   );
-  return data;
-}
-
-/** Fresh label-only precondition read, without downloading the body again. */
-export async function fetchMessageMinimal(client: GmailClient, messageId: string): Promise<gmail_v1.Schema$Message> {
-  const { data } = await withGoogleApiRetry(() => client.users.messages.get({
-    userId: "me", id: messageId, format: "minimal", fields: "id,labelIds"
-  }, GMAIL_READ_REQUEST_OPTIONS), GMAIL_READ_RETRY_OPTIONS, GMAIL_QUOTA_WEIGHT.message);
   return data;
 }
 
@@ -254,7 +252,7 @@ export async function fetchThreadHasUserSentMessage(client: GmailClient, threadI
     // stall the whole run for a minute; the orchestrator treats an
     // inconclusive answer as Review instead.
     { maxAttempts: 1, baseDelayMs: 0, maxDelayMs: 0 },
-    GMAIL_QUOTA_WEIGHT.thread
+    GMAIL_QUOTA_WEIGHT.thread, "gmail.threads.get"
   );
   return (data.messages ?? []).some((m) => (m.labelIds ?? []).includes(GMAIL_LABELS.sent));
 }
@@ -319,7 +317,7 @@ export async function listHistorySince(
             GMAIL_READ_REQUEST_OPTIONS
           ),
         GMAIL_READ_RETRY_OPTIONS,
-        GMAIL_QUOTA_WEIGHT.history
+        GMAIL_QUOTA_WEIGHT.history, "gmail.history.list"
       );
 
       for (const entry of data.history ?? []) {

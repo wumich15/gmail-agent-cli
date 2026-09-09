@@ -45,14 +45,12 @@ export interface MessagePolicyInput {
   isRead: boolean;
   /** True if the message currently carries the native Gmail SPAM label. */
   isNativeSpam: boolean;
-  /**
-   * True if an explicit important rule matches, or the message carries a
-   * preexisting STARRED/IMPORTANT label this app's ledger cannot attribute
-   * to itself. Protected messages are never auto-trashed.
-   */
+  /** True when classified actionable/calendar content should veto automatic Trash. */
   isProtected: boolean;
   /** A matching user-created rule, if any. Spam/important rules cannot overlap by construction. */
   explicitRule: { action: RuleAction; ruleGroupId: string } | null;
+  /** True for an explicit user spam command, which is allowed to override content protection. */
+  explicitSpamOverride?: boolean;
   /**
    * True when an authenticated high-risk transactional signal (security,
    * financial, delivery, medical/legal, etc.) is present. Gates the
@@ -99,11 +97,11 @@ export function evaluateMessagePolicy(
   input: MessagePolicyInput,
   thresholds: PolicyThresholds = DEFAULT_POLICY_THRESHOLDS
 ): PolicyDecision {
-  // 1 & 2: explicit local spam rule, unless the message is protected (should
-  // not occur because rule creation rejects protected overlaps, but defense
-  // in depth: protection always wins over trash).
+  // 1 & 2: explicit local spam rule. The normal resolver rejects overlap,
+  // while an explicit `gmail add spam` request sets explicitSpamOverride and
+  // intentionally wins over an actionable/calendar safety guard.
   if (input.explicitRule?.action === "spam") {
-    if (input.isProtected) {
+    if (input.isProtected && !input.explicitSpamOverride) {
       return review("protected_message_conflicts_with_spam_rule");
     }
     return trashOnly("explicit_spam_rule");
@@ -134,9 +132,8 @@ export function evaluateMessagePolicy(
     const a = input.assessment;
 
     // 5: high-confidence promotion / automated_low_value -> trash, nothing
-    // else. Never for a protected message — protection always wins over
-    // AI-derived trash, exactly like the explicit-rule/native-spam checks
-    // above.
+    // else. Never for content-protected actionable/calendar mail — the
+    // safety veto wins over AI-derived trash.
     if (!input.isProtected) {
       const isTrashKind = a.kind === "promotion" || a.kind === "automated_low_value";
       const trashThreshold =
@@ -167,10 +164,8 @@ export function evaluateMessagePolicy(
     }
 
     if (!isUnresolvedKind) {
-      // 7: star + important. Skipped for an already-protected message — it
-      // is already starred/important, or an explicit important rule adds
-      // both unconditionally below — so this only ever fires for a message
-      // that wasn't already protected.
+      // 7: star + important. Skip redundant AI importance actions for
+      // content-protected mail; an explicit important rule adds them below.
       if (!input.isProtected) {
         const importanceQualifies =
           a.importanceScore >= thresholds.autoStarImportanceScore &&
@@ -181,14 +176,8 @@ export function evaluateMessagePolicy(
         }
       }
 
-      // 8: high-confidence future event. Evaluated regardless of
-      // protection — CLAUDE.md is explicit that an important rule or a
-      // preexisting Important label "can bypass importance classification
-      // but not event extraction." A previous version of this function
-      // gated the entire block (including this) behind `!isProtected`,
-      // which silently dropped every calendar event for a message Gmail's
-      // own ML had already marked Important — exactly the kind of
-      // transactional/appointment mail most likely to contain one.
+      // 8: high-confidence future event. Evaluated regardless of the
+      // content-protection guard so the guard never suppresses extraction.
       if (
         a.event.intent === "create" &&
         a.event.confidence >= thresholds.autoCreateEventConfidence
@@ -201,8 +190,7 @@ export function evaluateMessagePolicy(
       }
 
       // Topical labeling: also evaluated regardless of protection (not a
-      // destructive action, and there's no reason to withhold a useful
-      // category from mail that's already protected). A candidate only —
+      // destructive action). A candidate only —
       // gated on a run-wide minimum batch size applied later in
       // core/orchestrator.ts, since one message's classification is never
       // enough on its own to create/apply a label.
