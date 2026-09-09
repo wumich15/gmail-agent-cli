@@ -173,7 +173,15 @@ export class GoogleApiRateLimiter {
   private intervalMs: number;
   private readonly fastestIntervalMs: number;
   private readonly ceilingIntervalMs: number;
-  private nextRequestAt = 0;
+  private readonly burstCapacity: number;
+  /**
+   * Token bucket, in baseline-request units, refilling at one token per
+   * `intervalMs`. Allowed to go negative so a heavy call (weight 2) still
+   * admits immediately and then repays its cost, which is what the old
+   * `nextRequestAt = now + intervalMs * weight` reservation did.
+   */
+  private tokens: number;
+  private tokensUpdatedAt = Date.now();
   private consecutiveSuccesses = 0;
   private cooldownUntil = 0;
   private queue: Promise<void> = Promise.resolve();
@@ -202,12 +210,25 @@ export class GoogleApiRateLimiter {
    * capping throughput at whatever the cold-start guess happened to be
    * regardless of what the account's real quota could sustain — the
    * opposite of "use the API to its fullest."
+   *
+   * `burstCapacity` is how many baseline requests may be admitted back to
+   * back before the pace applies at all, in the same weight units as
+   * `acquire`. It defaults to 1 — strict even spacing, the behavior existing
+   * callers and tests rely on — but production passes the full rolling
+   * minute budget, because Gmail's quota really is a per-minute bucket and
+   * not a per-request metronome. Spacing 100 reads 218ms apart spent ~22
+   * seconds of pure admission latency on a `--limit 100` run while the
+   * account's minute budget sat almost entirely unused; with a bucket that
+   * deep the same run spends its allowance immediately and waits only once
+   * the rolling window (still enforced in `acquire`, and still the hard cap)
+   * is genuinely full.
    */
   constructor(
     startRequestsPerSecond: number,
     ceilingIntervalMs = 4000,
     fastestRequestsPerSecond: number = startRequestsPerSecond,
-    private readonly minuteBudget: number = Infinity
+    private readonly minuteBudget: number = Infinity,
+    burstCapacity = 1
   ) {
     // Defense-in-depth: the only production instantiation below is already
     // guarded by parsePositiveNumber, but a non-positive rate here would
@@ -227,6 +248,15 @@ export class GoogleApiRateLimiter {
     // pacer at its (slower) starting point forever.
     this.fastestIntervalMs = 1000 / Math.max(fastestRequestsPerSecond, startRequestsPerSecond);
     this.ceilingIntervalMs = ceilingIntervalMs;
+    this.burstCapacity = Math.max(1, burstCapacity);
+    this.tokens = this.burstCapacity;
+  }
+
+  /** Credits elapsed time to the bucket at the pace in force for that stretch. */
+  private refill(now: number): void {
+    if (now <= this.tokensUpdatedAt) return;
+    this.tokens = Math.min(this.burstCapacity, this.tokens + (now - this.tokensUpdatedAt) / this.intervalMs);
+    this.tokensUpdatedAt = now;
   }
 
   /** Current pacing, for observability (e.g. a --json summary or debug output). */
@@ -262,12 +292,17 @@ export class GoogleApiRateLimiter {
           budgetAvailableAt = entry.at + 60_000;
           used -= entry.weight;
         }
-        const wait = Math.max(this.nextRequestAt, this.cooldownUntil, budgetAvailableAt) - now;
+        this.refill(now);
+        // One whole token admits a request of any size; a heavier call then
+        // repays the difference as debt, so weight still costs full pace.
+        const needed = Math.min(weight, 1);
+        const paceWait = this.tokens >= needed ? 0 : Math.ceil((needed - this.tokens) * this.intervalMs);
+        const wait = Math.max(paceWait, this.cooldownUntil - now, budgetAvailableAt - now);
         if (wait <= 0) break;
         await sleep(wait);
       }
       if (Number.isFinite(this.minuteBudget)) this.recentAdmissions.push({ at: Date.now(), weight });
-      this.nextRequestAt = Date.now() + this.intervalMs * weight;
+      this.tokens -= weight;
       this.waitMs += Date.now() - startedAt;
     });
     this.queue = admission.catch(() => {});
@@ -309,7 +344,13 @@ export class GoogleApiRateLimiter {
     // All failures in one in-flight wave share one slowdown. Repeatedly
     // halving for each worker used to drive an eight-worker pool to a crawl.
     if (cooldownMs > 0 && this.cooldownUntil > now) return;
+    this.refill(now);
     this.intervalMs = Math.min(this.intervalMs * 2, this.ceilingIntervalMs);
+    // Drop the accumulated burst too. Halving the refill rate while a full
+    // bucket is still sitting there would let the next wave go out at
+    // exactly the pace that just drew a quota error. One token is left so
+    // this only removes the burst; it never adds a new penalty wait.
+    this.tokens = Math.min(this.tokens, 1);
     this.consecutiveSuccesses = 0;
     if (cooldownMs > 0) {
       this.cooldownUntil = now + Math.min(cooldownMs, 60_000);
@@ -324,6 +365,7 @@ export class GoogleApiRateLimiter {
     // same recovery as fifty individual successes (two 25-read steps).
     const recoverySteps = Math.floor(this.consecutiveSuccesses / 25);
     if (recoverySteps > 0) {
+      this.refill(Date.now());
       this.intervalMs = Math.max(this.fastestIntervalMs, this.intervalMs * 0.85 ** recoverySteps);
       this.consecutiveSuccesses %= 25;
     }
@@ -382,16 +424,25 @@ function parsePositiveNumber(raw: string | undefined, fallback: number): number 
  * the explicit value the user gave rather than second-guessing it with a
  * separate ceiling).
  */
+const IS_TEST_ENV = process.env["VITEST"] !== undefined;
+const CONFIGURED_START_RPS = IS_TEST_ENV
+  ? TEST_ENV_REQUESTS_PER_SECOND
+  : parsePositiveNumber(process.env["GMAIL_AGENT_RATE_LIMIT_RPS"], START_REQUESTS_PER_SECOND);
+const CONFIGURED_FASTEST_RPS = IS_TEST_ENV
+  ? TEST_ENV_REQUESTS_PER_SECOND
+  : parsePositiveNumber(process.env["GMAIL_AGENT_RATE_LIMIT_RPS"], FASTEST_REQUESTS_PER_SECOND);
+const CONFIGURED_MINUTE_BUDGET = IS_TEST_ENV ? Infinity : Math.max(275, CONFIGURED_FASTEST_RPS * 60);
+
 export const googleApiRateLimiter = new GoogleApiRateLimiter(
-  process.env["VITEST"] !== undefined
-    ? TEST_ENV_REQUESTS_PER_SECOND
-    : parsePositiveNumber(process.env["GMAIL_AGENT_RATE_LIMIT_RPS"], START_REQUESTS_PER_SECOND),
+  CONFIGURED_START_RPS,
   4000,
-  process.env["VITEST"] !== undefined
-    ? TEST_ENV_REQUESTS_PER_SECOND
-    : parsePositiveNumber(process.env["GMAIL_AGENT_RATE_LIMIT_RPS"], FASTEST_REQUESTS_PER_SECOND),
-  process.env["VITEST"] !== undefined ? Infinity : Math.max(275,
-    parsePositiveNumber(process.env["GMAIL_AGENT_RATE_LIMIT_RPS"], FASTEST_REQUESTS_PER_SECOND) * 60)
+  CONFIGURED_FASTEST_RPS,
+  CONFIGURED_MINUTE_BUDGET,
+  // The whole minute's allowance is spendable at once. The rolling window
+  // above still caps real consumption at the same 275 units/minute, so this
+  // changes only *when* a run is allowed to spend them: immediately, the way
+  // a per-minute quota actually works, rather than one read every 218ms.
+  IS_TEST_ENV ? 1 : CONFIGURED_MINUTE_BUDGET
 );
 
 /**

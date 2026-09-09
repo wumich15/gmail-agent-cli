@@ -3,6 +3,16 @@ import { z } from "zod";
 export const DEFAULT_MODEL = "gpt-5.4-mini";
 
 /**
+ * In-flight Gmail reads. The shared limiter (see `core/api-retry.ts`) caps
+ * the real request *rate*, so this only decides how much of the per-minute
+ * allowance can be spent at once — and since that limiter now admits a whole
+ * burst rather than spacing reads out evenly, concurrency is what a short
+ * run's wall-clock time actually depends on. 8 matches what `gmail cache`
+ * has always used.
+ */
+export const DEFAULT_GMAIL_READ_CONCURRENCY = 8;
+
+/**
  * "openai" talks to the standard OpenAI API. "openai-compatible" points at
  * any endpoint implementing the same Responses API + Structured Outputs
  * shape — e.g. a self-hosted model server — via `aiBaseUrl`, so a user is
@@ -25,12 +35,12 @@ export const ConfigSchema = z
     model: z.string().min(1).default(DEFAULT_MODEL),
     concurrency: z
       .object({
-        gmailReads: z.number().int().min(1).max(20).default(5),
+        gmailReads: z.number().int().min(1).max(20).default(DEFAULT_GMAIL_READ_CONCURRENCY),
         aiCalls: z.number().int().min(1).max(10).default(5),
         calendarWrites: z.number().int().min(1).max(10).default(2)
       })
       .strict()
-      .default({ gmailReads: 5, aiCalls: 5, calendarWrites: 2 }),
+      .default({ gmailReads: DEFAULT_GMAIL_READ_CONCURRENCY, aiCalls: 5, calendarWrites: 2 }),
     policyThresholds: z
       .object({
         autoTrashPromotionConfidence: z.number().min(0).max(1),
@@ -63,7 +73,7 @@ export function defaultConfig(timezone: string): Config {
     aiProvider,
     ...(aiBaseUrl ? { aiBaseUrl } : {}),
     model: process.env["GMAIL_AGENT_MODEL"] ?? DEFAULT_MODEL,
-    concurrency: { gmailReads: 5, aiCalls: 5, calendarWrites: 2 },
+    concurrency: { gmailReads: DEFAULT_GMAIL_READ_CONCURRENCY, aiCalls: 5, calendarWrites: 2 },
     telemetryEnabled: false
   });
 }

@@ -13,7 +13,7 @@ import { GMAIL_LABELS, isRead } from "../gmail/labels.js";
 import { buildComposeTarget, buildReplyTarget, sendReply, type ReplyTarget } from "../gmail/reply.js";
 import { draftNewEmail, draftReply } from "../ai/draft-reply.js";
 import { resolveOpenAiCredentials } from "../ai/resolve-classifier.js";
-import { waitForKeypress } from "../core/keypress.js";
+import { readCommandLine, waitForKeypress } from "../core/keypress.js";
 import { ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 import { EXIT_CODES } from "../core/errors.js";
@@ -33,6 +33,19 @@ export interface ViewOptions {
 
 const DEFAULT_PAGE_SIZE = 20;
 const PAGE_SIZE_STEPS = [5, 10, 20, 50, 100] as const;
+
+const LIST_CONTROLS =
+  "type email number to open · ←/→ page · [ ] history · +/- size · l <n> · f filter · s search · c/a compose · u refresh · q quit";
+
+/**
+ * Wipes the viewport *and* the scrollback so paging or moving between
+ * messages replaces what is on screen instead of appending yet another copy
+ * below it. Anything the user still needs to see after a redraw is passed
+ * through as a `notice` rather than left in the scrollback to be erased.
+ */
+function clearScreen(): void {
+  if (process.stdout.isTTY) process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
+}
 
 interface ListViewSnapshot {
   page: number;
@@ -120,19 +133,26 @@ export async function runView(options: ViewOptions): Promise<number> {
     return stylePromise;
   };
 
+  let notice: string | null = null;
   for (;;) {
     const visible = filterMessages(all, selectedTags, search);
     const totalPages = Math.max(1, Math.ceil(visible.length / pageSize));
     page = Math.min(page, totalPages - 1);
     const pageItems = visible.slice(page * pageSize, (page + 1) * pageSize);
 
-    renderList(pageItems, { page, totalPages, pageSize, total: visible.length, selectedTags, search, labelNames });
-    const input = await p.text({
-      message: "Command",
-      placeholder: "number open · n/p page · [ back · ] forward · +/- size · f filter · s search · c/a compose · q"
-    });
-    if (p.isCancel(input)) break;
-    const cmd = input.trim();
+    renderList(pageItems, { page, totalPages, pageSize, total: visible.length, selectedTags, search, labelNames, notice });
+    notice = null;
+    const input = await readCommandLine("> ", ["left", "right"]);
+    if (input.kind === "cancel") break;
+    if (input.kind === "key") {
+      const forward = input.name === "right";
+      if (forward ? page < totalPages - 1 : page > 0) {
+        rememberView();
+        page = forward ? page + 1 : page - 1;
+      }
+      continue;
+    }
+    const cmd = input.value.trim();
 
     if (cmd === "q") break;
     if (cmd === "") continue;
@@ -152,7 +172,7 @@ export async function runView(options: ViewOptions): Promise<number> {
         forwardStack.push(snapshotView());
         restoreView(previous);
       } else {
-        console.log(pc.dim("No earlier view."));
+        notice = "No earlier view.";
       }
       continue;
     }
@@ -162,7 +182,7 @@ export async function runView(options: ViewOptions): Promise<number> {
         backStack.push(snapshotView());
         restoreView(next);
       } else {
-        console.log(pc.dim("No later view."));
+        notice = "No later view.";
       }
       continue;
     }
@@ -225,15 +245,14 @@ export async function runView(options: ViewOptions): Promise<number> {
         rememberView();
         page = 0;
       }
-      console.log(pc.green("Inbox updated."));
+      notice = "Inbox updated.";
       continue;
     }
-    if (cmd === "c") {
-      await handleCompose(gmailClient, account.accountHash, false, ctx, getStyleExamples);
-      continue;
-    }
-    if (cmd === "a" || cmd === ";c") {
-      await handleCompose(gmailClient, account.accountHash, true, ctx, getStyleExamples);
+    if (cmd === "c" || cmd === "a" || cmd === ";c") {
+      await handleCompose(gmailClient, account.accountHash, cmd !== "c", ctx, getStyleExamples);
+      // Hold the send confirmation on screen; the list redraw would wipe it.
+      console.log(pc.dim("\nPress any key to return to the list."));
+      await waitForKeypress();
       continue;
     }
     const index = Number(cmd);
@@ -241,7 +260,7 @@ export async function runView(options: ViewOptions): Promise<number> {
       let messageIndex = page * pageSize + index - 1;
       const browsingItems = visible;
       for (;;) {
-        const navigation = await openMessage(
+        const opened = await openMessage(
           gmailClient,
           account.accountHash,
           account.emailDisplay ?? "",
@@ -251,14 +270,15 @@ export async function runView(options: ViewOptions): Promise<number> {
           messageIndex > 0,
           messageIndex < browsingItems.length - 1
         );
-        if (navigation === "previous") messageIndex -= 1;
-        else if (navigation === "next") messageIndex += 1;
+        notice = opened.notice;
+        if (opened.navigation === "previous") messageIndex -= 1;
+        else if (opened.navigation === "next") messageIndex += 1;
         else break;
       }
       all = messagesRepo.listForAccount(account.accountHash);
       continue;
     }
-    console.log(pc.yellow(`Unrecognized command: "${cmd}"`));
+    notice = `Unrecognized command: "${cmd}"`;
   }
 
   return EXIT_CODES.ok;
@@ -351,9 +371,11 @@ interface ListRenderState {
   selectedTags: ReadonlySet<string>;
   search: string;
   labelNames: ReadonlyMap<string, string>;
+  notice: string | null;
 }
 
 function renderList(items: readonly CachedMessageRecord[], state: ListRenderState): void {
+  clearScreen();
   console.log("");
   console.log(
     pc.bold(`Gmail — ${state.total} message(s), page ${state.page + 1}/${state.totalPages} (page size ${state.pageSize})`)
@@ -371,6 +393,8 @@ function renderList(items: readonly CachedMessageRecord[], state: ListRenderStat
     );
   });
   console.log("");
+  if (state.notice) console.log(pc.yellow(state.notice));
+  console.log(pc.dim(LIST_CONTROLS));
 }
 
 async function chooseTags(
@@ -397,7 +421,7 @@ async function openMessage(
   getStyleExamples: () => Promise<SentStyleExample[]>,
   canGoPrevious: boolean,
   canGoNext: boolean
-): Promise<"back" | "previous" | "next"> {
+): Promise<OpenedMessage> {
   let raw;
   const lock = new ProcessLock(lockFilePath(accountHash));
   try {
@@ -438,8 +462,10 @@ async function openMessage(
     }
     raw = { ...raw, labelIds: currentLabelIds };
   } catch (error) {
-    console.error(pc.red(`Could not open this message: ${error instanceof Error ? error.message : String(error)}`));
-    return "back";
+    return {
+      navigation: "back",
+      notice: `Could not open this message: ${error instanceof Error ? error.message : String(error)}`
+    };
   } finally {
     lock.release();
   }
@@ -459,26 +485,39 @@ async function openMessage(
     userEmail,
     threadHasUserSentMessage: false
   });
-  renderMessage(message, labelIds);
-
+  let edge: string | null = null;
   for (;;) {
+    // Redrawn from scratch each time round so arrow navigation replaces the
+    // message on screen instead of stacking another copy underneath it.
+    renderMessage(message, labelIds);
+    if (edge) console.log(pc.yellow(edge));
     console.log(pc.dim("\n[esc] list   [←/p] previous   [→/n] next   [r] reply   [;][r] AI reply"));
+    edge = null;
     const action = await waitForViewerAction();
-    if (action === "back") return "back";
+    if (action === "back") return { navigation: "back", notice: null };
     if (action === "previous") {
-      if (canGoPrevious) return "previous";
-      console.log(pc.dim("Already at the first message in this view."));
+      if (canGoPrevious) return { navigation: "previous", notice: null };
+      edge = "Already at the first message in this view.";
     }
     if (action === "next") {
-      if (canGoNext) return "next";
-      console.log(pc.dim("Already at the last message in this view."));
+      if (canGoNext) return { navigation: "next", notice: null };
+      edge = "Already at the last message in this view.";
     }
-    if (action === "reply") await handleManualReply(gmailClient, accountHash, message);
-    if (action === "ai_reply") await handleAiReply(gmailClient, accountHash, ctx, message, getStyleExamples);
+    // Reply flows print their own prompts, drafts, and previews, so they
+    // deliberately run below the message rather than over a cleared screen;
+    // the next loop pass redraws once the exchange is finished.
+    if (action === "reply" || action === "ai_reply") {
+      if (action === "reply") await handleManualReply(gmailClient, accountHash, message);
+      else await handleAiReply(gmailClient, accountHash, ctx, message, getStyleExamples);
+      // Hold the send confirmation on screen; the redraw above would wipe it.
+      console.log(pc.dim("\nPress any key to return to the message."));
+      await waitForKeypress();
+    }
   }
 }
 
 function renderMessage(message: NormalizedMessage, labelIds: readonly string[]): void {
+  clearScreen();
   console.log("");
   console.log(pc.bold(message.subject || "(no subject)"));
   console.log(`From: ${message.from.displayName ?? message.from.address ?? "unknown"}`);
@@ -493,6 +532,12 @@ function renderMessage(message: NormalizedMessage, labelIds: readonly string[]):
 }
 
 type ViewerAction = "back" | "previous" | "next" | "reply" | "ai_reply";
+
+interface OpenedMessage {
+  navigation: "back" | "previous" | "next";
+  /** Surfaced by the list after its own redraw, which would otherwise erase it. */
+  notice: string | null;
+}
 
 async function waitForViewerAction(): Promise<ViewerAction> {
   let lastName: string | null = null;
