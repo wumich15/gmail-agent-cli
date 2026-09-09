@@ -151,7 +151,7 @@ export interface OrchestratorDeps {
 }
 
 export interface ReadProgress {
-  onPhase(phase: "preparing" | "discovering" | "hydrating" | "reconciling", total?: number): void;
+  onPhase(phase: "preparing" | "discovering" | "hydrating" | "reconciling" | "applying", total?: number): void;
   onProgress(completed: number, total?: number, failed?: number): void;
   onFinish(success?: boolean): void;
 }

@@ -118,12 +118,19 @@ function createTerminalProgress(title: string, options: ProgressOptions): Termin
 export type ReadProgressDisplay = ReadProgress & Pick<TerminalProgress, "onQuotaWait" | "writeMessage">;
 
 export function createReadProgress(options: ProgressOptions & { title?: string } = {}): ReadProgressDisplay {
-  const progress = createTerminalProgress(options.title ?? "Gmail reads", options);
+  // Not just "Gmail reads": this one progress display is reused for the
+  // write/mutation phase too (see work.ts's "applying" phase below) — a
+  // fixed "reads" title stayed on screen through Trash/label writes and,
+  // combined with reusing the "reconciling" phase for both the real
+  // post-scan history sync AND the unrelated write-application step, made
+  // a real Gmail quota cooldown during writes look like a stalled read.
+  const progress = createTerminalProgress(options.title ?? "Gmail", options);
   const phases = {
     preparing: "Reading mailbox details",
     discovering: "Discovering messages",
     hydrating: "Reading messages",
-    reconciling: "Reconciling mailbox changes"
+    reconciling: "Reconciling mailbox changes",
+    applying: "Applying changes"
   };
   return {
     onPhase: (phase, total) => progress.start(phases[phase], total),

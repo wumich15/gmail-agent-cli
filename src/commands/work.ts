@@ -502,7 +502,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
       diagnosticsLog.phase("trash_writes");
       const survivingTrash = trashTargets;
       const reconciliationTotal = survivingTrash.length + labelTargets.length;
-      if (reconciliationTotal > 0) readProgress.onPhase("reconciling", reconciliationTotal);
+      if (reconciliationTotal > 0) readProgress.onPhase("applying", reconciliationTotal);
 
       const successfullyTrashed = new Set<string>();
       for (const messageId of survivingTrash) markActions(messageId, ["trash"], "applying");

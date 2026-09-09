@@ -70,6 +70,23 @@ describe("read progress display", () => {
     progress.onFinish();
     expect(writes.join("")).toContain("100% Reconciling mailbox changes");
   });
+
+  it("labels the write/mutation phase distinctly from history reconciliation, under a phase-neutral default title", () => {
+    // Regression: work.ts used to call onPhase("reconciling", ...) for
+    // applying Trash/label mutations too — the exact same phase already
+    // used for the real post-scan history sync. A real Gmail quota
+    // cooldown during writes then displayed as "Gmail reads ... 0%
+    // Gmail quota cooldown Ns; 0/N" with no way to tell it was the write
+    // phase, not a stalled read.
+    const { writes, output } = capture(false);
+    const progress = createReadProgress({ output });
+    progress.onPhase("applying", 85);
+    const text = writes.join("");
+    expect(text).toContain("Applying changes");
+    expect(text).not.toContain("Reconciling");
+    expect(text.startsWith("Gmail [")).toBe(true);
+    expect(text).not.toContain("Gmail reads");
+  });
 });
 
 it("keeps classifier progress advancing in noninteractive output", () => {

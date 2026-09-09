@@ -1125,6 +1125,53 @@ output for genuinely complex, safety-relevant scenarios; `openai-classifier.test
 Consolidating these further was judged higher-risk than the reporting-count
 benefit justifies without a slower, more careful per-file pass.
 
+## Eighth pass: a real, sub-6,000-unit quota 403, and a progress-label bug
+
+A user-reported `gmail --limit 100` run showed a 42-second "Gmail quota
+cooldown" during what the progress bar displayed as "Gmail reads... 0/85."
+Investigation used this machine's own persistent diagnostic log
+(`~/Library/Application Support/gmail-agent-cli/logs/gmail-agent.log`,
+`operation`/`stage`/`status`/`quotaReason` fields per attempt) rather than
+guessing:
+
+- **The wait was a real Google 403** (`quotaReason: "per_minute"`) on the
+  very first `messages.batchModify` call of the write phase, and the ~59s
+  wait that followed was a genuine server `Retry-After` correctly honored
+  by the Fourth-fix-pass change (not a reappearance of the old artificial
+  10s-floor bug) — attempt 2 of that same request succeeded once the wait
+  elapsed.
+- **Total real quota usage for the entire run, computed directly from the
+  log's own per-operation attempt counts** (100× `messages.get.full` @ 20u,
+  10 successful + 1 failed `batchModify` @ 50u, 3× `messages.list` @ 5u, 1×
+  `labels.list`/`getProfile` @ 1u each) **was ~2,566 units — under half the
+  published 6,000-unit/minute budget** the pacer targets 275/min (5,500u)
+  against. No other run by this process appeared in the diagnostic log
+  within 5 minutes beforehand, ruling out leftover usage from a separate
+  prior invocation. This means the account's real, Google-enforced
+  per-minute Gmail API quota for this project is genuinely lower than the
+  published default this app assumes — not that the app is wasting quota.
+  Speeding up the pacer would make this worse (more 403s, more forced
+  waits), so the rate target was deliberately left unchanged; the correct
+  lever is checking this project's actual configured quota in Google Cloud
+  Console (APIs & Services → Gmail API → Quotas) and requesting an increase
+  if more throughput is wanted, or setting `GMAIL_AGENT_RATE_LIMIT_RPS`
+  lower to avoid tripping it at all.
+- **Real, fixed bug**: `work.ts`'s write-application step called
+  `readProgress.onPhase("reconciling", ...)` — the exact same phase already
+  used for the real post-scan Gmail-history sync — to report progress on
+  applying Trash/label mutations. A quota cooldown during writes therefore
+  displayed under a stale "reads"-flavored title with no indication it was
+  the write phase at all. `ReadProgress.onPhase` gained a distinct
+  `"applying"` phase (`"Applying changes"`), and the shared progress
+  display's default title changed from the misleading `"Gmail reads"` to
+  the phase-neutral `"Gmail"`, since one instance is reused across the
+  whole run including writes. Covered by a new `progress.test.ts` case.
+- **The "why not just batch up to 300 in one shot" question this prompted
+  again**: already tried against this exact live account and reverted (see
+  "Sixth fix pass") — reinforced by this finding, since batching only
+  reduces HTTP overhead, never quota-unit cost, and this account's binding
+  constraint is quota units, not connection count.
+
 ## Known deviations from the full design (as of this writing)
 
 - `gmail view`'s "toggles on the side for each tag" is implemented as an
