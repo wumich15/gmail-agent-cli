@@ -27,5 +27,14 @@ export class SettingsRepository {
 
 export const SETTING_KEYS = {
   cacheLastRunAt: "gmail_cache_last_run_at",
-  viewLastRefreshAt: "gmail_view_last_refresh_at"
+  viewLastRefreshAt: "gmail_view_last_refresh_at",
+  /**
+   * A short, non-verbatim description of the user's writing style (see
+   * `gmail/writing-style.ts`), computed once from a Sent-mail sample and
+   * reused across sessions instead of re-deriving it on every AI draft.
+   * Never the raw sent examples themselves — CLAUDE.md forbids persisting
+   * message bodies; this value is deliberately designed (by its generating
+   * prompt) to never reproduce them verbatim.
+   */
+  writingStyleProfile: "gmail_writing_style_profile"
 } as const;

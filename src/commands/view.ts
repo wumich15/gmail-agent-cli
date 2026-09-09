@@ -13,17 +13,19 @@ import { GMAIL_LABELS, isRead } from "../gmail/labels.js";
 import { buildComposeTarget, buildReplyTarget, sendReply, type ReplyTarget } from "../gmail/reply.js";
 import { draftNewEmail, draftReply } from "../ai/draft-reply.js";
 import { resolveOpenAiCredentials } from "../ai/resolve-classifier.js";
+import type { ResolvedOpenAiCredentials } from "../ai/resolve-classifier.js";
 import { readCommandLine, waitForKeypress } from "../core/keypress.js";
 import { ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 import { EXIT_CODES } from "../core/errors.js";
 import { withGoogleApiRetry } from "../core/api-retry.js";
+import { trashMessage, untrashMessage } from "../gmail/executor.js";
 import type { GmailClient } from "../gmail/client.js";
 import type { AccountRecord, NormalizedMessage } from "../core/models.js";
 import { projectHydratedCacheMessage } from "../gmail/cache-projection.js";
 import { refreshViewCache } from "../gmail/view-sync.js";
 import { listUserLabels } from "../gmail/custom-labels.js";
-import { loadSentStyleExamples, type SentStyleExample } from "../gmail/sent-style.js";
+import { getWritingStyleProfile } from "../gmail/writing-style.js";
 
 export interface ViewOptions {
   limit?: number;
@@ -35,7 +37,9 @@ const DEFAULT_PAGE_SIZE = 20;
 const PAGE_SIZE_STEPS = [5, 10, 20, 50, 100] as const;
 
 const LIST_CONTROLS =
-  "type email number to open · ←/→ page · [ ] history · +/- size · l <n> · f filter · s search · c/a compose · u refresh · q quit";
+  "↑/↓ select · enter open · type email number to open · <n> r/;r/d reply/AI-reply/delete without opening it · " +
+  "←/→ page · [ ] history · esc home · +/- size · l <n> · f filter · s search · c/a compose · " +
+  ";s refresh writing style · ;u undo last delete · u refresh · q quit";
 
 /**
  * Wipes the viewport *and* the scrollback so paging or moving between
@@ -69,8 +73,18 @@ export async function runView(options: ViewOptions): Promise<number> {
     console.error(pc.dim("Using the previous Gmail cache without refreshing it."));
   } else {
     const settings = new SettingsRepository(ctx.db);
+    // `gmail cache`'s own full-snapshot timestamp and gmail view's own
+    // incremental-refresh timestamp are tracked separately (see
+    // gmail/view-sync.ts), but whichever happened more recently is what
+    // actually answers "how stale is what I'm about to show" — showing
+    // only the `gmail cache`-specific one made a view session that had
+    // been refreshing itself the whole time (via "u" or on every launch)
+    // still claim to be looking at data from whenever `gmail cache` last
+    // ran, however long ago that was.
     const lastCacheAt = settings.get(account.accountHash, SETTING_KEYS.cacheLastRunAt);
-    console.error(pc.dim(lastCacheAt ? `Updating mail cached ${formatAge(lastCacheAt)}...` : "Updating cached mail..."));
+    const lastViewRefreshAt = settings.get(account.accountHash, SETTING_KEYS.viewLastRefreshAt);
+    const lastSyncAt = [lastCacheAt, lastViewRefreshAt].filter((value): value is string => value !== null).sort().at(-1) ?? null;
+    console.error(pc.dim(lastSyncAt ? `Updating mail cached ${formatAge(lastSyncAt)}...` : "Updating cached mail..."));
 
     refresh = await refreshViewCacheLocked(ctx, gmailClient, account);
     if (refresh.kind === "full_required") {
@@ -107,12 +121,17 @@ export async function runView(options: ViewOptions): Promise<number> {
   }
 
   let labelNames = options.previous ? systemLabelNames() : await loadLabelNames(gmailClient);
-  let selectedTags = new Set<string>(
+  const homeTags = new Set<string>(
     all.some((message) => message.labelSnapshot.includes(GMAIL_LABELS.inbox)) ? [GMAIL_LABELS.inbox] : []
   );
+  let selectedTags = new Set<string>(homeTags);
   let search = "";
   let pageSize = options.limit ?? DEFAULT_PAGE_SIZE;
   let page = 0;
+  /** Highlighted row within the current page — moved by ↑/↓, opened by Enter on an empty command. */
+  let selectedRow = 0;
+  /** The most recently trashed message from this session, for the ";u" quick-undo command. */
+  let lastTrashed: CachedMessageRecord | null = null;
   const backStack: ListViewSnapshot[] = [];
   const forwardStack: ListViewSnapshot[] = [];
   const snapshotView = (): ListViewSnapshot => ({ page, pageSize, selectedTags: new Set(selectedTags), search });
@@ -127,11 +146,22 @@ export async function runView(options: ViewOptions): Promise<number> {
     if (backStack.length > 50) backStack.shift();
     forwardStack.length = 0;
   };
-  let stylePromise: Promise<SentStyleExample[]> | null = null;
-  const getStyleExamples = (): Promise<SentStyleExample[]> => {
-    stylePromise ??= loadSentStyleExamples(gmailClient, account.emailDisplay ?? "");
-    return stylePromise;
-  };
+  // Saved once to SQLite (see gmail/writing-style.ts) instead of being
+  // re-derived from a live Sent-mail fetch on every single AI draft/reply —
+  // a settings-table read is essentially free, so no additional in-memory
+  // caching is needed here; ";s" forces a real recomputation on demand.
+  const getStyleProfile = (credentials: ResolvedOpenAiCredentials, forceRefresh = false): Promise<string | null> =>
+    getWritingStyleProfile(
+      {
+        db: ctx.db,
+        accountHash: account.accountHash,
+        gmailClient,
+        userEmail: account.emailDisplay ?? "",
+        credentials,
+        nowIso: () => ctx.clock.nowIso()
+      },
+      forceRefresh
+    );
 
   let notice: string | null = null;
   for (;;) {
@@ -139,23 +169,78 @@ export async function runView(options: ViewOptions): Promise<number> {
     const totalPages = Math.max(1, Math.ceil(visible.length / pageSize));
     page = Math.min(page, totalPages - 1);
     const pageItems = visible.slice(page * pageSize, (page + 1) * pageSize);
+    selectedRow = pageItems.length === 0 ? 0 : Math.min(selectedRow, pageItems.length - 1);
+    /** Opens one message, staying in the read view across prev/next until the user backs out. */
+    const openSelectedMessage = async (cached: CachedMessageRecord): Promise<{ notice: string | null }> => {
+      let messageIndex = visible.indexOf(cached);
+      if (messageIndex === -1) messageIndex = 0;
+      let openedNotice: string | null = null;
+      for (;;) {
+        const opened = await openMessage(
+          gmailClient,
+          account.accountHash,
+          account.emailDisplay ?? "",
+          visible[messageIndex]!,
+          ctx,
+          getStyleProfile,
+          messageIndex > 0,
+          messageIndex < visible.length - 1
+        );
+        openedNotice = opened.notice;
+        if (opened.trashedRecord) lastTrashed = opened.trashedRecord;
+        if (opened.navigation === "previous") messageIndex -= 1;
+        else if (opened.navigation === "next") messageIndex += 1;
+        else break;
+      }
+      all = messagesRepo.listForAccount(account.accountHash);
+      return { notice: openedNotice };
+    };
 
-    renderList(pageItems, { page, totalPages, pageSize, total: visible.length, selectedTags, search, labelNames, notice });
+    renderList(pageItems, { page, totalPages, pageSize, total: visible.length, selectedTags, search, labelNames, notice, selectedRow });
     notice = null;
-    const input = await readCommandLine("> ", ["left", "right"]);
-    if (input.kind === "cancel") break;
+    const input = await readCommandLine("> ", ["left", "right", "up", "down"]);
+    if (input.kind === "cancel") {
+      // Esc always goes "home" (default Inbox filter, no search, first
+      // page) instead of quitting — quitting is q/Ctrl-C only. Useful
+      // after a search or a deep filter/page-history dive.
+      if (search || !sameSet(selectedTags, homeTags) || page !== 0) {
+        rememberView();
+        search = "";
+        selectedTags = new Set(homeTags);
+        page = 0;
+        selectedRow = 0;
+      }
+      continue;
+    }
     if (input.kind === "key") {
+      if (input.name === "up" || input.name === "down") {
+        if (pageItems.length > 0) {
+          selectedRow =
+            input.name === "up"
+              ? (selectedRow - 1 + pageItems.length) % pageItems.length
+              : (selectedRow + 1) % pageItems.length;
+        }
+        continue;
+      }
       const forward = input.name === "right";
       if (forward ? page < totalPages - 1 : page > 0) {
         rememberView();
         page = forward ? page + 1 : page - 1;
+        selectedRow = 0;
       }
       continue;
     }
     const cmd = input.value.trim();
 
     if (cmd === "q") break;
-    if (cmd === "") continue;
+    if (cmd === "") {
+      // Enter on an empty command opens the highlighted row — the ↑/↓
+      // selection cursor's counterpart to typing a number and pressing Enter.
+      if (pageItems.length === 0) continue;
+      const opened = await openSelectedMessage(pageItems[selectedRow]!);
+      notice = opened.notice;
+      continue;
+    }
     if (cmd === "n") {
       if (page < totalPages - 1) rememberView();
       page = Math.min(page + 1, totalPages - 1);
@@ -249,39 +334,116 @@ export async function runView(options: ViewOptions): Promise<number> {
       continue;
     }
     if (cmd === "c" || cmd === "a" || cmd === ";c") {
-      await handleCompose(gmailClient, account.accountHash, cmd !== "c", ctx, getStyleExamples);
+      await handleCompose(gmailClient, account.accountHash, cmd !== "c", ctx, getStyleProfile);
       // Hold the send confirmation on screen; the list redraw would wipe it.
       console.log(pc.dim("\nPress any key to return to the list."));
       await waitForKeypress();
       continue;
     }
+    if (cmd === ";s") {
+      const credentials = await resolveOpenAiCredentials(
+        { accountHash: account.accountHash, credentialStore: ctx.credentialStore, config: ctx.config },
+        "compose"
+      );
+      if (!credentials) {
+        notice = "AI is not configured (no API key found).";
+        continue;
+      }
+      const spinner = p.spinner();
+      spinner.start("Refreshing your writing style from recent Sent mail");
+      const profile = await getStyleProfile(credentials, true);
+      spinner.stop(profile ? "Writing style saved — future replies/drafts will reuse it." : "Could not derive a writing style from Sent mail.");
+      console.log(pc.dim("\nPress any key to return to the list."));
+      await waitForKeypress();
+      continue;
+    }
+    if (cmd === ";u") {
+      if (!lastTrashed) {
+        notice = "Nothing to undo.";
+        continue;
+      }
+      const toRestore = lastTrashed;
+      try {
+        await untrashMessage(gmailClient, toRestore.gmailMessageId, toRestore.labelSnapshot);
+        messagesRepo.upsert(toRestore);
+        all = messagesRepo.listForAccount(account.accountHash);
+        lastTrashed = null;
+        notice = `Restored "${toRestore.subject || "(no subject)"}".`;
+      } catch (error) {
+        notice = `Could not undo: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      continue;
+    }
+    // "<n> r" / "<n> ;r" / "<n> d" — act on a message directly from the
+    // list without the separate open-then-press-key steps. Reply/AI-reply
+    // still open the message first (real content is needed to draft
+    // against) and still show the full, unedited confirmation screen
+    // before anything sends — this is a navigation shortcut only, never a
+    // way to skip that confirmation (see CLAUDE.md's "Interactive reply").
+    const quickAction = parseQuickActionCommand(cmd);
+    if (quickAction) {
+      const { index, action } = quickAction;
+      if (index >= 1 && index <= pageItems.length) {
+        const messageIndex = page * pageSize + index - 1;
+        const target = visible[messageIndex]!;
+        if (action === "delete") {
+          const trashed = await handleQuickDelete(gmailClient, messagesRepo, target);
+          if (trashed) lastTrashed = trashed;
+          console.log(pc.dim("\nPress any key to return to the list."));
+          await waitForKeypress();
+          all = messagesRepo.listForAccount(account.accountHash);
+        } else {
+          const opened = await openMessage(
+            gmailClient,
+            account.accountHash,
+            account.emailDisplay ?? "",
+            target,
+            ctx,
+            getStyleProfile,
+            false,
+            false,
+            action
+          );
+          notice = opened.notice;
+          if (opened.trashedRecord) lastTrashed = opened.trashedRecord;
+          all = messagesRepo.listForAccount(account.accountHash);
+        }
+        continue;
+      }
+    }
     const index = Number(cmd);
     if (Number.isInteger(index) && index >= 1 && index <= pageItems.length) {
-      let messageIndex = page * pageSize + index - 1;
-      const browsingItems = visible;
-      for (;;) {
-        const opened = await openMessage(
-          gmailClient,
-          account.accountHash,
-          account.emailDisplay ?? "",
-          browsingItems[messageIndex]!,
-          ctx,
-          getStyleExamples,
-          messageIndex > 0,
-          messageIndex < browsingItems.length - 1
-        );
-        notice = opened.notice;
-        if (opened.navigation === "previous") messageIndex -= 1;
-        else if (opened.navigation === "next") messageIndex += 1;
-        else break;
-      }
-      all = messagesRepo.listForAccount(account.accountHash);
+      const opened = await openSelectedMessage(pageItems[index - 1]!);
+      notice = opened.notice;
       continue;
     }
     notice = `Unrecognized command: "${cmd}"`;
   }
 
   return EXIT_CODES.ok;
+}
+
+export interface QuickAction {
+  /** 1-based, as shown in the list — the caller still validates it against the current page's item count. */
+  index: number;
+  action: "reply" | "ai_reply" | "delete";
+}
+
+/**
+ * Parses the "<n> r" / "<n> ;r" / "<n> d" list-view shorthand — select a
+ * message and immediately reply / AI-reply / delete it in one typed
+ * command instead of opening it first and pressing a key. Reply and
+ * AI-reply are a navigation shortcut only: `openMessage`'s normal
+ * confirm-before-send flow still runs unchanged (see CLAUDE.md's
+ * "Interactive reply" — there is no path that skips that confirmation).
+ */
+export function parseQuickActionCommand(cmd: string): QuickAction | null {
+  const match = /^(\d+)\s*(;r|r|d)$/.exec(cmd.trim());
+  if (!match) return null;
+  const index = Number(match[1]);
+  if (!Number.isInteger(index) || index < 1) return null;
+  const action = match[2] === ";r" ? "ai_reply" : match[2] === "r" ? "reply" : "delete";
+  return { index, action };
 }
 
 export function adjustPageSize(current: number, direction: "larger" | "smaller"): number {
@@ -372,6 +534,8 @@ interface ListRenderState {
   search: string;
   labelNames: ReadonlyMap<string, string>;
   notice: string | null;
+  /** Row highlighted by ↑/↓, opened by Enter on an empty command. */
+  selectedRow: number;
 }
 
 function renderList(items: readonly CachedMessageRecord[], state: ListRenderState): void {
@@ -388,9 +552,8 @@ function renderList(items: readonly CachedMessageRecord[], state: ListRenderStat
   items.forEach((message, index) => {
     const unread = message.labelSnapshot.includes(GMAIL_LABELS.unread) ? pc.bold("●") : " ";
     const date = message.internalDate ? new Date(Number(message.internalDate)).toLocaleDateString() : "";
-    console.log(
-      `  ${String(index + 1).padStart(2)}. ${unread} ${message.subject || "(no subject)"} — ${pc.dim(message.senderDisplay ?? "unknown")} ${pc.dim(date)}`
-    );
+    const line = `${String(index + 1).padStart(2)}. ${unread} ${message.subject || "(no subject)"} — ${pc.dim(message.senderDisplay ?? "unknown")} ${pc.dim(date)}`;
+    console.log(index === state.selectedRow ? pc.inverse(`> ${line}`) : `  ${line}`);
   });
   console.log("");
   if (state.notice) console.log(pc.yellow(state.notice));
@@ -418,10 +581,13 @@ async function openMessage(
   userEmail: string,
   cached: CachedMessageRecord,
   ctx: ReturnType<typeof bootstrap>,
-  getStyleExamples: () => Promise<SentStyleExample[]>,
+  getStyleProfile: (credentials: ResolvedOpenAiCredentials, forceRefresh?: boolean) => Promise<string | null>,
   canGoPrevious: boolean,
-  canGoNext: boolean
+  canGoNext: boolean,
+  /** Dispatches this action immediately on open (the "<n> r"/"<n> ;r" list shortcut) instead of waiting for a keypress first. Still goes through the normal confirm-before-send flow — this only skips the separate open-then-press-key navigation step. */
+  initialAction?: "reply" | "ai_reply"
 ): Promise<OpenedMessage> {
+  const messagesRepo = new MessagesRepository(ctx.db);
   let raw;
   const lock = new ProcessLock(lockFilePath(accountHash));
   try {
@@ -486,14 +652,21 @@ async function openMessage(
     threadHasUserSentMessage: false
   });
   let edge: string | null = null;
+  let pendingAction: ViewerAction | undefined = initialAction;
   for (;;) {
     // Redrawn from scratch each time round so arrow navigation replaces the
     // message on screen instead of stacking another copy underneath it.
-    renderMessage(message, labelIds);
+    const links = renderMessage(message, labelIds);
     if (edge) console.log(pc.yellow(edge));
-    console.log(pc.dim("\n[esc] list   [←/p] previous   [→/n] next   [r] reply   [;][r] AI reply"));
+    console.log(
+      pc.dim(
+        "\n[esc] list   [←/p] previous   [→/n] next   [r] reply   [;][r] AI reply   [d] delete" +
+          (links.length > 0 ? "   [l] show link URLs" : "")
+      )
+    );
     edge = null;
-    const action = await waitForViewerAction();
+    const action = pendingAction ?? await waitForViewerAction();
+    pendingAction = undefined;
     if (action === "back") return { navigation: "back", notice: null };
     if (action === "previous") {
       if (canGoPrevious) return { navigation: "previous", notice: null };
@@ -508,15 +681,119 @@ async function openMessage(
     // the next loop pass redraws once the exchange is finished.
     if (action === "reply" || action === "ai_reply") {
       if (action === "reply") await handleManualReply(gmailClient, accountHash, message);
-      else await handleAiReply(gmailClient, accountHash, ctx, message, getStyleExamples);
+      else await handleAiReply(gmailClient, accountHash, ctx, message, getStyleProfile);
       // Hold the send confirmation on screen; the redraw above would wipe it.
       console.log(pc.dim("\nPress any key to return to the message."));
       await waitForKeypress();
     }
+    if (action === "links") {
+      console.log("");
+      if (links.length === 0) {
+        console.log(pc.dim("No links in this message."));
+      } else {
+        console.log(pc.bold("Links:"));
+        for (const link of links) console.log(`  ${link.label} ${link.url}`);
+      }
+      console.log(pc.dim("\nPress any key to return to the message."));
+      await waitForKeypress();
+    }
+    if (action === "delete") {
+      const trashed = await confirmAndTrash(gmailClient, messagesRepo, cached);
+      console.log(pc.dim("\nPress any key to return to the list."));
+      await waitForKeypress();
+      if (trashed) return { navigation: "back", notice: "Moved to Trash. \";u\" undoes it.", trashedRecord: trashed };
+    }
   }
 }
 
-function renderMessage(message: NormalizedMessage, labelIds: readonly string[]): void {
+/**
+ * Trash only — this app never calls Gmail's permanent-delete endpoints
+ * (see CLAUDE.md's "Never call Gmail's permanent-delete endpoints"), so
+ * "delete" here always means the same reversible Trash move `gmail work`
+ * uses, recoverable from Gmail's own Trash folder. Defaults to "yes" on
+ * confirm (unlike every send confirmation in this app, which defaults to
+ * "no") because this action is reversible two ways: Gmail's own Trash and,
+ * within this session, ";u" (see `runView`'s `lastTrashed`) — the returned
+ * record is exactly what a caller needs to offer that quick undo. Removes
+ * the row from the local cache immediately so the list reflects the
+ * change without waiting for the next Gmail history sync.
+ */
+async function confirmAndTrash(
+  gmailClient: GmailClient,
+  messagesRepo: MessagesRepository,
+  cached: CachedMessageRecord
+): Promise<CachedMessageRecord | null> {
+  console.log("");
+  const confirmed = await p.confirm({ message: `Move "${cached.subject || "(no subject)"}" to Trash?`, initialValue: true });
+  if (p.isCancel(confirmed) || !confirmed) {
+    console.log(pc.dim("Not deleted."));
+    return null;
+  }
+  try {
+    await trashMessage(gmailClient, cached.gmailMessageId);
+    messagesRepo.delete(cached.accountHash, cached.gmailMessageId);
+    console.log(pc.green('Moved to Trash. Type ";u" to undo.'));
+    return cached;
+  } catch (error) {
+    console.error(pc.red(`Failed to move to Trash: ${error instanceof Error ? error.message : String(error)}`));
+    return null;
+  }
+}
+
+/** List-view fast path ("<n> d"): trashes by ID without a live full-message fetch first, since deleting needs nothing from the body. */
+async function handleQuickDelete(
+  gmailClient: GmailClient,
+  messagesRepo: MessagesRepository,
+  cached: CachedMessageRecord
+): Promise<CachedMessageRecord | null> {
+  return confirmAndTrash(gmailClient, messagesRepo, cached);
+}
+
+export interface DisplayLink {
+  label: string;
+  url: string;
+}
+
+/**
+ * Wraps `label` as an OSC 8 terminal hyperlink pointing at `url` — most
+ * modern terminals (iTerm2, Terminal.app, Windows Terminal, kitty, wezterm,
+ * ...) render this as clickable text that opens the URL in the system
+ * browser, entirely client-side; this app never opens anything itself. A
+ * terminal without OSC 8 support just shows `label` with the surrounding
+ * escape bytes ignored — never garbage — since OSC 8 degrades that way by
+ * design. Skipped when stdout isn't a TTY so redirected output stays plain.
+ */
+export function terminalHyperlink(label: string, url: string): string {
+  if (!process.stdout.isTTY) return label;
+  return `\x1b]8;;${url}\x1b\\${label}\x1b]8;;\x1b\\`;
+}
+
+/**
+ * Replaces every URL in `text` with a short, numbered, clickable label
+ * (`[1]`, `[2]`, ...) instead of the full address — the same URL reused
+ * later in the message reuses its earlier number rather than getting a new
+ * one. Pairs with `terminalHyperlink`: the label is still a real working
+ * link via OSC 8, so shortening is purely cosmetic, never a loss of
+ * function. Returns the link table so the read view can offer "show link
+ * URL" for a terminal that doesn't render OSC 8, or for the merely
+ * cautious.
+ */
+export function shortenLinksForDisplay(text: string): { text: string; links: DisplayLink[] } {
+  const links: DisplayLink[] = [];
+  const indexByUrl = new Map<string, number>();
+  const rewritten = text.replace(/https?:\/\/[^\s)]+/g, (url) => {
+    let index = indexByUrl.get(url);
+    if (index === undefined) {
+      index = links.length + 1;
+      indexByUrl.set(url, index);
+      links.push({ label: `[${index}]`, url });
+    }
+    return terminalHyperlink(pc.underline(pc.cyan(`[${index}]`)), url);
+  });
+  return { text: rewritten, links };
+}
+
+function renderMessage(message: NormalizedMessage, labelIds: readonly string[]): readonly DisplayLink[] {
   clearScreen();
   console.log("");
   console.log(pc.bold(message.subject || "(no subject)"));
@@ -528,15 +805,23 @@ function renderMessage(message: NormalizedMessage, labelIds: readonly string[]):
   console.log(pc.dim(`Read: ${isRead(labelIds) ? "yes" : "no"}`));
   console.log("");
   const content = message.bodyText ?? message.snippet;
-  console.log(content.length > 0 ? content : pc.dim("(no content)"));
+  if (content.length === 0) {
+    console.log(pc.dim("(no content)"));
+    return [];
+  }
+  const { text, links } = shortenLinksForDisplay(content);
+  console.log(text);
+  return links;
 }
 
-type ViewerAction = "back" | "previous" | "next" | "reply" | "ai_reply";
+type ViewerAction = "back" | "previous" | "next" | "reply" | "ai_reply" | "delete" | "links";
 
 interface OpenedMessage {
   navigation: "back" | "previous" | "next";
   /** Surfaced by the list after its own redraw, which would otherwise erase it. */
   notice: string | null;
+  /** Set when this message was just trashed, so the caller can offer ";u" to undo it. */
+  trashedRecord?: CachedMessageRecord;
 }
 
 async function waitForViewerAction(): Promise<ViewerAction> {
@@ -549,6 +834,8 @@ async function waitForViewerAction(): Promise<ViewerAction> {
     if (key.name === "right" || key.name === "n") return "next";
     if (key.name === "r" && lastName === ";" && Date.now() - lastAt < 1000) return "ai_reply";
     if (key.name === "r") return "reply";
+    if (key.name === "d") return "delete";
+    if (key.name === "l") return "links";
     lastName = key.name;
     lastAt = Date.now();
   }
@@ -641,7 +928,7 @@ async function handleAiReply(
   accountHash: string,
   ctx: ReturnType<typeof bootstrap>,
   message: NormalizedMessage,
-  getStyleExamples: () => Promise<SentStyleExample[]>
+  getStyleProfile: (credentials: ResolvedOpenAiCredentials, forceRefresh?: boolean) => Promise<string | null>
 ): Promise<void> {
   const target = buildReplyTarget(message);
   if (!target) {
@@ -659,10 +946,10 @@ async function handleAiReply(
   const guidance = await p.text({ message: "Optional guidance for the reply", placeholder: "Press Enter to let AI decide" });
   if (p.isCancel(guidance)) return;
   const spinner = p.spinner();
-  spinner.start("Learning your style from recent Sent mail and drafting");
-  const styleExamples = await getStyleExamples();
-  const draft = await draftReply(message, credentials, { styleExamples, guidance });
-  spinner.stop(draft ? `Draft ready (${styleExamples.length} style example(s)).` : "Could not draft a reply.");
+  spinner.start("Drafting");
+  const styleProfile = await getStyleProfile(credentials);
+  const draft = await draftReply(message, credentials, { styleProfile, guidance });
+  spinner.stop(draft ? "Draft ready." : "Could not draft a reply.");
   if (!draft) return;
   const edited = await reviewAiDraft(draft);
   if (!edited) {
@@ -677,7 +964,7 @@ async function handleCompose(
   accountHash: string,
   useAi: boolean,
   ctx: ReturnType<typeof bootstrap>,
-  getStyleExamples: () => Promise<SentStyleExample[]>
+  getStyleProfile: (credentials: ResolvedOpenAiCredentials, forceRefresh?: boolean) => Promise<string | null>
 ): Promise<void> {
   const to = await p.text({ message: "To" });
   if (p.isCancel(to)) return;
@@ -703,14 +990,14 @@ async function handleCompose(
       return;
     }
     const spinner = p.spinner();
-    spinner.start("Learning your style from recent Sent mail and drafting");
-    const styleExamples = await getStyleExamples();
+    spinner.start("Drafting");
+    const styleProfile = await getStyleProfile(credentials);
     const draft = await draftNewEmail(
       { to: target.to, subject: target.subject, purpose },
       credentials,
-      { styleExamples }
+      { styleProfile }
     );
-    spinner.stop(draft ? `Draft ready (${styleExamples.length} style example(s)).` : "Could not draft the email.");
+    spinner.stop(draft ? "Draft ready." : "Could not draft the email.");
     body = draft ? await reviewAiDraft(draft) : null;
   }
   if (!body) {

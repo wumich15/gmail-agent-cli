@@ -20,20 +20,37 @@ function parsePositiveInt(value: string): number {
 
 const VIEW_HELP_TEXT =
   "\nGmail view controls:\n" +
+  "  up/down      move the highlighted row (no Enter needed)\n" +
+  "  enter        open the highlighted row\n" +
   "  number       type email number to open\n" +
+  "  <n> r        reply to message n immediately, without opening it first\n" +
+  "  <n> ;r       AI-draft a reply to message n immediately (e.g. \"2 ;r\")\n" +
+  "  <n> d        delete (Trash) message n immediately, without opening it\n" +
   "  left/right   previous or next page in the list (no Enter needed)\n" +
   "  n / p        next or previous page\n" +
   "  [ / ]        back or forward through prior list views\n" +
+  "  esc          go home: clear search/filters, first page (never quits)\n" +
   "  + / -        increase or decrease page size\n" +
   "  l <number>   set an exact page size\n" +
   "  f            filter by Gmail label\n" +
   "  s <text>     search subjects and senders (s alone clears)\n" +
   "  c / a        compose manually or with AI\n" +
-  "  u            refresh Gmail\n" +
+  "  ;s           refresh your saved writing style from recent Sent mail\n" +
+  "  ;u           undo the last delete from this session\n" +
+  "  u            refresh Gmail (also updates the \"cached ... ago\" timestamp)\n" +
   "  q            quit\n" +
   "  left/right   previous or next message while reading one\n" +
   "  r / ;r       reply manually or with AI while reading\n" +
-  "  esc          return to the message list\n";
+  "  d            delete (move to Trash) while reading — default answer is yes\n" +
+  "  l            show this message's link URLs (links are shown shortened\n" +
+  "               and clickable in a terminal that supports it)\n" +
+  "  esc          return to the message list\n" +
+  "\n" +
+  "The \"<n> r\"/\"<n> ;r\" shortcuts only jump straight to composing — the same\n" +
+  "exact-message confirmation screen still appears before anything sends;\n" +
+  "there is no way to skip it. \"Delete\" always means Gmail's Trash (reversible\n" +
+  "from Gmail itself, or instantly via \";u\" for the last one this session),\n" +
+  "never permanent deletion — deleting always updates the list immediately.\n";
 
 // MVP command surface: `gmail` (scan + clean up, with inline sign-in on
 // first run), `gmail add` (create a spam/important rule), `gmail category`

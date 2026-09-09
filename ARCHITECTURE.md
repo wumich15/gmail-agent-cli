@@ -1172,6 +1172,68 @@ guessing:
   reduces HTTP overhead, never quota-unit cost, and this account's binding
   constraint is quota units, not connection count.
 
+## Ninth pass: concurrent reads were racing straight into the real quota wall
+
+A follow-up user report — "still only getting ~140-150 reads" — led to
+re-reading this same account's diagnostic log for the most recent run.
+It showed the token-bucket burst pacer (introduced to let a run "spend its
+minute's allowance immediately... rather than one read every 218ms") firing
+8 concurrent reads within 70ms of a quota cooldown clearing, immediately
+re-failing with the same 403, over and over: `pending=8` the entire time,
+`requestsPerSecond` never once climbing off its cold-start value across a
+70-second run.
+
+Root cause, found in `GoogleApiRateLimiter.refill()`: it credited *all*
+elapsed wall-clock time toward new burst tokens, with no awareness that
+part of that time was spent forcibly waiting out an active
+`cooldownUntil`. `reportQuotaPressure` correctly dropped tokens to ~1 the
+moment a real 403 arrived, but the ~60-second cooldown that followed then
+got silently credited back as refill once it elapsed — for a deep burst
+capacity (production passes the *entire* assumed minute budget, 275, as
+the burst size), that's enough elapsed time to rebuild well over 100
+tokens, not just the 1 that was supposed to remain. The instant the
+cooldown cleared, the same oversized burst fired again, immediately
+re-tripping the same limit. This directly explains capped-low, non-climbing
+throughput: most of the run's wall-clock time was dead cooldown, and a
+clean streak long enough to trigger `reportSuccess`'s recovery never had a
+chance to happen.
+
+Two fixes, `src/core/api-retry.ts`:
+
+- `refill()` now excludes any wall-clock time that overlaps an active
+  cooldown window (`baseline = max(tokensUpdatedAt, min(now, cooldownUntil))`)
+  — only time strictly after `cooldownUntil` earns new tokens.
+- That alone would leave the *first* post-cooldown request waiting an
+  extra `intervalMs` whenever the bucket was already at 0 when the
+  cooldown began (the common case — the request that triggered the 403 was
+  itself the last available token). `reportQuotaPressure` and
+  `pauseForQuotaWindow` now unconditionally guarantee exactly one token is
+  available the moment their cooldown clears (previously
+  `Math.min(tokens, 1)`, which only capped a larger balance down and never
+  raised an already-exhausted one back up) — one immediate admission, then
+  normal interval-paced admission resumes; never a renewed multi-hundred-
+  token burst.
+
+Verified with a new regression test constructing the exact production
+shape (burst capacity 275, a 60s cooldown) and asserting only the first of
+three post-cooldown reads is immediate, the rest pay the full paced
+interval — plus the three pre-existing timing-precision tests this change
+touched, which now pass with the corrected (still exact, still
+zero-extra-wait) timing.
+
+**Immediate follow-up, per explicit product decision**: the first version
+of this fix also shrank the production singleton's burst capacity from the
+full assumed minute budget (275) down to 10, reasoning that a smaller
+initial burst was inherently safer. The user preferred the original speed
+(the whole point of the burst design — spending the assumed budget
+immediately rather than one read every 218ms) and pointed out that once
+the cooldown-crediting bug above is actually fixed, a real quota hit no
+longer cascades — it costs at most one cooldown, not a repeating failure
+loop — so shrinking the burst was solving a problem the root-cause fix
+had already solved. Restored to the full minute budget; hitting the
+account's real ceiling once per burst is treated as an acceptable, expected
+cost of maximizing throughput, not something to design around.
+
 ## Known deviations from the full design (as of this writing)
 
 - `gmail view`'s "toggles on the side for each tag" is implemented as an

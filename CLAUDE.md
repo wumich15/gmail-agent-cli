@@ -57,12 +57,20 @@ The design gaps the old boundary's text called out are resolved like this:
   and Sent-mail style examples are passed only in the untrusted `input`
   block (never `instructions`), with explicit instructions to ignore any
   embedded directives.
-- **AI drafts imitate the user's established writing style.** On the first
-  AI drafting action in a view session, load a small bounded sample of the
-  most recent messages carrying Gmail's `SENT` label. Normalize and bound
-  their text, use them only for tone/brevity/greeting/punctuation/sign-off,
-  keep them in memory only, and never copy unrelated private facts. Reuse
-  that in-memory sample for later drafts in the same session.
+- **AI drafts imitate the user's established writing style, saved once
+  instead of re-derived every session.** The first time any view session
+  needs it, load a small bounded sample of the most recent messages
+  carrying Gmail's `SENT` label, normalize and bound their text, and make
+  one further stateless AI call that describes the user's style in 2-4
+  plain sentences (tone, sentence length, greeting/sign-off habits,
+  punctuation) — explicitly instructed to never quote or closely reproduce
+  the sample's actual content. Persist only that short description (a
+  `settings` row, per "Local database") and reuse it on every later draft
+  across every future session; the raw Sent-mail sample itself is never
+  written to SQLite, matching the same body-content rule as everywhere
+  else in this app — only the derived, non-verbatim description is durable.
+  An explicit `;s` command in the list view forces recomputation (e.g.
+  after the user's style has changed).
 - **Nothing sends without the user seeing the exact final message first.**
   The confirmation step shows the real final To/Subject/Body — including
   any user edits made to an AI draft — and only a
@@ -82,23 +90,49 @@ change is retried later.
 - **List view**: cached message subject, sender, date, and read/unread state,
   most-recent first, paginated at a user-configurable page size (`--limit`,
   adjustable interactively with `+`/`-` convenience steps or exact
-  `l <number>` input). Left/right arrows page immediately on the bare
-  keypress — no Enter — while a message number or a longer command is still
-  typed and submitted with Enter; `n`/`p` remain as typed equivalents. `[`
-  and `]` move backward
-  and forward through up to 50 prior list states, including pages, searches,
-  filters, and page-size changes. Local search covers subject/sender. The
-  label picker supports `INBOX`, `UNREAD`, `STARRED`, `IMPORTANT`,
-  `CATEGORY_*`, and custom labels resolved to display names. Multiple
-  selected labels use OR semantics; selecting none shows all cached
-  Inbox+Spam mail. The initial filter is Inbox.
+  `l <number>` input). One row is always highlighted; up/down arrows move it
+  immediately (no Enter), and Enter on an empty command opens the
+  highlighted row — the cursor-based counterpart to typing its number and
+  pressing Enter, which still also works. Left/right arrows page immediately
+  on the bare keypress — no Enter — while a message number or a longer
+  command is still typed and submitted with Enter; `n`/`p` remain as typed
+  page equivalents. `[` and `]` move backward and forward through up to 50
+  prior list states, including pages, searches, filters, and page-size
+  changes; `esc` jumps straight back to the default "home" view (Inbox
+  filter, no search, first page) instead of quitting — quitting is `q`
+  (or Ctrl-C) only. Local search covers subject/sender. The label picker
+  supports `INBOX`, `UNREAD`, `STARRED`, `IMPORTANT`, `CATEGORY_*`, and
+  custom labels resolved to display names. Multiple selected labels use OR
+  semantics; selecting none shows all cached Inbox+Spam mail. The initial
+  filter is Inbox.
 - **Read view**: selecting a message does one live `format=full` fetch
   (never persisted — bodies stay out of SQLite exactly as everywhere
   else in this app), marks the Gmail message read, updates its local label
   projection, and renders bounded plain text using the classifier's same
-  HTML normalization. Left/right arrows (or `p`/`n`) open the previous/next
-  message in the current filtered view without returning to the list;
-  `esc` returns to the list.
+  HTML normalization. That normalization inserts a line break at every
+  block-level element boundary (`<div>`, `<table>`/`<tr>`, `<li>`,
+  `<h1>`-`<h6>`, `<blockquote>`), not just `<br>`/`</p>` — most real HTML
+  mail is `<div>`/`<table>`-laid-out, not `<p>`-based, so limiting line
+  breaks to the latter ran unrelated blocks together on one line. A link's
+  destination is kept as visible text (`link text (https://...)`) instead
+  of being silently discarded when its tags are stripped — still subject to
+  the same secret-looking-query-value redaction as any other URL in the
+  body. A broadened named-entity table plus numeric (decimal/hex) entity
+  decoding covers curly quotes, dashes, ellipses, and symbols that
+  previously showed up as literal `&rsquo;`/`&#8217;`-style text; an
+  unrecognized entity is left as literal text rather than guessed at. Left/
+  right arrows (or `p`/`n`) open the previous/next message in the current
+  filtered view without returning to the list; `esc` returns to the list.
+  Every URL in the rendered body is additionally shortened to a numbered
+  `[1]`/`[2]`/... label (the same URL reused later in the message reuses its
+  earlier number) and wrapped as a clickable OSC 8 terminal hyperlink, so a
+  supporting terminal (iTerm2, Terminal.app, Windows Terminal, kitty,
+  wezterm, and most others) opens it in the system browser on click — this
+  app never opens anything itself, and the escape sequence degrades to
+  plain shortened text on a terminal that doesn't support it. Shortening is
+  cosmetic only, never a loss of function; pressing `l` on an open message
+  prints the label-to-URL table for anyone who wants to see or copy the
+  real destination before trusting a click.
 - **Redraw discipline**: both the list and the read view clear the viewport
   and scrollback before drawing, so paging or moving between messages
   replaces what is on screen instead of appending another copy below it.
@@ -111,10 +145,37 @@ change is retried later.
 - **Compose (`c`)** and **AI compose (`a`/`;c`)**: prompt for a user-owned
   recipient and subject, accept or draft body text, then show the shared
   confirmation preview.
-- **Reply (`r`)** and **AI reply (`;r`)**: available only on an open
-  message and use deterministic reply targeting/thread headers.
+- **Reply (`r`)** and **AI reply (`;r`)**: available on an open message
+  (deterministic reply targeting/thread headers) and, as a pure navigation
+  shortcut, directly from the list by typing `<n> r` or `<n> ;r` (e.g.
+  `2 ;r`) — this only collapses "open the message, then press the key"
+  into one typed command; it still opens the message for real and still
+  ends at the same exact-message confirmation gate described above. There
+  is no command or flag anywhere that sends without that confirmation.
+- **Delete (`d`)**: on an open message, or from the list as `<n> d`,
+  moves the message to Gmail's Trash after a lightweight confirmation
+  (defaulting to "yes," unlike every send confirmation in this app, which
+  defaults to "no" — Trash is reversible two different ways, see below) —
+  the same reversible `messages.trash` this app's Trash policy elsewhere
+  uses, never a permanent-delete endpoint (see "Non-goals and hard
+  boundaries"). The local cache row is removed immediately, so the list
+  reflects the deletion right away instead of waiting for the next Gmail
+  history sync. Recoverable from Gmail's own Trash folder, and instantly
+  within the same session via `;u` (below); this one-off interactive
+  action is not written to the action ledger, so `gmail undo` does not
+  know about it once the session ends.
+- **Quick undo (`;u`)**: restores the single most recently deleted message
+  from this session — `messages.untrash` plus reinstating its exact prior
+  local-cache label snapshot — and clears the pending undo. Session-scoped
+  and single-slot by design: it complements `d`'s defaulted-to-yes
+  confirmation as the fast way to recover from a wrong one, not a general
+  multi-step history.
 - **Update (`u`)**: repeats the same quick history reconciliation during
-  a long-running view session.
+  a long-running view session, and — like the automatic refresh on every
+  `gmail view` launch — updates the same "how stale is this" timestamp
+  `gmail cache` itself sets, so the startup "Updating mail cached ... ago"
+  message reflects whichever of the two actually happened most recently
+  instead of only ever considering an explicit `gmail cache` run.
 - **Previous cache (`--previous`)**: skip startup history reconciliation,
   custom-label listing, and full-cache fallback and immediately browse the
   rows already in SQLite, even when the cache has no valid history marker.
@@ -660,7 +721,7 @@ Use one SQLite database per OS user, with `0600` permissions where supported. En
 - `actions`: deterministic action key, run ID, message/event target, action type, reason code, before-state, planned payload hash, status, attempt count, timestamps, error class.
 - `unsubscribe_attempts`: unique subscription key, endpoint-hash history, method, status, explicit-retry generation, last attempt, non-secret response class.
 - `calendar_links`: account/message/event IDs, payload hash, ETag, status, created timestamp.
-- `settings`: non-secret versioned configuration only.
+- `settings`: non-secret versioned configuration, plus small derived-and-bounded values such as `gmail view`'s saved writing-style description — never raw message/Sent-mail content itself (see "Interactive mail (`gmail view`)").
 
 Required uniqueness includes account plus Gmail message ID, matcher tuple within a rule group, deterministic action key, subscription identity, and account/message/candidate for Calendar links. Keep secrets, full email bodies, raw unsubscribe headers, verbatim evidence, and AI `sourceEvidence` out of SQLite. Persist only assessment enums, numeric scores, reason codes, version/hash fields, and other non-verbatim facts. Keep the body-derived one-line summary in memory for the current run. Encrypt a pending Calendar payload with a per-install authenticated-encryption key held in the OS credential store, then delete that payload after the action becomes terminal. Cached normalized text is disabled.
 

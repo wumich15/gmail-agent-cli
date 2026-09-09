@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { draftNewEmail, draftReply } from "../../src/ai/draft-reply.js";
+import { draftNewEmail, draftReply, summarizeWritingStyle } from "../../src/ai/draft-reply.js";
 import { buildNormalizedMessage, headerMapFromList } from "../../src/gmail/normalize.js";
 
 function message(overrides: Partial<Parameters<typeof buildNormalizedMessage>[0]> = {}) {
@@ -81,7 +81,7 @@ describe("draftReply", () => {
     expect(result).toBeNull();
   });
 
-  it("includes bounded Sent-mail examples in input for style matching, never in instructions", async () => {
+  it("includes the persisted style profile in input for style matching, never in instructions", async () => {
     let capturedParams: Record<string, unknown> | undefined;
     vi.mocked(OpenAI).mockImplementation(
       () =>
@@ -95,11 +95,11 @@ describe("draftReply", () => {
         }) as unknown as OpenAI
     );
     await draftReply(message(), { apiKey: "sk-test", model: "gpt-5.4-mini" }, {
-      styleExamples: [{ subject: "Checking in", body: "Hey! Quick note. Talk soon!" }]
+      styleProfile: "Casual and brief, signs off with 'Talk soon!'"
     });
     const input = capturedParams?.["input"] as { content: string }[];
-    expect(input[0]!.content).toContain("Hey! Quick note. Talk soon!");
-    expect(capturedParams?.["instructions"]).not.toContain("Hey! Quick note. Talk soon!");
+    expect(input[0]!.content).toContain("Casual and brief, signs off with 'Talk soon!'");
+    expect(capturedParams?.["instructions"]).not.toContain("Casual and brief");
   });
 
   it("drafts a new email body with user-controlled addressing context and store:false", async () => {
@@ -123,5 +123,50 @@ describe("draftReply", () => {
     expect(capturedParams?.["store"]).toBe(false);
     const input = capturedParams?.["input"] as { content: string }[];
     expect(input[0]!.content).toContain("Ask for a Tuesday meeting");
+  });
+});
+
+describe("summarizeWritingStyle", () => {
+  it("returns null without calling the API when there are no examples — nothing to persist yet", async () => {
+    const create = vi.fn();
+    vi.mocked(OpenAI).mockImplementation(() => ({ responses: { create } }) as unknown as OpenAI);
+    const result = await summarizeWritingStyle([], { apiKey: "sk-test", model: "gpt-5.4-mini" });
+    expect(result).toBeNull();
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("returns the trimmed, bounded style description on success, isolated in input never instructions", async () => {
+    let capturedParams: Record<string, unknown> | undefined;
+    vi.mocked(OpenAI).mockImplementation(
+      () =>
+        ({
+          responses: {
+            create: vi.fn().mockImplementation(async (params: Record<string, unknown>) => {
+              capturedParams = params;
+              return { output_text: "  Casual, short sentences, signs off with 'Thanks, Mike'.  " };
+            })
+          }
+        }) as unknown as OpenAI
+    );
+    const result = await summarizeWritingStyle(
+      [{ subject: "Checking in", body: "Hey! Quick note. Talk soon!" }],
+      { apiKey: "sk-test", model: "gpt-5.4-mini" }
+    );
+    expect(result).toBe("Casual, short sentences, signs off with 'Thanks, Mike'.");
+    expect(capturedParams?.["store"]).toBe(false);
+    const input = capturedParams?.["input"] as { content: string }[];
+    expect(input[0]!.content).toContain("Hey! Quick note. Talk soon!");
+    expect(capturedParams?.["instructions"]).not.toContain("Hey! Quick note. Talk soon!");
+  });
+
+  it("returns null (never throws) when the API call fails", async () => {
+    vi.mocked(OpenAI).mockImplementation(
+      () => ({ responses: { create: vi.fn().mockRejectedValue(new Error("boom")) } }) as unknown as OpenAI
+    );
+    const result = await summarizeWritingStyle(
+      [{ subject: "Hi", body: "Hello" }],
+      { apiKey: "sk-test", model: "gpt-5.4-mini" }
+    );
+    expect(result).toBeNull();
   });
 });

@@ -148,6 +148,41 @@ export function parseEmailAddressList(raw: string | null): EmailAddress[] {
   return parts.map((p) => parseEmailAddress(p)).filter((a): a is EmailAddress => a !== null);
 }
 
+/**
+ * Named HTML entities beyond the five XML-predefined ones. Not exhaustive —
+ * an unrecognized named entity (e.g. a rare/legacy one) is left as literal
+ * text rather than guessed at, which is always safer than fabricating a
+ * character. Covers the entities that actually show up in real HTML mail:
+ * curly quotes, dashes, ellipsis, bullets, and a few symbols.
+ */
+const NAMED_HTML_ENTITIES: Record<string, string> = {
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'",
+  nbsp: " ", ensp: " ", emsp: " ", thinsp: " ",
+  rsquo: "’", lsquo: "‘", rdquo: "”", ldquo: "“",
+  sbquo: "‚", bdquo: "„",
+  mdash: "—", ndash: "–", hellip: "…",
+  copy: "©", reg: "®", trade: "™",
+  bull: "•", middot: "·", deg: "°",
+  hearts: "♥", larr: "←", rarr: "→",
+  euro: "€", pound: "£", yen: "¥", cent: "¢"
+};
+
+/** Decodes both named (from the table above) and numeric (decimal/hex) HTML entities in one pass. */
+function decodeHtmlEntities(text: string): string {
+  return text.replace(/&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]*);/gi, (match, body: string) => {
+    if (body[0] === "#") {
+      const codePoint = body[1]?.toLowerCase() === "x" ? Number.parseInt(body.slice(2), 16) : Number.parseInt(body.slice(1), 10);
+      if (!Number.isFinite(codePoint) || codePoint < 0 || codePoint > 0x10ffff) return match;
+      try {
+        return String.fromCodePoint(codePoint);
+      } catch {
+        return match;
+      }
+    }
+    return NAMED_HTML_ENTITIES[body.toLowerCase()] ?? match;
+  });
+}
+
 /** Strips script/style/tags to bounded, plain text. Never rendered as HTML anywhere downstream. */
 export function htmlToBoundedPlainText(html: string, maxChars: number = MAX_BODY_CHARS): { text: string; truncated: boolean } {
   let text = html
@@ -164,15 +199,30 @@ export function htmlToBoundedPlainText(html: string, maxChars: number = MAX_BODY
     .replace(/<script\b[^>]*>[\s\S]*$/gi, "")
     .replace(/<style\b[^>]*>[\s\S]*$/gi, "")
     .replace(/<!--([\s\S]*?)-->/g, "")
+    // Preserve link destinations as visible text before the generic tag
+    // stripper below would otherwise throw them away silently, leaving
+    // only unlabeled anchor text with no indication of where it points.
+    // The secret-looking-URL redaction a few lines down still runs over
+    // this, so a tracking/unsubscribe link's token is still never shown.
+    .replace(/<a\b[^>]*\bhref\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi, (_match, href: string, inner: string) => {
+      const linkText = inner.replace(/<[^>]+>/g, "").trim();
+      const url = href.trim();
+      if (!url || url.toLowerCase().startsWith("javascript:")) return linkText;
+      if (!linkText || linkText === url) return url;
+      return `${linkText} (${url})`;
+    })
     .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
+    .replace(/<li\b[^>]*>/gi, "\n• ")
+    // Any other block-level element boundary becomes a line break instead
+    // of silently vanishing. Without this, a <div>/<table>-based HTML email
+    // — the overwhelming majority of real marketing/transactional mail;
+    // <p>/<br> alone are comparatively rare — ran every block's text
+    // together onto one line once its tags were stripped below.
+    .replace(/<\/(?:div|p|tr|li|h[1-6]|blockquote)>/gi, "\n")
+    .replace(/<(?:div|p|tr|table|ul|ol|blockquote|h[1-6])\b[^>]*>/gi, "\n")
+    .replace(/<\/?(?:td|th)\b[^>]*>/gi, " ")
+    .replace(/<[^>]+>/g, "");
+  text = decodeHtmlEntities(text);
 
   // Redact URLs that carry secret-looking query values (tokens, signatures).
   text = text.replace(

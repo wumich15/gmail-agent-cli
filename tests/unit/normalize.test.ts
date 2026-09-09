@@ -50,7 +50,7 @@ describe("parseEmailAddressList", () => {
 });
 
 describe("htmlToBoundedPlainText", () => {
-  it("preserves all 6 scenarios", async () => {
+  it("preserves all 12 scenarios", async () => {
     await runScenarios([
       { name: "strips script/style and tags", run: () => {
     const { text } = htmlToBoundedPlainText(
@@ -85,6 +85,60 @@ describe("htmlToBoundedPlainText", () => {
     const { text } = htmlToBoundedPlainText("<p>Hello</p><style>.a{color:red} no closing tag here");
     expect(text).not.toContain("color:red");
     expect(text).toContain("Hello");
+  } },
+      { name: "inserts a line break at <div>/<table>/<tr>/<h1-6>/<blockquote> boundaries, not just <br>/<p>", run: () => {
+    // Regression: <div>-based (table-layout) HTML mail — the overwhelming
+    // majority of real marketing/transactional email — used to run every
+    // block's text together onto one line, since only <br> and </p>
+    // produced a newline and the generic tag-stripper silently dropped
+    // every other block tag.
+    const { text } = htmlToBoundedPlainText(
+      "<div>First line</div><div>Second line</div><table><tr><td>Cell A</td></tr><tr><td>Cell B</td></tr></table>"
+    );
+    const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+    expect(lines).toContain("First line");
+    expect(lines).toContain("Second line");
+    expect(text).not.toContain("First lineSecond line");
+    expect(text).not.toContain("Cell ACell B");
+  } },
+      { name: "renders <li> items as separate bulleted lines", run: () => {
+    const { text } = htmlToBoundedPlainText("<ul><li>Apples</li><li>Oranges</li></ul>");
+    expect(text).toContain("• Apples");
+    expect(text).toContain("• Oranges");
+    expect(text).not.toContain("Apples• Oranges");
+  } },
+      { name: "keeps a link's destination visible instead of silently discarding it", run: () => {
+    // Regression: <a href> was stripped down to just its visible text —
+    // "Click here" gave no indication of where it actually pointed.
+    const { text } = htmlToBoundedPlainText('<a href="https://example.com/offer">Click here</a>');
+    expect(text).toContain("Click here");
+    expect(text).toContain("https://example.com/offer");
+  } },
+      { name: "shows a bare URL once, not duplicated, when the link text is just the URL itself", run: () => {
+    const { text } = htmlToBoundedPlainText('<a href="https://example.com/page">https://example.com/page</a>');
+    expect(text.match(/https:\/\/example\.com\/page/g)).toHaveLength(1);
+  } },
+      { name: "still redacts a secret-looking link URL even though the destination is now shown", run: () => {
+    const { text } = htmlToBoundedPlainText(
+      '<a href="https://example.com/unsub?token=abc123secret">unsubscribe</a>'
+    );
+    expect(text).not.toContain("abc123secret");
+    expect(text).toContain("[redacted-url]");
+  } },
+      { name: "decodes curly quotes, dashes, ellipsis, and numeric HTML entities", run: () => {
+    const { text } = htmlToBoundedPlainText(
+      "It&rsquo;s &ldquo;great&rdquo; &mdash; really&hellip; &#8217;tis the season &#x2764;"
+    );
+    expect(text).toContain("It’s");
+    expect(text).toContain("“great”");
+    expect(text).toContain("—");
+    expect(text).toContain("really…");
+    expect(text).toContain("’tis");
+    expect(text).toContain("❤");
+  } },
+      { name: "leaves an unrecognized named entity as literal text rather than guessing", run: () => {
+    const { text } = htmlToBoundedPlainText("&notarealentity;");
+    expect(text).toContain("&notarealentity;");
   } }
     ]);
   });

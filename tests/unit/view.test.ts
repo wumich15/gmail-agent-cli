@@ -1,5 +1,11 @@
-import { describe, expect, it } from "vitest";
-import { adjustPageSize, filterMessages } from "../../src/commands/view.js";
+import { describe, expect, it, afterEach } from "vitest";
+import {
+  adjustPageSize,
+  filterMessages,
+  parseQuickActionCommand,
+  shortenLinksForDisplay,
+  terminalHyperlink
+} from "../../src/commands/view.js";
 import type { CachedMessageRecord } from "../../src/state/repositories/messages.js";
 
 function row(id: string, labels: string[], subject: string, sender: string): CachedMessageRecord {
@@ -33,6 +39,79 @@ describe("gmail view filtering", () => {
 
   it("uses an empty label selection as all cached mail", () => {
     expect(filterMessages(messages, new Set(), "sale").map((message) => message.gmailMessageId)).toEqual(["spam"]);
+  });
+});
+
+describe("gmail view quick-action shorthand", () => {
+  it("parses '<n> ;r' as an immediate AI-reply on message n", () => {
+    expect(parseQuickActionCommand("2 ;r")).toEqual({ index: 2, action: "ai_reply" });
+  });
+
+  it("parses '<n> r' as an immediate manual reply", () => {
+    expect(parseQuickActionCommand("3 r")).toEqual({ index: 3, action: "reply" });
+  });
+
+  it("parses '<n> d' as an immediate delete", () => {
+    expect(parseQuickActionCommand("1 d")).toEqual({ index: 1, action: "delete" });
+  });
+
+  it("tolerates no space between the number and the action", () => {
+    expect(parseQuickActionCommand("2;r")).toEqual({ index: 2, action: "ai_reply" });
+  });
+
+  it("returns null for a bare index (still opens normally) and for garbage", () => {
+    expect(parseQuickActionCommand("2")).toBeNull();
+    expect(parseQuickActionCommand("2 x")).toBeNull();
+    expect(parseQuickActionCommand("r")).toBeNull();
+    expect(parseQuickActionCommand("0 d")).toBeNull();
+  });
+});
+
+describe("terminalHyperlink", () => {
+  const originalIsTTY = process.stdout.isTTY;
+  afterEach(() => {
+    process.stdout.isTTY = originalIsTTY;
+  });
+
+  it("wraps the label in an OSC 8 hyperlink escape sequence on a TTY", () => {
+    process.stdout.isTTY = true;
+    const result = terminalHyperlink("[1]", "https://example.com");
+    expect(result).toBe("\x1b]8;;https://example.com\x1b\\[1]\x1b]8;;\x1b\\");
+  });
+
+  it("returns the plain label with no escape codes when stdout is not a TTY (redirected output)", () => {
+    process.stdout.isTTY = false;
+    expect(terminalHyperlink("[1]", "https://example.com")).toBe("[1]");
+  });
+});
+
+describe("shortenLinksForDisplay", () => {
+  const originalIsTTY = process.stdout.isTTY;
+  afterEach(() => {
+    process.stdout.isTTY = originalIsTTY;
+  });
+
+  it("replaces each distinct URL with a numbered label and returns the link table", () => {
+    process.stdout.isTTY = false; // isolate from OSC 8 escape codes for this assertion
+    const { text, links } = shortenLinksForDisplay("Click here (https://example.com/a) or here (https://example.com/b)");
+    expect(text).not.toContain("https://example.com/a");
+    expect(text).not.toContain("https://example.com/b");
+    expect(links).toEqual([
+      { label: "[1]", url: "https://example.com/a" },
+      { label: "[2]", url: "https://example.com/b" }
+    ]);
+  });
+
+  it("reuses the same label when the same URL appears more than once", () => {
+    process.stdout.isTTY = false;
+    const { links } = shortenLinksForDisplay("See https://example.com/a and again https://example.com/a");
+    expect(links).toEqual([{ label: "[1]", url: "https://example.com/a" }]);
+  });
+
+  it("returns no links for plain text with no URLs", () => {
+    const { text, links } = shortenLinksForDisplay("Just plain text, no links here.");
+    expect(text).toBe("Just plain text, no links here.");
+    expect(links).toEqual([]);
   });
 });
 

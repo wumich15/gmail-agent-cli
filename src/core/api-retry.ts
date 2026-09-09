@@ -252,10 +252,25 @@ export class GoogleApiRateLimiter {
     this.tokens = this.burstCapacity;
   }
 
-  /** Credits elapsed time to the bucket at the pace in force for that stretch. */
+  /**
+   * Credits elapsed time to the bucket at the pace in force for that
+   * stretch — but never for time spent inside an active quota cooldown.
+   * Regression: this used to credit the *entire* cooldown duration once it
+   * elapsed, since it only ever looked at wall-clock time and had no idea
+   * a cooldown had been in effect. A real observed failure mode: one quota
+   * error triggers a ~60s cooldown; `reportQuotaPressure` correctly drops
+   * tokens to ~1 at that moment, but by the time the cooldown clears,
+   * naive elapsed-time refill had quietly rebuilt the bucket back to
+   * (near) full — so the exact same oversized burst that caused the
+   * failure fired again the instant the cooldown lifted, immediately
+   * re-tripping the same per-minute limit, in a loop that never let
+   * throughput climb. Only wall-clock time *after* `cooldownUntil` (never
+   * the cooldown window itself) is eligible for refill.
+   */
   private refill(now: number): void {
-    if (now <= this.tokensUpdatedAt) return;
-    this.tokens = Math.min(this.burstCapacity, this.tokens + (now - this.tokensUpdatedAt) / this.intervalMs);
+    const baseline = Math.max(this.tokensUpdatedAt, Math.min(now, this.cooldownUntil));
+    if (now <= baseline) return;
+    this.tokens = Math.min(this.burstCapacity, this.tokens + (now - baseline) / this.intervalMs);
     this.tokensUpdatedAt = now;
   }
 
@@ -336,6 +351,15 @@ export class GoogleApiRateLimiter {
     // they must not keep extending the same one-minute pause.
     if (this.cooldownUntil > now) return;
     this.cooldownUntil = now + Math.min(cooldownMs, 60_000);
+    // `refill()` gives no credit for time spent inside this cooldown (see
+    // its own doc comment), so without this, a hold imposed right after
+    // the last available token was already spent would leave the queue
+    // waiting an extra `intervalMs` once the hold clears — a real
+    // ratcheting-down effect this function's own contract explicitly rules
+    // out ("without ratcheting the process down"). Guarantee at least the
+    // one token this function's no-pace-change promise requires; never
+    // reduce a larger balance that happened to still be available.
+    this.tokens = Math.max(this.tokens, 1);
     for (const listener of this.quotaWaitListeners) listener(this.quotaCooldownRemainingMs);
   }
 
@@ -348,9 +372,18 @@ export class GoogleApiRateLimiter {
     this.intervalMs = Math.min(this.intervalMs * 2, this.ceilingIntervalMs);
     // Drop the accumulated burst too. Halving the refill rate while a full
     // bucket is still sitting there would let the next wave go out at
-    // exactly the pace that just drew a quota error. One token is left so
-    // this only removes the burst; it never adds a new penalty wait.
-    this.tokens = Math.min(this.tokens, 1);
+    // exactly the pace that just drew a quota error. Exactly one token is
+    // left — capped down from a larger burst, but also raised up from an
+    // already-exhausted bucket (the common case: the request that just
+    // failed was itself the last available token) — so this removes the
+    // burst without ever adding a new penalty wait once the cooldown
+    // clears; `refill()` gives no further credit during the cooldown, so
+    // without the raise, an already-empty bucket stayed empty and the
+    // first request after the cooldown had to wait out a full extra
+    // `intervalMs` on top of it, which is exactly the ratcheting effect
+    // this line exists to prevent. (Capping down and raising up both
+    // resolve to the same target, so this is just an unconditional reset.)
+    this.tokens = 1;
     this.consecutiveSuccesses = 0;
     if (cooldownMs > 0) {
       this.cooldownUntil = now + Math.min(cooldownMs, 60_000);
@@ -433,16 +466,23 @@ const CONFIGURED_FASTEST_RPS = IS_TEST_ENV
   : parsePositiveNumber(process.env["GMAIL_AGENT_RATE_LIMIT_RPS"], FASTEST_REQUESTS_PER_SECOND);
 const CONFIGURED_MINUTE_BUDGET = IS_TEST_ENV ? Infinity : Math.max(275, CONFIGURED_FASTEST_RPS * 60);
 
+// Full minute budget, restored after `refill()`'s cooldown-crediting bug
+// (fixed above) turned out to be the actual cause of the repeated-failure
+// loop this constant was previously shrunk to work around — with that
+// root cause fixed, a deep burst no longer risks compounding: at most one
+// cooldown gets triggered per quota wall the burst runs into, never a
+// renewed multi-hundred-token re-burst immediately after. Per explicit
+// product decision, a real quota hit is an acceptable, expected cost of
+// spending the assumed budget as fast as possible — the priority is
+// getting through it without cascading, not avoiding it.
+const INITIAL_BURST_CAPACITY = IS_TEST_ENV ? 1 : CONFIGURED_MINUTE_BUDGET;
+
 export const googleApiRateLimiter = new GoogleApiRateLimiter(
   CONFIGURED_START_RPS,
   4000,
   CONFIGURED_FASTEST_RPS,
   CONFIGURED_MINUTE_BUDGET,
-  // The whole minute's allowance is spendable at once. The rolling window
-  // above still caps real consumption at the same 275 units/minute, so this
-  // changes only *when* a run is allowed to spend them: immediately, the way
-  // a per-minute quota actually works, rather than one read every 218ms.
-  IS_TEST_ENV ? 1 : CONFIGURED_MINUTE_BUDGET
+  INITIAL_BURST_CAPACITY
 );
 
 /**

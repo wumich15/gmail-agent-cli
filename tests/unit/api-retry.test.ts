@@ -263,6 +263,38 @@ describe("GoogleApiRateLimiter", () => {
     }
   });
 
+  it("does not rebuild a large burst from idle time spent inside a quota cooldown", async () => {
+    // Regression: refill() used to credit ALL elapsed wall-clock time
+    // toward new burst tokens, including time spent forcibly waiting out a
+    // quota cooldown. With a deep burst capacity (production's real
+    // config, sized to the whole minute budget), a long enough cooldown
+    // silently "refilled" the very burst that caused it — so the exact
+    // same oversized burst fired again the instant the cooldown cleared,
+    // immediately re-tripping the same per-minute limit. Confirmed against
+    // a real account's own diagnostic log: 8 concurrent reads failing
+    // within 70ms of each other, repeatedly, right as each ~60s cooldown
+    // expired.
+    vi.useFakeTimers();
+    try {
+      const limiter = new GoogleApiRateLimiter(10, 4000, 10, Infinity, 275); // production-shaped: deep burst
+      await limiter.acquire(); // consumes the sole starting token
+      limiter.reportQuotaPressure(60_000); // a real per-minute 403's cooldown
+      const startedAt = Date.now();
+      const requests = Array.from({ length: 3 }, async () => {
+        await limiter.acquire();
+        return Date.now() - startedAt;
+      });
+      await vi.advanceTimersByTimeAsync(60_400);
+      // Only the one preserved token is spendable the instant the cooldown
+      // clears; every request after that pays the full (now-doubled, from
+      // reportQuotaPressure) 200ms interval like normal — never a renewed
+      // 275-deep burst.
+      await expect(Promise.all(requests)).resolves.toEqual([60_000, 60_200, 60_400]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("halves its rate (doubles the interval) on reportQuotaPressure, up to the ceiling", () => {
     const limiter = new GoogleApiRateLimiter(10, 8_000); // starts at 100ms interval
     expect(limiter.currentRequestsPerSecond).toBeCloseTo(10);
