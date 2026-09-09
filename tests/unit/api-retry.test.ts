@@ -205,6 +205,64 @@ describe("GoogleApiRateLimiter", () => {
     }
   });
 
+  it("admits a whole burst at once before the pace applies", async () => {
+    // Gmail's quota is a per-minute bucket, so a run must be able to spend
+    // its allowance immediately rather than one request per interval. This
+    // is what makes `gmail --limit 100` finish in seconds instead of ~22s.
+    vi.useFakeTimers();
+    try {
+      const limiter = new GoogleApiRateLimiter(10, 4000, 10, Infinity, 5); // 100ms pace, 5 deep
+      const startedAt = Date.now();
+      const requests = Array.from({ length: 6 }, async () => {
+        await limiter.acquire();
+        return Date.now() - startedAt;
+      });
+
+      await vi.advanceTimersByTimeAsync(200);
+      await expect(Promise.all(requests)).resolves.toEqual([0, 0, 0, 0, 0, 100]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still caps a burst at the rolling minute budget", async () => {
+    vi.useFakeTimers();
+    try {
+      // Bucket deep enough for 100, but only 3 units of quota per minute.
+      const limiter = new GoogleApiRateLimiter(1000, 4000, 1000, 3, 100);
+      const startedAt = Date.now();
+      const requests = Array.from({ length: 4 }, async () => {
+        await limiter.acquire();
+        return Date.now() - startedAt;
+      });
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      await expect(Promise.all(requests)).resolves.toEqual([0, 0, 0, 60_000]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("spends the accumulated burst when quota pressure slows the pace", async () => {
+    vi.useFakeTimers();
+    try {
+      const limiter = new GoogleApiRateLimiter(10, 8_000, 10, Infinity, 5);
+      limiter.reportQuotaPressure();
+      const startedAt = Date.now();
+      const requests = Array.from({ length: 2 }, async () => {
+        await limiter.acquire();
+        return Date.now() - startedAt;
+      });
+
+      // The burst is gone, so the second request waits a full (now halved)
+      // 200ms interval instead of riding the bucket the pressure built up.
+      await vi.advanceTimersByTimeAsync(200);
+      await expect(Promise.all(requests)).resolves.toEqual([0, 200]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("halves its rate (doubles the interval) on reportQuotaPressure, up to the ceiling", () => {
     const limiter = new GoogleApiRateLimiter(10, 8_000); // starts at 100ms interval
     expect(limiter.currentRequestsPerSecond).toBeCloseTo(10);

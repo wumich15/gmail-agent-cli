@@ -17,6 +17,7 @@ import { EXIT_CODES } from "../core/errors.js";
 import { newRuleGroupId, newRunId } from "../core/ids.js";
 import { ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
+import { DEFAULT_GMAIL_READ_CONCURRENCY } from "../config/schema.js";
 import {
   applyGroupedLabelMutations,
   archiveMutation,
@@ -318,7 +319,10 @@ export async function runWork(options: WorkOptions): Promise<number> {
       userEmail: account.emailDisplay ?? "",
       userTimezone: account.timezone,
       clock: ctx.clock,
-      concurrency: { gmailReads: ctx.config?.concurrency.gmailReads ?? 5, aiCalls: ctx.config?.concurrency.aiCalls ?? 5 },
+      concurrency: {
+        gmailReads: ctx.config?.concurrency.gmailReads ?? DEFAULT_GMAIL_READ_CONCURRENCY,
+        aiCalls: ctx.config?.concurrency.aiCalls ?? 5
+      },
       existingLabels: existingLabels.map((l) => l.name),
       priorLabelCandidateCounts,
       priorLabelCandidateVotedMessageIds,

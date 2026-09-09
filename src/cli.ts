@@ -20,7 +20,8 @@ function parsePositiveInt(value: string): number {
 
 const VIEW_HELP_TEXT =
   "\nGmail view controls:\n" +
-  "  number       open a message\n" +
+  "  number       type email number to open\n" +
+  "  left/right   previous or next page in the list (no Enter needed)\n" +
   "  n / p        next or previous page\n" +
   "  [ / ]        back or forward through prior list views\n" +
   "  + / -        increase or decrease page size\n" +
@@ -30,7 +31,7 @@ const VIEW_HELP_TEXT =
   "  c / a        compose manually or with AI\n" +
   "  u            refresh Gmail\n" +
   "  q            quit\n" +
-  "  left/right   previous or next message while reading\n" +
+  "  left/right   previous or next message while reading one\n" +
   "  r / ;r       reply manually or with AI while reading\n" +
   "  esc          return to the message list\n";
 
