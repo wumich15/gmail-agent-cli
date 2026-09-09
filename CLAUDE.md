@@ -51,7 +51,9 @@ The design gaps the old boundary's text called out are resolved like this:
   validates them before drafting. The model produces body text only.
 - **The AI draft is a body-text suggestion only, still isolated exactly
   like the classifier's calls**: a fresh, stateless, tool-less Responses
-  API call (`store: false`). Source-email content, user drafting guidance,
+  API call (`store: false`). It runs on the separate, stronger compose
+  model (see "Firm technology decisions"), not the triage classifier's
+  model; the isolation and safety posture are identical either way. Source-email content, user drafting guidance,
   and Sent-mail style examples are passed only in the untrusted `input`
   block (never `instructions`), with explicit instructions to ignore any
   embedded directives.
@@ -133,7 +135,7 @@ after marking a message read.
 | CLI | `commander` plus `@clack/prompts` and `picocolors` | Small, testable command surface with accessible interactive setup |
 | Google APIs | Official `googleapis` and `google-auth-library` packages | Supported Gmail/Calendar clients and OAuth refresh behavior |
 | AI | Official `openai` SDK, I'Responses API, Structured Outputs parsed with `zod` (maybe) | A typed assessment is safer than free-form output or model-selected write tools |
-| Default model | One centrally configured Structured-Outputs-capable model, initially `gpt-5.4-mini`; override with `GMAIL_AGENT_MODEL` | Avoid model names scattered through business logic and permit controlled upgrades after evaluation |
+| Default model | Two centrally configured models, resolved by purpose in `ai/resolve-classifier.ts` and never hardcoded anywhere else. **Classification** uses a Structured-Outputs-capable `gpt-5.4-mini` (override: `GMAIL_AGENT_MODEL`). **Composing/replying in `gmail view`** uses the stronger `gpt-5.6-luna` (override: `GMAIL_AGENT_COMPOSE_MODEL`) | Avoid model names scattered through business logic and permit controlled upgrades after evaluation. The two jobs have opposite cost/quality trades: triage makes one cheap call per unresolved message on every run and returns a tiny enum, while drafting happens a handful of times per session at the user's explicit request and produces prose the user reads, edits, and sends under their own name |
 | Persistence | Local SQLite through `better-sqlite3`, WAL mode, versioned migrations | Durable action ledger, idempotency, rules, and crash recovery without a server |
 | Secrets | An internal credential-store interface backed by macOS Keychain, Windows Credential Manager, or Linux Secret Service | OAuth refresh tokens and API keys must not live in config, SQLite, logs, or shell history |
 | HTTP | Native `fetch`/Undici behind a hardened unsubscribe client | Tight control of timeouts, redirects, response size, and private-address blocking |

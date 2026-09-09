@@ -1,6 +1,17 @@
 import { z } from "zod";
 
+/** Triage/classification: one cheap call per unresolved message, every run. */
 export const DEFAULT_MODEL = "gpt-5.4-mini";
+
+/**
+ * Composing and replying in `gmail view`. Deliberately a stronger model than
+ * classification: drafting happens a handful of times per session, entirely
+ * at the user's request, and its output is prose the user will read, edit,
+ * and put their own name on — so quality matters far more than per-call cost.
+ * Triage is the opposite trade (thousands of calls, a tiny enum out), which
+ * is why the two are configured separately rather than sharing one model.
+ */
+export const DEFAULT_COMPOSE_MODEL = "gpt-5.6-luna";
 
 /**
  * In-flight Gmail reads. The shared limiter (see `core/api-retry.ts`) caps
@@ -33,6 +44,7 @@ export const ConfigSchema = z
     /** Required when aiProvider is "openai-compatible"; ignored otherwise. */
     aiBaseUrl: z.string().url().optional(),
     model: z.string().min(1).default(DEFAULT_MODEL),
+    composeModel: z.string().min(1).default(DEFAULT_COMPOSE_MODEL),
     concurrency: z
       .object({
         gmailReads: z.number().int().min(1).max(20).default(DEFAULT_GMAIL_READ_CONCURRENCY),
@@ -73,6 +85,7 @@ export function defaultConfig(timezone: string): Config {
     aiProvider,
     ...(aiBaseUrl ? { aiBaseUrl } : {}),
     model: process.env["GMAIL_AGENT_MODEL"] ?? DEFAULT_MODEL,
+    composeModel: process.env["GMAIL_AGENT_COMPOSE_MODEL"] ?? DEFAULT_COMPOSE_MODEL,
     concurrency: { gmailReads: DEFAULT_GMAIL_READ_CONCURRENCY, aiCalls: 5, calendarWrites: 2 },
     telemetryEnabled: false
   });

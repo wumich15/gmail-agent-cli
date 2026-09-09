@@ -648,11 +648,10 @@ async function handleAiReply(
     console.log(pc.red("This message has no usable address to reply to."));
     return;
   }
-  const credentials = await resolveOpenAiCredentials({
-    accountHash,
-    credentialStore: ctx.credentialStore,
-    config: ctx.config
-  });
+  const credentials = await resolveOpenAiCredentials(
+    { accountHash, credentialStore: ctx.credentialStore, config: ctx.config },
+    "compose"
+  );
   if (!credentials) {
     console.log(pc.yellow("AI is not configured (no API key found) — use r for a manual reply instead."));
     return;
@@ -695,11 +694,10 @@ async function handleCompose(
   } else {
     const purpose = await p.text({ message: "What should this email say?" });
     if (p.isCancel(purpose) || !purpose.trim()) return;
-    const credentials = await resolveOpenAiCredentials({
-      accountHash,
-      credentialStore: ctx.credentialStore,
-      config: ctx.config
-    });
+    const credentials = await resolveOpenAiCredentials(
+      { accountHash, credentialStore: ctx.credentialStore, config: ctx.config },
+      "compose"
+    );
     if (!credentials) {
       console.log(pc.yellow("AI is not configured; use c to compose manually."));
       return;
