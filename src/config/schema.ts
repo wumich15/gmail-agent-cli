@@ -1,6 +1,27 @@
 import { z } from "zod";
 
+/** Triage/classification: one cheap call per unresolved message, every run. */
 export const DEFAULT_MODEL = "gpt-5.4-mini";
+
+/**
+ * Composing and replying in `gmail view`. Deliberately a stronger model than
+ * classification: drafting happens a handful of times per session, entirely
+ * at the user's request, and its output is prose the user will read, edit,
+ * and put their own name on — so quality matters far more than per-call cost.
+ * Triage is the opposite trade (thousands of calls, a tiny enum out), which
+ * is why the two are configured separately rather than sharing one model.
+ */
+export const DEFAULT_COMPOSE_MODEL = "gpt-5.6-luna";
+
+/**
+ * In-flight Gmail reads. The shared limiter (see `core/api-retry.ts`) caps
+ * the real request *rate*, so this only decides how much of the per-minute
+ * allowance can be spent at once — and since that limiter now admits a whole
+ * burst rather than spacing reads out evenly, concurrency is what a short
+ * run's wall-clock time actually depends on. 8 matches what `gmail cache`
+ * has always used.
+ */
+export const DEFAULT_GMAIL_READ_CONCURRENCY = 8;
 
 /**
  * "openai" talks to the standard OpenAI API. "openai-compatible" points at
@@ -23,14 +44,15 @@ export const ConfigSchema = z
     /** Required when aiProvider is "openai-compatible"; ignored otherwise. */
     aiBaseUrl: z.string().url().optional(),
     model: z.string().min(1).default(DEFAULT_MODEL),
+    composeModel: z.string().min(1).default(DEFAULT_COMPOSE_MODEL),
     concurrency: z
       .object({
-        gmailReads: z.number().int().min(1).max(20).default(5),
+        gmailReads: z.number().int().min(1).max(20).default(DEFAULT_GMAIL_READ_CONCURRENCY),
         aiCalls: z.number().int().min(1).max(10).default(5),
         calendarWrites: z.number().int().min(1).max(10).default(2)
       })
       .strict()
-      .default({ gmailReads: 5, aiCalls: 5, calendarWrites: 2 }),
+      .default({ gmailReads: DEFAULT_GMAIL_READ_CONCURRENCY, aiCalls: 5, calendarWrites: 2 }),
     policyThresholds: z
       .object({
         autoTrashPromotionConfidence: z.number().min(0).max(1),
@@ -63,7 +85,8 @@ export function defaultConfig(timezone: string): Config {
     aiProvider,
     ...(aiBaseUrl ? { aiBaseUrl } : {}),
     model: process.env["GMAIL_AGENT_MODEL"] ?? DEFAULT_MODEL,
-    concurrency: { gmailReads: 5, aiCalls: 5, calendarWrites: 2 },
+    composeModel: process.env["GMAIL_AGENT_COMPOSE_MODEL"] ?? DEFAULT_COMPOSE_MODEL,
+    concurrency: { gmailReads: DEFAULT_GMAIL_READ_CONCURRENCY, aiCalls: 5, calendarWrites: 2 },
     telemetryEnabled: false
   });
 }

@@ -1,5 +1,5 @@
 import { CREDENTIAL_KEYS, type CredentialStore } from "../auth/credential-store.js";
-import { DEFAULT_MODEL, type Config } from "../config/schema.js";
+import { DEFAULT_COMPOSE_MODEL, DEFAULT_MODEL, type Config } from "../config/schema.js";
 import { NotConfiguredClassifier } from "./not-configured-classifier.js";
 import { OpenAiClassifier, SCHEMA_VERSION } from "./openai-classifier.js";
 import { PROMPT_VERSION } from "./prompt.js";
@@ -37,24 +37,38 @@ export interface ResolvedOpenAiCredentials {
 }
 
 /**
+ * Which job the model is being resolved for. These are deliberately
+ * different models: `classify` runs a cheap call on every unresolved
+ * message, while `compose` drafts prose the user will read, edit, and send
+ * under their own name. See `config/schema.ts` for the two defaults.
+ */
+export type ModelPurpose = "classify" | "compose";
+
+/**
  * Shared credential/model resolution: checked in the OS credential store
  * first, then the OPENAI_API_KEY environment variable, matching how the
  * OpenAI SDK itself defaults. Used both by `resolveClassifier` below and
- * by `gmail view`'s AI-drafted-reply feature, so the two never drift on
- * which key/model/provider they end up using.
+ * by `gmail view`'s AI drafting, so the two never drift on which
+ * key/provider they end up using — only the model differs, by `purpose`.
  */
-export async function resolveOpenAiCredentials(input: ResolveClassifierInput): Promise<ResolvedOpenAiCredentials | null> {
+export async function resolveOpenAiCredentials(
+  input: ResolveClassifierInput,
+  purpose: ModelPurpose = "classify"
+): Promise<ResolvedOpenAiCredentials | null> {
   const storedKey = await input.credentialStore.getSecret(CREDENTIAL_KEYS.aiApiKey(input.accountHash));
   const apiKey = storedKey ?? process.env["OPENAI_API_KEY"];
   if (!apiKey) {
     return null;
   }
-  // GMAIL_AGENT_MODEL is documented as a live override (CLAUDE.md's
-  // "Firm technology decisions" table), so it must win over whatever
-  // model got persisted into config.json at an earlier sign-in — a
-  // config file happily keeps a stale model name forever otherwise,
-  // since nothing else ever rewrites it.
-  const model = process.env["GMAIL_AGENT_MODEL"] || input.config?.model || DEFAULT_MODEL;
+  // GMAIL_AGENT_MODEL / GMAIL_AGENT_COMPOSE_MODEL are documented as live
+  // overrides (CLAUDE.md's "Firm technology decisions" table), so they must
+  // win over whatever model got persisted into config.json at an earlier
+  // sign-in — a config file happily keeps a stale model name forever
+  // otherwise, since nothing else ever rewrites it.
+  const model =
+    purpose === "compose"
+      ? process.env["GMAIL_AGENT_COMPOSE_MODEL"] || input.config?.composeModel || DEFAULT_COMPOSE_MODEL
+      : process.env["GMAIL_AGENT_MODEL"] || input.config?.model || DEFAULT_MODEL;
   const baseURL =
     input.config?.aiProvider === "openai-compatible" && input.config.aiBaseUrl ? input.config.aiBaseUrl : null;
   return { apiKey, model, baseURL };

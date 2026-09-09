@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { resolveClassifier } from "../../src/ai/resolve-classifier.js";
+import { resolveClassifier, resolveOpenAiCredentials } from "../../src/ai/resolve-classifier.js";
 import { InMemoryCredentialStore, CREDENTIAL_KEYS } from "../../src/auth/credential-store.js";
 import { NotConfiguredClassifier } from "../../src/ai/not-configured-classifier.js";
 import { OpenAiClassifier } from "../../src/ai/openai-classifier.js";
-import { defaultConfig, DEFAULT_MODEL } from "../../src/config/schema.js";
+import { defaultConfig, DEFAULT_COMPOSE_MODEL, DEFAULT_MODEL } from "../../src/config/schema.js";
 
 const ACCOUNT_HASH = "acct1";
 const ORIGINAL_ENV = { ...process.env };
@@ -11,6 +11,7 @@ const ORIGINAL_ENV = { ...process.env };
 beforeEach(() => {
   delete process.env["OPENAI_API_KEY"];
   delete process.env["GMAIL_AGENT_MODEL"];
+  delete process.env["GMAIL_AGENT_COMPOSE_MODEL"];
 });
 
 afterEach(() => {
@@ -80,5 +81,42 @@ describe("resolveClassifier", () => {
       config: null
     });
     expect(result.description).toContain(DEFAULT_MODEL);
+  });
+});
+
+describe("resolveOpenAiCredentials model purpose", () => {
+  const base = () => ({
+    accountHash: ACCOUNT_HASH,
+    credentialStore: new InMemoryCredentialStore(),
+    config: null
+  });
+
+  it("classification and composing resolve to different default models", async () => {
+    process.env["OPENAI_API_KEY"] = "sk-test";
+    const classify = await resolveOpenAiCredentials(base(), "classify");
+    const compose = await resolveOpenAiCredentials(base(), "compose");
+    expect(classify?.model).toBe(DEFAULT_MODEL);
+    expect(compose?.model).toBe(DEFAULT_COMPOSE_MODEL);
+    expect(classify?.model).not.toBe(compose?.model);
+  });
+
+  it("defaults to the classification model when no purpose is given", async () => {
+    process.env["OPENAI_API_KEY"] = "sk-test";
+    expect((await resolveOpenAiCredentials(base()))?.model).toBe(DEFAULT_MODEL);
+  });
+
+  it("each purpose reads its own env override and ignores the other's", async () => {
+    process.env["OPENAI_API_KEY"] = "sk-test";
+    process.env["GMAIL_AGENT_MODEL"] = "classify-override";
+    process.env["GMAIL_AGENT_COMPOSE_MODEL"] = "compose-override";
+    expect((await resolveOpenAiCredentials(base(), "classify"))?.model).toBe("classify-override");
+    expect((await resolveOpenAiCredentials(base(), "compose"))?.model).toBe("compose-override");
+  });
+
+  it("composing uses the persisted composeModel, not the classification model", async () => {
+    process.env["OPENAI_API_KEY"] = "sk-test";
+    const config = { ...defaultConfig("UTC"), model: "persisted-classify", composeModel: "persisted-compose" };
+    expect((await resolveOpenAiCredentials({ ...base(), config }, "compose"))?.model).toBe("persisted-compose");
+    expect((await resolveOpenAiCredentials({ ...base(), config }, "classify"))?.model).toBe("persisted-classify");
   });
 });
