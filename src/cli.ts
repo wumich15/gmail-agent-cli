@@ -18,6 +18,22 @@ function parsePositiveInt(value: string): number {
   return parsed;
 }
 
+const VIEW_HELP_TEXT =
+  "\nGmail view controls:\n" +
+  "  number       open a message\n" +
+  "  n / p        next or previous page\n" +
+  "  [ / ]        back or forward through prior list views\n" +
+  "  + / -        increase or decrease page size\n" +
+  "  l <number>   set an exact page size\n" +
+  "  f            filter by Gmail label\n" +
+  "  s <text>     search subjects and senders (s alone clears)\n" +
+  "  c / a        compose manually or with AI\n" +
+  "  u            refresh Gmail\n" +
+  "  q            quit\n" +
+  "  left/right   previous or next message while reading\n" +
+  "  r / ;r       reply manually or with AI while reading\n" +
+  "  esc          return to the message list\n";
+
 // MVP command surface: `gmail` (scan + clean up, with inline sign-in on
 // first run), `gmail add` (create a spam/important rule), `gmail category`
 // (create a Gmail label directly, on demand), `gmail cache` (read-only
@@ -41,6 +57,10 @@ program
     "--limit <n>",
     "cap the Inbox and native-Spam scans to the N most recent messages each (reduces Gmail API quota usage)",
     parsePositiveInt
+  )
+  .addHelpText(
+    "after",
+    VIEW_HELP_TEXT + "\nUse `gmail help <command>` for command-specific options (for example, `gmail help view`).\n"
   );
 
 function withExitHandling(fn: () => Promise<number>): void {
@@ -119,19 +139,29 @@ program
   )
   .option("--limit <n>", "messages per page (default: 20)", parsePositiveInt)
   .option("--previous", "open the existing Gmail cache without refreshing it first", false)
-  .addHelpText(
-    "after",
-    "\nView controls:\n" +
-      "  n / p       next or previous page\n" +
-      "  [ / ]       back or forward through prior list views\n" +
-      "  + / -       increase or decrease page size\n" +
-      "  l <number>  set an exact page size\n" +
-      "  left/right  previous or next message while reading\n"
-  )
+  .addHelpText("after", VIEW_HELP_TEXT)
   .action((opts: { limit?: number; previous: boolean }) => {
     withExitHandling(() =>
       runView({ ...(opts.limit !== undefined ? { limit: opts.limit } : {}), previous: opts.previous })
     );
+  });
+
+program
+  .command("help [command]")
+  .description("Show all commands and Gmail view controls, or focused help for one command")
+  .action((commandName?: string) => {
+    if (commandName === undefined) {
+      program.outputHelp();
+      return;
+    }
+    const command = program.commands.find((candidate) => candidate.name() === commandName);
+    if (!command) {
+      console.error(pc.red(`Unknown command: ${commandName}`));
+      console.error("Run 'gmail help' to see available commands.");
+      process.exitCode = EXIT_CODES.invalidOrAuthRequired;
+      return;
+    }
+    command.outputHelp();
   });
 
 // Commander's root `.action()` absorbs ANY unrecognized first argument as
@@ -144,7 +174,7 @@ const KNOWN_SUBCOMMANDS = new Set(["add", "category", "cache", "uncache", "view"
 const firstArg = process.argv[2];
 if (firstArg !== undefined && !firstArg.startsWith("-") && !KNOWN_SUBCOMMANDS.has(firstArg)) {
   console.error(pc.red(`Unknown command: ${firstArg}`));
-  console.error("Run 'gmail --help' to see available commands.");
+  console.error("Run 'gmail help' to see available commands.");
   process.exitCode = EXIT_CODES.invalidOrAuthRequired;
 } else {
   program.parse();

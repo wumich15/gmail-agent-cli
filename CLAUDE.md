@@ -143,6 +143,7 @@ gmail category <NAME...>
 gmail cache [--limit N]
 gmail uncache [--yes]
 gmail view [--limit N] [--previous]
+gmail help [COMMAND]
 gmail rules list [--json]
 gmail rules remove <RULE_GROUP_ID>
 gmail summary [RUN_ID] [--json]
@@ -153,6 +154,11 @@ gmail auth logout
 gmail config show
 gmail doctor
 ```
+
+`gmail help` must print every wired top-level command and the complete
+interactive `gmail view` control reference. `gmail help <COMMAND>` prints
+focused help for one command; in particular, `gmail help view` repeats the
+same shared view-control reference so the two help surfaces cannot drift.
 
 ### Default command and onboarding
 
