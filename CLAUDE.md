@@ -127,12 +127,19 @@ change is retried later.
   `[1]`/`[2]`/... label (the same URL reused later in the message reuses its
   earlier number) and wrapped as a clickable OSC 8 terminal hyperlink, so a
   supporting terminal (iTerm2, Terminal.app, Windows Terminal, kitty,
-  wezterm, and most others) opens it in the system browser on click — this
-  app never opens anything itself, and the escape sequence degrades to
-  plain shortened text on a terminal that doesn't support it. Shortening is
-  cosmetic only, never a loss of function; pressing `l` on an open message
-  prints the label-to-URL table for anyone who wants to see or copy the
-  real destination before trusting a click.
+  wezterm, and most others) opens it in the system browser on click, and the
+  escape sequence degrades to plain shortened text on a terminal that
+  doesn't support it. Shortening is cosmetic only, never a loss of function;
+  pressing `l` on an open message prints the label-to-URL table for anyone
+  who wants to see or copy the real destination before trusting a click.
+  Pressing `o` instead prompts for one of those numbered links and launches
+  it directly via the OS's own browser launcher (`open` on macOS, `start` on
+  Windows, `xdg-open` elsewhere) — an explicit alternative to clicking the
+  OSC 8 hyperlink for a terminal that doesn't render it, or for a script- or
+  keyboard-driven session. This app itself still never fetches the URL or
+  the page behind it; the click and the `o` command both hand the address to
+  the user's own browser and stop there, and only an `http(s)` URL is ever
+  passed to the launcher.
 - **Redraw discipline**: both the list and the read view clear the viewport
   and scrollback before drawing, so paging or moving between messages
   replaces what is on screen instead of appending another copy below it.
@@ -144,7 +151,9 @@ change is retried later.
   the view redraws, so a "Sent." is never wiped out from under the user.
 - **Compose (`c`)** and **AI compose (`a`/`;c`)**: prompt for a user-owned
   recipient and subject, accept or draft body text, then show the shared
-  confirmation preview.
+  confirmation preview. This exact flow (`gmail/compose-flow.ts`) is also
+  reachable directly from a shell prompt as `gmail send` — see below —
+  rather than only from inside a running view session.
 - **Reply (`r`)** and **AI reply (`;r`)**: available on an open message
   (deterministic reply targeting/thread headers) and, as a pure navigation
   shortcut, directly from the list by typing `<n> r` or `<n> ;r` (e.g.
@@ -152,18 +161,19 @@ change is retried later.
   into one typed command; it still opens the message for real and still
   ends at the same exact-message confirmation gate described above. There
   is no command or flag anywhere that sends without that confirmation.
-- **Delete (`d`)**: on an open message, or from the list as `<n> d`,
-  moves the message to Gmail's Trash after a lightweight confirmation
-  (defaulting to "yes," unlike every send confirmation in this app, which
-  defaults to "no" — Trash is reversible two different ways, see below) —
-  the same reversible `messages.trash` this app's Trash policy elsewhere
-  uses, never a permanent-delete endpoint (see "Non-goals and hard
-  boundaries"). The local cache row is removed immediately, so the list
-  reflects the deletion right away instead of waiting for the next Gmail
-  history sync. Recoverable from Gmail's own Trash folder, and instantly
-  within the same session via `;u` (below); this one-off interactive
-  action is not written to the action ledger, so `gmail undo` does not
-  know about it once the session ends.
+- **Delete (`d`)**: on an open message, from the list as `<n> d`, or as bare
+  `d` in the list (acting on whichever row is currently highlighted — the
+  arrow-key selection's counterpart to `<n> d`), moves the message to
+  Gmail's Trash after a lightweight confirmation (defaulting to "yes,"
+  unlike every send confirmation in this app, which defaults to "no" —
+  Trash is reversible two different ways, see below) — the same reversible
+  `messages.trash` this app's Trash policy elsewhere uses, never a
+  permanent-delete endpoint (see "Non-goals and hard boundaries"). The local
+  cache row is removed immediately, so the list reflects the deletion right
+  away instead of waiting for the next Gmail history sync. Recoverable from
+  Gmail's own Trash folder, and instantly within the same session via `;u`
+  (below); this one-off interactive action is not written to the action
+  ledger, so `gmail undo` does not know about it once the session ends.
 - **Quick undo (`;u`)**: restores the single most recently deleted message
   from this session — `messages.untrash` plus reinstating its exact prior
   local-cache label snapshot — and clears the pending undo. Session-scoped
@@ -218,6 +228,7 @@ gmail category <NAME...>
 gmail cache [--limit N]
 gmail uncache [--yes]
 gmail view [--limit N] [--previous]
+gmail send [TO] [--subject TEXT] [--ai]
 gmail help [COMMAND]
 gmail rules list [--json]
 gmail rules remove <RULE_GROUP_ID>
@@ -282,6 +293,12 @@ With no category, show an interactive message/sender picker. With a category str
 Protection is content-based: only a classified actionable message or a message with a Calendar candidate receives the content safety veto. A bare important rule or preexisting `STARRED`/`IMPORTANT` label does not make an otherwise low-value promotion immune to cleanup. `gmail add spam` is an explicit user override: it may overlap an important rule, wins rule matching for that sender/list, and sends current matches to Trash.
 
 A persistent important matcher is not allowed to trust display name, `From`, or domain alone. At rule creation, bind it to an aligned passing DMARC identity or passing aligned DKIM signing domain observed on the selected message. Future messages must satisfy the matcher and the stored authentication binding; an authentication failure/mismatch disables that rule for the message and routes it to Review. A one-time, explicitly selected message can still be starred without creating a persistent sender rule.
+
+### `gmail send`
+
+Composes and sends exactly one new email, using the identical shared flow `gmail view`'s `c`/`a`/`;c` commands use (`gmail/compose-flow.ts`) — this command exists so that flow is reachable without first opening the interactive inbox. `TO` and `--subject` are optional positional/flag pre-fills that skip the corresponding prompt; when omitted, the user is prompted for them exactly as in `gmail view`. Recipient and subject are always either a value the user typed or one passed on the command line — never AI-derived, matching every other outbound path in this app.
+
+With no `--ai` flag, the command asks whether to compose manually or with AI before drafting; `--ai` skips that question and drafts directly. An AI draft reuses the account's persisted writing-style profile (`gmail/writing-style.ts`), computing and saving it on first use exactly as `gmail view` does, rather than re-deriving it every invocation. Either way, the flow ends at the same exact-message (To/Subject/Body) confirmation gate as everywhere else in this app, defaulting to "no" — there is no flag that skips it. `gmail send` requires an interactive terminal (like `gmail view`) and fails safe with exit code `3` rather than guessing when stdin is not a TTY, since it can never obtain that confirmation non-interactively.
 
 ### Exit codes and output
 

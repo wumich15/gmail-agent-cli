@@ -1,6 +1,6 @@
 import * as p from "@clack/prompts";
 import pc from "picocolors";
-import { createInterface } from "node:readline/promises";
+import { spawn } from "node:child_process";
 import { bootstrap } from "../core/bootstrap.js";
 import { resolveAccountSigningInIfNeeded } from "./shared.js";
 import { runCache } from "./cache.js";
@@ -10,10 +10,11 @@ import { SETTING_KEYS, SettingsRepository } from "../state/repositories/settings
 import { fetchMessageFull, headersFromMessage } from "../gmail/scanner.js";
 import { buildNormalizedMessage, extractBodyParts } from "../gmail/normalize.js";
 import { GMAIL_LABELS, isRead } from "../gmail/labels.js";
-import { buildComposeTarget, buildReplyTarget, sendReply, type ReplyTarget } from "../gmail/reply.js";
-import { draftNewEmail, draftReply } from "../ai/draft-reply.js";
+import { buildReplyTarget } from "../gmail/reply.js";
+import { draftReply } from "../ai/draft-reply.js";
 import { resolveOpenAiCredentials } from "../ai/resolve-classifier.js";
 import type { ResolvedOpenAiCredentials } from "../ai/resolve-classifier.js";
+import { promptBody, reviewAiDraft, confirmAndSend, handleCompose } from "../gmail/compose-flow.js";
 import { readCommandLine, waitForKeypress } from "../core/keypress.js";
 import { ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
@@ -37,7 +38,8 @@ const DEFAULT_PAGE_SIZE = 20;
 const PAGE_SIZE_STEPS = [5, 10, 20, 50, 100] as const;
 
 const LIST_CONTROLS =
-  "↑/↓ select · enter open · type email number to open · <n> r/;r/d reply/AI-reply/delete without opening it · " +
+  "↑/↓ select · enter open · type email number to open · d delete highlighted row · " +
+  "<n> r/;r/d reply/AI-reply/delete without opening it · " +
   "←/→ page · [ ] history · esc home · +/- size · l <n> · f filter · s search · c/a compose · " +
   ";s refresh writing style · ;u undo last delete · u refresh · q quit";
 
@@ -374,6 +376,20 @@ export async function runView(options: ViewOptions): Promise<number> {
       }
       continue;
     }
+    if (cmd === "d") {
+      // Bare "d" — the arrow-key highlight's counterpart to "<n> d": deletes
+      // whichever row is currently highlighted, without needing to type its
+      // number first. Same reversible Trash move, same defaulted-to-yes
+      // confirmation, same instant local-cache removal and ";u" undo.
+      if (pageItems.length > 0) {
+        const trashed = await handleQuickDelete(gmailClient, messagesRepo, pageItems[selectedRow]!);
+        if (trashed) lastTrashed = trashed;
+        console.log(pc.dim("\nPress any key to return to the list."));
+        await waitForKeypress();
+        all = messagesRepo.listForAccount(account.accountHash);
+      }
+      continue;
+    }
     // "<n> r" / "<n> ;r" / "<n> d" — act on a message directly from the
     // list without the separate open-then-press-key steps. Reply/AI-reply
     // still open the message first (real content is needed to draft
@@ -661,7 +677,7 @@ async function openMessage(
     console.log(
       pc.dim(
         "\n[esc] list   [←/p] previous   [→/n] next   [r] reply   [;][r] AI reply   [d] delete" +
-          (links.length > 0 ? "   [l] show link URLs" : "")
+          (links.length > 0 ? "   [l] show link URLs   [o] open link in browser" : "")
       )
     );
     edge = null;
@@ -702,6 +718,30 @@ async function openMessage(
       console.log(pc.dim("\nPress any key to return to the list."));
       await waitForKeypress();
       if (trashed) return { navigation: "back", notice: "Moved to Trash. \";u\" undoes it.", trashedRecord: trashed };
+    }
+    if (action === "open_link") {
+      console.log("");
+      if (links.length === 0) {
+        console.log(pc.dim("No links in this message."));
+      } else {
+        const choice = await p.text({
+          message: `Open which link in your browser? (1-${links.length})`,
+          ...(links.length === 1 ? { placeholder: "1" } : {})
+        });
+        if (!p.isCancel(choice)) {
+          const raw = choice.trim() || (links.length === 1 ? "1" : "");
+          const index = Number(raw);
+          const link = Number.isInteger(index) ? links[index - 1] : undefined;
+          if (link) {
+            openUrlInBrowser(link.url);
+            console.log(pc.green(`Opening ${link.label} in your system browser.`));
+          } else {
+            console.log(pc.red("No such link number."));
+          }
+        }
+      }
+      console.log(pc.dim("\nPress any key to return to the message."));
+      await waitForKeypress();
     }
   }
 }
@@ -793,6 +833,36 @@ export function shortenLinksForDisplay(text: string): { text: string; links: Dis
   return { text: rewritten, links };
 }
 
+/**
+ * Opens `url` in the user's default system browser via the OS's own
+ * "open"/"start"/"xdg-open" launcher — this app never fetches the URL
+ * itself; the browser does, exactly as if the user had clicked the OSC 8
+ * hyperlink (`terminalHyperlink`) themselves. Restricted to http(s) so a
+ * non-web scheme extracted from a message body can never reach a shell
+ * launcher — defense-in-depth alongside `shortenLinksForDisplay` only ever
+ * capturing http(s) URLs from the body in the first place.
+ */
+export function openUrlInBrowser(url: string): void {
+  if (!/^https?:\/\//i.test(url)) return;
+  let command: string;
+  let args: string[];
+  if (process.platform === "darwin") {
+    command = "open";
+    args = [url];
+  } else if (process.platform === "win32") {
+    command = "cmd";
+    args = ["/c", "start", "", url];
+  } else {
+    command = "xdg-open";
+    args = [url];
+  }
+  try {
+    spawn(command, args, { stdio: "ignore", detached: true }).unref();
+  } catch {
+    console.error(pc.yellow(`Could not launch a browser automatically. Open this URL manually: ${url}`));
+  }
+}
+
 function renderMessage(message: NormalizedMessage, labelIds: readonly string[]): readonly DisplayLink[] {
   clearScreen();
   console.log("");
@@ -814,7 +884,7 @@ function renderMessage(message: NormalizedMessage, labelIds: readonly string[]):
   return links;
 }
 
-type ViewerAction = "back" | "previous" | "next" | "reply" | "ai_reply" | "delete" | "links";
+type ViewerAction = "back" | "previous" | "next" | "reply" | "ai_reply" | "delete" | "links" | "open_link";
 
 interface OpenedMessage {
   navigation: "back" | "previous" | "next";
@@ -836,76 +906,9 @@ async function waitForViewerAction(): Promise<ViewerAction> {
     if (key.name === "r") return "reply";
     if (key.name === "d") return "delete";
     if (key.name === "l") return "links";
+    if (key.name === "o") return "open_link";
     lastName = key.name;
     lastAt = Date.now();
-  }
-}
-
-async function promptBody(message: string): Promise<string | null> {
-  console.log("");
-  console.log(pc.bold(message));
-  console.log(pc.dim("Enter plain text on as many lines as needed. Finish with a single . on its own line."));
-  const readline = createInterface({ input: process.stdin, output: process.stdout });
-  const lines: string[] = [];
-  try {
-    for (;;) {
-      const line = await readline.question(lines.length === 0 ? "> " : "| ");
-      if (line === ".") break;
-      lines.push(line);
-    }
-  } catch {
-    return null;
-  } finally {
-    readline.close();
-  }
-  const body = lines.join("\n").trim();
-  return body || null;
-}
-
-async function reviewAiDraft(draft: string): Promise<string | null> {
-  console.log("");
-  console.log(pc.bold("AI draft"));
-  console.log(draft);
-  console.log("");
-  const choice = await p.select({
-    message: "What next?",
-    options: [
-      { value: "use", label: "Use this draft" },
-      { value: "replace", label: "Replace the body" },
-      { value: "discard", label: "Discard" }
-    ]
-  });
-  if (p.isCancel(choice) || choice === "discard") return null;
-  return choice === "replace" ? promptBody("Replacement body") : draft;
-}
-
-async function confirmAndSend(
-  gmailClient: GmailClient,
-  accountHash: string,
-  target: ReplyTarget,
-  body: string
-): Promise<void> {
-  console.log("");
-  console.log(pc.bold(target.threadId ? "Reply preview" : "Message preview"));
-  console.log(`To: ${target.to}`);
-  console.log(`Subject: ${target.subject}`);
-  console.log("");
-  console.log(body);
-  console.log("");
-  const confirmed = await p.confirm({ message: "Send this exact message?", initialValue: false });
-  if (p.isCancel(confirmed) || !confirmed) {
-    console.log(pc.dim("Not sent."));
-    return;
-  }
-  const lock = new ProcessLock(lockFilePath(accountHash));
-  lock.acquire();
-  try {
-    await sendReply(gmailClient, target, body);
-    console.log(pc.green("Sent."));
-  } catch (error) {
-    console.error(pc.red(`Failed to send: ${error instanceof Error ? error.message : String(error)}`));
-  } finally {
-    lock.release();
   }
 }
 
@@ -959,50 +962,3 @@ async function handleAiReply(
   await confirmAndSend(gmailClient, accountHash, target, edited);
 }
 
-async function handleCompose(
-  gmailClient: GmailClient,
-  accountHash: string,
-  useAi: boolean,
-  ctx: ReturnType<typeof bootstrap>,
-  getStyleProfile: (credentials: ResolvedOpenAiCredentials, forceRefresh?: boolean) => Promise<string | null>
-): Promise<void> {
-  const to = await p.text({ message: "To" });
-  if (p.isCancel(to)) return;
-  const subject = await p.text({ message: "Subject" });
-  if (p.isCancel(subject)) return;
-  const target = buildComposeTarget(to, subject);
-  if (!target) {
-    console.log(pc.red("Enter valid email addresses separated by commas; headers cannot contain line breaks."));
-    return;
-  }
-  let body: string | null;
-  if (!useAi) {
-    body = await promptBody("Message body");
-  } else {
-    const purpose = await p.text({ message: "What should this email say?" });
-    if (p.isCancel(purpose) || !purpose.trim()) return;
-    const credentials = await resolveOpenAiCredentials(
-      { accountHash, credentialStore: ctx.credentialStore, config: ctx.config },
-      "compose"
-    );
-    if (!credentials) {
-      console.log(pc.yellow("AI is not configured; use c to compose manually."));
-      return;
-    }
-    const spinner = p.spinner();
-    spinner.start("Drafting");
-    const styleProfile = await getStyleProfile(credentials);
-    const draft = await draftNewEmail(
-      { to: target.to, subject: target.subject, purpose },
-      credentials,
-      { styleProfile }
-    );
-    spinner.stop(draft ? "Draft ready." : "Could not draft the email.");
-    body = draft ? await reviewAiDraft(draft) : null;
-  }
-  if (!body) {
-    console.log(pc.dim("Cancelled."));
-    return;
-  }
-  await confirmAndSend(gmailClient, accountHash, target, body);
-}

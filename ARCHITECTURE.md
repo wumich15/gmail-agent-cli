@@ -528,6 +528,16 @@ the MVP surface small:
   first-ever run or an expired marker.
 - **`gmail view`** (`src/commands/view.ts`) — an interactive terminal
   browser over `gmail cache`'s local data; see "gmail view" below.
+- **`gmail send [TO] [--subject <text>] [--ai]`** (`src/commands/send.ts`) —
+  reaches `gmail view`'s exact compose/AI-draft/confirm flow directly from
+  a shell prompt. Both this command and `gmail view`'s `c`/`a`/`;c` now
+  call the same extracted `handleCompose`/`confirmAndSend`/`promptBody`/
+  `reviewAiDraft` functions in `src/gmail/compose-flow.ts`, so the two
+  entry points cannot drift on the one property that matters: neither can
+  reach `sendReply` without first showing the exact To/Subject/Body and
+  getting an explicit, default-no confirmation. Requires a TTY (same
+  `stdin.isTTY` guard as `gmail view`) and fails safe with exit code 3
+  otherwise, since it can never obtain that confirmation non-interactively.
 
 ### `gmail view`
 
@@ -1233,6 +1243,47 @@ loop — so shrinking the burst was solving a problem the root-cause fix
 had already solved. Restored to the full minute budget; hitting the
 account's real ceiling once per burst is treated as an acceptable, expected
 cost of maximizing throughput, not something to design around.
+
+## Tenth pass: `gmail send`, opening links in a browser, and highlight-delete
+
+Three user requests handled together since they all touch the same
+`src/commands/view.ts` compose/read-view surface:
+
+- **`gmail send`** (`src/commands/send.ts`, wired in `src/cli.ts`): a new
+  top-level command that composes and sends one new email from a shell
+  prompt, without opening `gmail view` first. Rather than duplicate
+  `gmail view`'s compose logic, `promptBody`, `reviewAiDraft`,
+  `confirmAndSend`, and `handleCompose` moved out of `view.ts` into a new
+  `src/gmail/compose-flow.ts` module that both commands import — `view.ts`'s
+  `c`/`a`/`;c` and manual/AI reply handlers call the exact same functions
+  they did before, just from the shared module. `handleCompose` gained an
+  optional `prefill: { to?, subject? }` parameter so `gmail send`'s
+  positional `TO` argument and `--subject` flag can skip those prompts
+  without introducing a second, divergent compose path. `--ai` skips the
+  manual-vs-AI `p.select` prompt and drafts directly; either way the flow
+  still ends at `confirmAndSend`'s unchanged exact-message, default-no
+  confirmation. Like `gmail view`, it refuses to run at all
+  (`EXIT_CODES.safetyBlocked`) when `stdin` isn't a TTY, since there would
+  be no way to obtain that confirmation.
+- **Opening a link in the browser (`o`, read view)**: previously the only
+  way to follow a link was clicking the OSC 8 hyperlink `shortenLinksForDisplay`
+  already wraps each `[N]` label in — invisible/inert on a terminal that
+  doesn't render OSC 8. `o` now prompts for a link number and calls a new
+  `openUrlInBrowser` (`view.ts`, exported for testing) that spawns the OS's
+  own launcher (`open` on darwin, `cmd /c start` on win32, `xdg-open`
+  elsewhere) detached and with `stdio: "ignore"`, then `unref()`s it — this
+  app still never fetches the URL or its content itself; the spawned
+  browser process does, exactly as a real click would. Restricted to
+  `http(s)` schemes as defense-in-depth (a non-web scheme can never reach
+  the shell launcher), even though `shortenLinksForDisplay`'s regex already
+  only ever captures `http(s)` URLs from the body.
+- **Highlight-delete (bare `d` in the list)**: `<n> d` already deleted a
+  message by typed number; bare `d` now does the same thing to whichever
+  row the arrow keys currently have highlighted (`pageItems[selectedRow]`),
+  the same pairing Enter-on-empty-command already has with the highlighted
+  row for *opening* a message. Reuses the existing `handleQuickDelete` path
+  unchanged — same defaulted-to-yes confirmation, same instant local-cache
+  removal, same `;u` session-scoped undo.
 
 ## Known deviations from the full design (as of this writing)
 

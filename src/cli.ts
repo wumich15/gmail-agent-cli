@@ -7,6 +7,7 @@ import { runCategory } from "./commands/category.js";
 import { runCache } from "./commands/cache.js";
 import { runUncache } from "./commands/uncache.js";
 import { runView } from "./commands/view.js";
+import { runSend } from "./commands/send.js";
 import { GmailAgentError, EXIT_CODES } from "./core/errors.js";
 import { redactSecrets } from "./logging/logger.js";
 
@@ -26,6 +27,7 @@ const VIEW_HELP_TEXT =
   "  <n> r        reply to message n immediately, without opening it first\n" +
   "  <n> ;r       AI-draft a reply to message n immediately (e.g. \"2 ;r\")\n" +
   "  <n> d        delete (Trash) message n immediately, without opening it\n" +
+  "  d            delete (Trash) the highlighted row, without opening it\n" +
   "  left/right   previous or next page in the list (no Enter needed)\n" +
   "  n / p        next or previous page\n" +
   "  [ / ]        back or forward through prior list views\n" +
@@ -44,6 +46,7 @@ const VIEW_HELP_TEXT =
   "  d            delete (move to Trash) while reading — default answer is yes\n" +
   "  l            show this message's link URLs (links are shown shortened\n" +
   "               and clickable in a terminal that supports it)\n" +
+  "  o            open one of this message's links in your system browser\n" +
   "  esc          return to the message list\n" +
   "\n" +
   "The \"<n> r\"/\"<n> ;r\" shortcuts only jump straight to composing — the same\n" +
@@ -57,8 +60,10 @@ const VIEW_HELP_TEXT =
 // (create a Gmail label directly, on demand), `gmail cache` (read-only
 // full-inbox snapshot that seeds incremental scanning), `gmail uncache`
 // (clears that local scan cache/history marker, no Gmail/Calendar changes),
-// and `gmail view` (terminal inbox with automatic cache refresh, reading,
-// composing, replies, and Sent-style-aware AI drafts). The other commands (spam/important/rules/summary/
+// `gmail view` (terminal inbox with automatic cache refresh, reading,
+// composing, replies, and Sent-style-aware AI drafts), and `gmail send`
+// (the same compose/AI-draft/confirm flow as gmail view's "c"/"a", reachable
+// directly from the command line). The other commands (spam/important/rules/summary/
 // undo/auth/config/doctor) still exist as working code under
 // src/commands/ — they're just not wired up as CLI subcommands yet.
 // Re-add them here when they're back in scope.
@@ -165,6 +170,24 @@ program
   });
 
 program
+  .command("send [to]")
+  .description(
+    'Compose and send one new email, e.g. gmail send "someone@example.com" — shares gmail view\'s exact ' +
+      "compose/AI-draft/confirm flow; nothing sends without a final exact-message confirmation"
+  )
+  .option("--subject <text>", "subject line (skips the prompt)")
+  .option("--ai", "draft the body with AI using your saved writing style, instead of typing it manually", false)
+  .action((to: string | undefined, opts: { subject?: string; ai: boolean }) => {
+    withExitHandling(() =>
+      runSend({
+        ...(to !== undefined ? { to } : {}),
+        ...(opts.subject !== undefined ? { subject: opts.subject } : {}),
+        ai: opts.ai
+      })
+    );
+  });
+
+program
   .command("help [command]")
   .description("Show all commands and Gmail view controls, or focused help for one command")
   .action((commandName?: string) => {
@@ -188,7 +211,7 @@ program
 // otherwise silently run the full mutating pipeline instead of erroring.
 // Since bare `gmail` performs real mailbox mutations, that's a dangerous
 // default; check the first token explicitly before letting Commander parse.
-const KNOWN_SUBCOMMANDS = new Set(["add", "category", "cache", "uncache", "view", "help"]);
+const KNOWN_SUBCOMMANDS = new Set(["add", "category", "cache", "uncache", "view", "send", "help"]);
 const firstArg = process.argv[2];
 if (firstArg !== undefined && !firstArg.startsWith("-") && !KNOWN_SUBCOMMANDS.has(firstArg)) {
   console.error(pc.red(`Unknown command: ${firstArg}`));

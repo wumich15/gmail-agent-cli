@@ -22,9 +22,11 @@ describe("gmail help", () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("Commands:");
     expect(result.stdout).toContain("view [options]");
+    expect(result.stdout).toContain("send [options]");
     expect(result.stdout).toContain("Gmail view controls:");
     expect(result.stdout).toContain("r / ;r");
     expect(result.stdout).toContain("type email number to open");
+    expect(result.stdout).toContain("open one of this message's links in your system browser");
     // The point is that `help` does no mailbox work and reports no problem of
     // its own — not that the runtime is silent. Node writes its own
     // deprecation notices (e.g. DEP0040 for punycode, from a transitive

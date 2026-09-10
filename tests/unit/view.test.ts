@@ -1,12 +1,17 @@
-import { describe, expect, it, afterEach } from "vitest";
-import {
+import { describe, expect, it, vi, afterEach } from "vitest";
+import type { CachedMessageRecord } from "../../src/state/repositories/messages.js";
+
+const spawnMock = vi.hoisted(() => vi.fn(() => ({ unref: vi.fn() })));
+vi.mock("node:child_process", () => ({ spawn: spawnMock }));
+
+const {
   adjustPageSize,
   filterMessages,
   parseQuickActionCommand,
   shortenLinksForDisplay,
-  terminalHyperlink
-} from "../../src/commands/view.js";
-import type { CachedMessageRecord } from "../../src/state/repositories/messages.js";
+  terminalHyperlink,
+  openUrlInBrowser
+} = await import("../../src/commands/view.js");
 
 function row(id: string, labels: string[], subject: string, sender: string): CachedMessageRecord {
   return {
@@ -112,6 +117,26 @@ describe("shortenLinksForDisplay", () => {
     const { text, links } = shortenLinksForDisplay("Just plain text, no links here.");
     expect(text).toBe("Just plain text, no links here.");
     expect(links).toEqual([]);
+  });
+});
+
+describe("openUrlInBrowser", () => {
+  const originalPlatform = process.platform;
+  afterEach(() => {
+    Object.defineProperty(process, "platform", { value: originalPlatform });
+    spawnMock.mockClear();
+  });
+
+  it("launches the platform's default browser command with the URL", () => {
+    Object.defineProperty(process, "platform", { value: "darwin" });
+    openUrlInBrowser("https://example.com/a");
+    expect(spawnMock).toHaveBeenCalledWith("open", ["https://example.com/a"], expect.any(Object));
+  });
+
+  it("refuses a non-http(s) scheme instead of ever reaching a shell launcher", () => {
+    openUrlInBrowser("javascript:alert(1)");
+    openUrlInBrowser("file:///etc/passwd");
+    expect(spawnMock).not.toHaveBeenCalled();
   });
 });
 
