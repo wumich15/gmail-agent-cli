@@ -15,3 +15,7 @@ coverage/
 /[Aa][Rr][Cc][Hh][Ii][Tt][Ee][Cc][Tt][Uu][Rr][Ee].[Mm][Dd]
 /[Ee][Xx][Pp][Ll][Aa][Ii][Nn][Ee][Rr].[Mm][Dd]
 /[Pp][Ll][Aa][Nn].[Mm][Dd]
+
+# Generated artifacts from the local documentation build.
+output/
+tmp/

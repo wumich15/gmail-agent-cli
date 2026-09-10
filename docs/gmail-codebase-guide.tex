@@ -1,0 +1,600 @@
+\documentclass[12pt,oneside]{book}
+
+\usepackage[margin=1.45cm,includeheadfoot]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{seqsplit}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+\usepackage{titlesec}
+\usepackage{parskip}
+
+\definecolor{ink}{HTML}{18212B}
+\definecolor{muted}{HTML}{5B6570}
+\definecolor{accent}{HTML}{155E75}
+\definecolor{codebg}{HTML}{F4F7F9}
+\definecolor{codeframe}{HTML}{D8E1E8}
+\definecolor{codekw}{HTML}{7C3AED}
+\definecolor{codestr}{HTML}{0F766E}
+\definecolor{coderemark}{HTML}{64748B}
+
+\hypersetup{colorlinks=true,linkcolor=accent,urlcolor=accent,citecolor=accent}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textit{gmail-agent-cli codebase guide}}
+\fancyhead[R]{\small\nouppercase{\leftmark}}
+\fancyfoot[C]{\small\thepage}
+\setlength{\headheight}{15pt}
+\setlist{nosep,leftmargin=1.6em}
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.12}
+\titleformat{\chapter}[display]{\normalfont\huge\bfseries\color{ink}}{\chaptertitlename\ \thechapter}{8pt}{\Huge}
+\titleformat{\section}{\normalfont\Large\bfseries\color{accent}}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\normalfont\large\bfseries\color{ink}}{\thesubsection}{0.6em}{}
+\titleformat{\subsubsection}{\normalfont\normalsize\bfseries\color{ink}}{\thesubsubsection}{0.6em}{}
+
+\lstdefinelanguage{TypeScript}{
+  morekeywords={as,async,await,break,case,catch,class,const,continue,debugger,default,delete,do,else,export,extends,false,finally,for,from,function,if,implements,import,in,instanceof,interface,let,new,null,of,package,private,protected,public,readonly,return,static,super,switch,this,throw,true,try,type,typeof,var,void,while,with,yield},
+  sensitive=true,
+  morecomment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  morestring=[b]'
+}
+\lstset{
+  language=TypeScript,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{coderemark}\itshape,
+  stringstyle=\color{codestr},
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  frameround=tttt,
+  breaklines=true,
+  breakatwhitespace=false,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  numbers=left,
+  numberstyle=\tiny\color{muted},
+  numbersep=6pt,
+  xleftmargin=1.2em,
+  framexleftmargin=1.2em,
+  aboveskip=0.8em,
+  belowskip=0.8em
+}
+
+\newcommand{\code}[1]{\nolinkurl{#1}}
+\newcommand{\file}[1]{\nolinkurl{#1}}
+\newcommand{\term}[1]{\texttt{#1}}
+\newcommand{\srcnote}[1]{\textit{#1}}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcolumntype{P}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\begin{document}
+
+\begin{titlepage}
+  \centering
+  \vspace*{1.1cm}
+  {\color{accent}\rule{\textwidth}{1.2pt}}\\[1.1cm]
+  {\Huge\bfseries\color{ink} gmail-agent-cli\\[0.25cm]}
+  {\LARGE Codebase and System Design Guide\\[0.8cm]}
+  {\large TypeScript terminal application for Gmail cleanup, Calendar extraction, and interactive mail}\\[1.4cm]
+  \begin{minipage}{0.86\textwidth}
+  \small
+  This guide is an implementation-oriented tour of the repository as it exists in the workspace. It explains the top-level design first, then the runtime pipeline, safety boundaries, integrations, persistence model, command surface, tests, and a file/function reference. It is intentionally selective rather than a line-by-line transcription, but every source directory and every exported production function is represented in the reference chapter.
+  \end{minipage}
+  \vfill
+  {\large Generated from the repository on 2026-09-09}\par
+  {\small Package: \code{gmail-agent-cli} \quad Binary: \code{gmail} \quad Node.js: \code{>=20}}\par
+  \vspace{0.4cm}
+  {\color{accent}\rule{\textwidth}{1.2pt}}
+\end{titlepage}
+
+\frontmatter
+\tableofcontents
+\mainmatter
+
+\chapter{System design overview}
+
+\section{What the program is}
+
+\code{gmail-agent-cli} is a local, installable Node.js command-line application. The user invokes \term{gmail}; the process authenticates against Google, reads Gmail, optionally asks a classifier to assess messages, applies deterministic safety policy, and can write changes to Gmail or Calendar. There is no server, background worker, browser extension, hosted mailbox, or autonomous tool-calling loop.
+
+The important architectural choice is that the model is an untrusted analysis component. It never receives a Gmail client, Calendar client, credential, shell, or write tool. It returns a typed assessment; ordinary TypeScript code decides whether any mutation is allowed. This keeps the consequential part of the program deterministic and testable.
+
+\section{Top-down flow}
+
+The normal cleanup run is a fixed pipeline:
+
+\begin{lstlisting}[language={},numbers=none]
+CLI command
+  -> account/config/auth setup
+  -> snapshot or Gmail history synchronization
+  -> fetch bounded message metadata/body and normalize it
+  -> apply explicit local rules
+  -> classify unresolved messages (or reuse a valid cache assessment)
+  -> evaluate deterministic policy
+  -> validate Calendar candidates and run-wide label thresholds
+  -> build deterministic action keys and persist the plan
+  -> execute Gmail mutations and idempotent Calendar inserts
+  -> persist cache, history marker, label votes, and run status atomically
+  -> render human or JSON summary
+\end{lstlisting}
+
+The first half is intentionally read-heavy. The second half is mutation-heavy but is separated by a durable action ledger. Dry-run stops after assessment and summary: it still reads Gmail and may call the configured AI provider, but it does not advance durable state or make Gmail/Calendar changes.
+
+\section{Subsystem map}
+
+\begin{center}
+\begingroup\small
+\begin{tabularx}{\textwidth}{P{3.3cm}Y Y}
+\toprule
+\textbf{Subsystem} & \textbf{Primary code} & \textbf{Responsibility} \\
+\midrule
+CLI and commands & \file{src/cli.ts}, \file{src/commands/} & Parse commands, perform onboarding, coordinate repositories and integrations, render progress. \\
+Core domain and policy & \file{src/core/} & Stable domain types, pure policy, action keys, locking, retries, orchestration, clocks. \\
+Gmail adapter & \file{src/gmail/} & Google client access, message listing/fetching, normalization, label mutations, cache refresh, terminal compose/view helpers. \\
+AI adapter & \file{src/ai/} & Assessment schema, prompt construction, OpenAI adapter, fallback classifiers, body-only drafting. \\
+Calendar adapter & \file{src/calendar/} & Event candidate validation and deterministic insert/reconciliation. \\
+Rules and unsubscribe & \file{src/rules/}, \file{src/unsubscribe/} & Local matcher evaluation, authentication-bound important rules, safe RFC 8058/mailto handling. \\
+State and reporting & \file{src/state/}, \file{src/summary/} & SQLite migrations/repositories, cache projections, action/run summaries, JSON output. \\
+Auth/config/logging & \file{src/auth/}, \file{src/config/}, \file{src/logging/} & OAuth PKCE, OS credential store, validated non-secret config, redacted diagnostics. \\
+\bottomrule
+\end{tabularx}
+\endgroup
+\end{center}
+
+\section{Dependency direction}
+
+The intended direction is inward toward \code{core}: policy imports only domain types and small interfaces. Gmail, Calendar, OpenAI, OAuth, SQLite, and terminal UI details stay at the edges. The codebase has a formal \code{Classifier}, \code{CredentialStore}, and \code{Clock} boundary. Gmail and Calendar are strongly isolated in their directories but are currently called directly by commands/orchestration rather than hidden behind formal \code{MailGateway} and \code{CalendarGateway} interfaces.
+
+\begin{lstlisting}[language={},numbers=none]
+commands + adapters  --->  core models / policy / action plan
+       |                         ^
+       +----> state repositories +---- tests with fakes
+\end{lstlisting}
+
+\section{Safety as a system property}
+
+The system is designed around the idea that an incorrect AI answer should not directly become an irreversible or hidden side effect. The main safety mechanisms are:
+
+\begin{itemize}
+\item Gmail cleanup moves mail to Trash, never permanent deletion.
+\item The policy engine is pure and enforces precedence independent of model wording.
+\item Authenticated high-risk signals veto low-value auto-trash.
+\item Suspicious, unknown, unavailable, or ambiguous assessments become review/no-op outcomes.
+\item Calendar candidates must pass real-code validation for date, duration, timezone, and evidence.
+\item Every planned mutation is recorded before execution, with a deterministic key and payload hash.
+\item Sending is outside the cleanup pipeline and ends at a user-visible exact-message confirmation.
+\item Secrets live in the OS credential store, not SQLite, config, logs, or prompts.
+\end{itemize}
+
+\chapter{Runtime, package shape, and entrypoints}
+
+\section{Build and execution model}
+
+The package is ESM TypeScript. \file{package.json} exposes \code{dist/cli.js} as the \code{gmail} binary. The development command runs \file{src/cli.ts} through \code{tsx}; production builds use \code{tsc -p tsconfig.build.json}. Quality commands are \code{typecheck}, \code{lint}, \code{test}, \code{test:integration}, and \code{eval}.
+
+\begin{center}
+\begingroup\small
+\begin{tabularx}{\textwidth}{P{3.5cm}Y}
+\toprule
+\textbf{Dependency group} & \textbf{Why it is present} \\
+\midrule
+\code{commander}, \code{@clack/prompts}, \code{picocolors} & CLI parsing, onboarding/confirmation prompts, terminal styling. \\
+\code{googleapis}, \code{google-auth-library} & Official Gmail and Calendar clients plus OAuth refresh behavior. \\
+\code{openai}, \code{zod} & Responses API calls and typed/validated assessment data. \\
+\code{better-sqlite3} & Local SQLite database with synchronous transactional writes. \\
+\code{luxon} & IANA timezone and DST-aware event calculations. \\
+\code{undici} & Native fetch/HTTP behavior, especially hardened unsubscribe requests. \\
+\code{pino} & Structured, redacted file/console logging. \\
+\code{keytar} (optional) & OS-backed credential storage when available. \\
+\code{vitest}, TypeScript ESLint & Unit/integration tests and static checks. \\
+\bottomrule
+\end{tabularx}
+\endgroup
+\end{center}
+
+\section{CLI entrypoint}
+
+\file{src/cli.ts} constructs a Commander program, registers the public command surface, centralizes error-to-exit-code handling, and rejects unknown first arguments before Commander can accidentally interpret them as the dangerous bare cleanup command. The bare \term{gmail} action is the normal work pipeline; the public subcommands are \term{add}, \term{category}, \term{cache}, \term{uncache}, \term{view}, \term{send}, and \term{help}.
+
+\begin{lstlisting}[caption={The root command delegates to the work pipeline.},label={lst:cli-root}]
+program.action((opts: { dryRun: boolean; json: boolean; limit?: number }) => {
+  withExitHandling(() =>
+    runWork({
+      dryRun: opts.dryRun,
+      json: opts.json,
+      ...(opts.limit !== undefined ? { limit: opts.limit } : {})
+    })
+  );
+});
+\end{lstlisting}
+
+\section{User-visible commands}
+
+\begin{center}
+\begingroup\small
+\begin{tabularx}{\textwidth}{P{3.5cm}Y}
+\toprule
+\textbf{Command} & \textbf{Behavior} \\
+\midrule
+\term{gmail} / \term{gmail --dry-run} & Run cleanup; optional dry-run previews the same scan and classifier decisions without mutation. \\
+\term{gmail add spam|important ...} & Resolve current matches into persistent local rules and optionally apply immediate current-message actions. \\
+\term{gmail category NAME...} & Create/reuse Gmail labels directly. \\
+\term{gmail cache [--limit N]} & Full read-only Inbox/Spam snapshot into the local cache; no AI or Gmail mutation. \\
+\term{gmail uncache} & Clear local cache, label votes, and history marker. \\
+\term{gmail view} & Interactive cached inbox with search, labels, reading, Trash, compose, reply, and AI drafts. \\
+\term{gmail send [TO]} & Compose one new message through the same exact-message confirmation flow. \\
+\term{gmail help [COMMAND]} & Print command help and the interactive view control reference. \\
+\bottomrule
+\end{tabularx}
+\endgroup
+\end{center}
+
+The repository also contains working command modules for authentication, configuration, doctor, rules, summary, undo, spam, important, and progress, but the current \file{src/cli.ts} comments explicitly identify the smaller public surface above. That distinction matters when reading the code: a module can be implemented without being wired into the current executable.
+
+\chapter{The cleanup pipeline}
+
+\section{Discovery: full snapshot versus history sync}
+
+\code{runWorkScan} in \file{src/core/orchestrator.ts} chooses a scan path from the account's Gmail history marker. With no marker, or when Gmail reports the marker expired, it performs a full Inbox plus native-Spam listing. With a valid marker it calls \code{users.history.list}, deduplicates changed message IDs, fetches only those messages, and filters them by their current Inbox/Spam labels before classification. A full scan fences the mailbox with a profile history ID and then performs a post-snapshot reconciliation call so changes occurring during the scan are not silently skipped.
+
+The scan also merges a local cached backlog: rows created by \term{gmail cache}, or rows whose model/prompt/schema/policy versions are stale, are queued for one targeted live evaluation. A limited scan deliberately returns a null new history marker so omitted mail is not skipped forever.
+
+\subsection{Quota and concurrency}
+
+Gmail metadata reads and AI calls use separate bounded worker pools. Gmail request fields are narrowed, reads are retried, and a shared rate limiter targets 275 message-read equivalents per minute by default. The scanner uses the lightweight Sent-thread index to protect replies from being trashed without issuing an expensive \code{threads.get} for every candidate.
+
+\section{Normalization and rule matching}
+
+\file{src/gmail/normalize.ts} converts a Gmail API message into \code{NormalizedMessage}. It parses headers and addresses, decodes Gmail base64url bodies, converts HTML to bounded plain text, strips quoted reply history, records whether the body was truncated, and computes a content hash. Bodies are deliberately transient; they are passed to classification or the interactive reader but are not stored in SQLite.
+
+Rules run before AI when they can decide the result. \file{src/rules/matcher.ts} normalizes list IDs, addresses, domains, and subject prefixes, then reports \code{matched}, \code{auth_failed}, or \code{no_match}. \file{src/rules/auth-signals.ts} parses Authentication-Results and lets important rules bind to aligned passing DKIM/DMARC domains. \file{src/rules/resolver.ts} groups current mail by subscription identity and proposes concrete matchers for a user-confirmed category.
+
+\section{Classification}
+
+The \code{Classifier} interface returns either a typed \code{EmailAssessment} or a structured unavailable result. The real adapter is \file{src/ai/openai-classifier.ts}; \file{src/ai/not-configured-classifier.ts} keeps rules-only mode explicit; \file{src/ai/random-classifier.ts} supports tests/evaluation. \file{src/ai/schema.ts} defines the compact Structured Outputs shape, while \file{src/ai/prompt.ts} constructs the deterministic summary and prompt versions used for cache validity.
+
+The assessment includes a kind such as \code{promotion}, \code{automated_low_value}, \code{transactional_important}, \code{suspicious}, or \code{unknown}; confidence and importance scores; reason codes; one optional event candidate; and one optional topical category. The adapter, not the model, attaches classifier/prompt/schema version identifiers.
+
+\section{Deterministic policy}
+
+\code{evaluateMessagePolicy} in \file{src/core/policy.ts} is pure: it receives the normalized local signals and optional assessment and returns action intents plus review state. Its current precedence is:
+
+\begin{enumerate}
+\item An explicit spam rule plans Trash, including the explicit user override path.
+\item Unprotected native Gmail Spam plans Trash without an AI call.
+\item Authenticated high-risk signals veto promotion/low-value Trash and route to review.
+\item High-confidence promotion/low-value assessments plan Trash; suspicious/unknown/unavailable results produce no AI-derived mutation and may require review.
+\item Qualifying importance adds STARRED and IMPORTANT.
+\item A qualifying event candidate requests Calendar creation; a category requests a possible label.
+\item Read Inbox mail that was not trashed receives an archive action, even if it was starred or used for an event.
+\end{enumerate}
+
+All default thresholds are currently 0.90. This is a product choice coupled to full auditability and reversibility: actions are durable and enumerable, and cleanup effects can be undone through the broader command implementation except unsubscribe.
+
+\begin{lstlisting}[caption={Policy is a pure precedence gate, not a model callback.},label={lst:policy}]
+if (input.explicitRule?.action === "spam") {
+  if (input.isProtected && !input.explicitSpamOverride) {
+    return review("protected_message_conflicts_with_spam_rule");
+  }
+  return trashOnly("explicit_spam_rule");
+}
+
+if (input.isNativeSpam) {
+  if (input.isProtected) return review("protected_native_spam_conflict");
+  return trashOnly("native_spam");
+}
+\end{lstlisting}
+
+\section{Calendar validation and run-wide labels}
+
+\file{src/calendar/event-policy.ts} validates candidates for supported create intents, usable dates, bounded durations, IANA timezones, and source evidence. The policy can request an event, but only a validated candidate reaches the executor. A message that actually gets a Calendar event also receives a deterministic Calendar label and archive action during orchestration.
+
+Topical labels use a separate run-wide threshold in the orchestrator. A single AI category guess is not enough to create mailbox clutter: new labels require ten distinct message votes accumulated across runs. Existing Gmail labels can be reused, and distinct message IDs are tracked so incremental reprocessing cannot inflate the vote count.
+
+\section{Plan, execute, summarize}
+
+\file{src/core/action-plan.ts} maps policy intents to durable \code{PlannedAction} rows. \code{deterministicActionKey} and \code{payloadHash} make a plan stable across retries and process restarts.
+
+\begin{lstlisting}[caption={Action keys are deterministic and carry the pre-mutation state hash.},label={lst:actions}]
+return {
+  actionKey: deterministicActionKey({
+    accountHash: input.accountHash,
+    type,
+    target: input.gmailMessageId,
+    payloadHash: hash
+  }),
+  runId: input.runId,
+  type,
+  targetGmailMessageId: input.gmailMessageId,
+  beforeStateHash: input.beforeStateHash,
+  payloadHash: hash,
+  status: "planned"
+};
+\end{lstlisting}
+
+\file{src/gmail/executor.ts} groups label mutations in batches of 50 and returns succeeded/failed message IDs. Trash and untrash are separate reversible calls. \file{src/calendar/idempotency.ts} derives an event ID from account/message/candidate identity and reconciles HTTP 409 conflicts: same provenance means already applied; different provenance is a terminal collision; an unknown response is not blindly retried.
+
+\file{src/summary/build-summary.ts} converts message outcomes into counts, details, review items, recent unread mail, and automatic spam-rule candidates. \file{src/summary/render-human.ts} and \file{src/summary/render-json.ts} provide the two output modes. JSON keeps diagnostics on stderr so stdout remains machine-readable.
+
+\chapter{Integrations and interactive mail}
+
+\section{Gmail API adapter}
+
+\file{src/gmail/client.ts} creates the typed Google Gmail client. \file{src/gmail/scanner.ts} wraps profile, list, metadata/full message, Sent-thread, and history endpoints with partial-response fields and retry behavior. \file{src/gmail/labels.ts} centralizes system label checks such as Inbox, Unread, Spam, Promotions, Starred, and Important. \file{src/gmail/custom-labels.ts} lists and creates user labels.
+
+\file{src/gmail/cache-projection.ts} produces the non-body projection written to the messages table. \file{src/gmail/view-sync.ts} refreshes that projection for the interactive reader, using history sync when possible and atomic local writes. \file{src/commands/cache.ts} is the explicit full-snapshot counterpart: no classifier call, no Gmail mutation, no Calendar mutation.
+
+\section{OAuth and credential storage}
+
+\file{src/auth/google-oauth.ts} implements an installed-app PKCE flow with a loopback listener and browser launch, then creates an OAuth client from a refresh token. \file{src/auth/credential-store.ts} defines the credential boundary and supplies a keytar-backed OS store plus an in-memory store for tests. The named keys cover OAuth refresh tokens, AI keys, and provider configuration; these do not enter SQLite.
+
+\section{AI drafting and sending}
+
+Cleanup classification and interactive drafting are separate jobs with separate model settings. \file{src/ai/draft-reply.ts} asks for body text only, passing source mail, user guidance, and the saved writing-style description as untrusted input. \file{src/gmail/sent-style.ts} samples a bounded set of recent Sent messages; \file{src/gmail/writing-style.ts} derives and persists only a short style description, never the raw samples.
+
+\file{src/gmail/reply.ts} derives reply recipients from the live message's Reply-To/From headers, validates new compose targets, and builds RFC-compatible raw messages. \file{src/gmail/compose-flow.ts} handles manual body entry, AI-draft review, exact-message preview, and the default-no confirmation gate. \file{src/commands/send.ts} exposes this flow outside the interactive reader.
+
+\section{Interactive terminal view}
+
+\file{src/commands/view.ts} is a substantial stateful terminal surface over the local cache. It handles page history, highlighted-row navigation, label OR filters, subject/sender search, read view, links, manual/AI replies, compose, reversible Trash, and session-scoped quick undo. Message bodies are fetched live and rendered transiently; the cache stores only subject, sender, date, labels, hashes, and assessment metadata.
+
+Links are shortened for display and wrapped in OSC 8 terminal hyperlinks when supported; the app itself does not fetch or inspect the destination. The \code{o} command hands an HTTPS URL to the operating system browser launcher after explicit user choice.
+
+\chapter{Persistence, reliability, and security}
+
+\section{SQLite database}
+
+\file{src/state/database.ts} creates one per-user SQLite database, enforces 0700 directory/0600 file permissions on POSIX, enables WAL mode, foreign keys, and a busy timeout, then applies ordered migrations. The schema begins with accounts, messages, rule groups/matchers, runs, actions, unsubscribe attempts, calendar links, and settings.
+
+\begin{center}
+\begingroup\small
+\begin{tabularx}{\textwidth}{P{3.4cm}Y}
+\toprule
+\textbf{Table} & \textbf{Role} \\
+\midrule
+\code{accounts} & Account hash, display email, timezone, history checkpoint, setup/automation flags. \\
+\code{messages} & Non-verbatim cache projection and versioned assessment projection. \\
+\code{rule_groups}, \code{rule_matchers} & Persistent local spam/important rules and concrete matchers. \\
+\code{runs} & Run mode, versions, status, counters, and error summary. \\
+\code{actions} & Durable outbox/ledger with status, attempts, hashes, and targets. \\
+\code{unsubscribe_attempts} & Per-subscription identity history; automatic retry is intentionally constrained. \\
+\code{calendar\_links} & Message/candidate provenance to deterministic Calendar event IDs. \\
+\code{settings} & Versioned non-secret settings such as the writing-style profile. \\
+\code{label_candidates} & Cross-run distinct-vote threshold state for AI topical labels. \\
+\bottomrule
+\end{tabularx}
+\endgroup
+\end{center}
+
+The six migrations are append-only: initial schema, label candidates, view columns, distinct label-candidate votes, message category, and assessment-had-event tracking. The repositories in \file{src/state/repositories/} convert rows to domain records and provide the typed CRUD used by commands and orchestration.
+
+\section{Checkpoint and crash behavior}
+
+The work command reconciles stale \code{applying} actions as \code{unknown_no_retry}; the remote side effect cannot be safely inferred after a crash. It then plans actions, executes Gmail/Calendar work, and finishes a single SQLite transaction that writes run status, cache rows, label votes, evictions, and the new history marker. If that transaction fails, the old marker remains, allowing the next invocation to reconcile the same mailbox changes rather than skipping them.
+
+This is a local outbox pattern, not a distributed transaction. Gmail and Calendar calls happen outside SQLite, so the code records explicit retryable, terminal, and unknown states rather than pretending remote and local commits are atomic.
+
+\section{Retries, rate limiting, logging}
+
+\file{src/core/api-retry.ts} classifies HTTP/network/quota failures, honors retry-after information, applies backoff, and provides the shared Google API rate limiter plus attempt subscribers. \file{src/core/concurrency.ts} supplies the bounded worker pool. \file{src/core/lock.ts} prevents overlapping local runs with a process lock; \file{src/core/clock.ts} provides injectable time for deterministic tests.
+
+\file{src/logging/logger.ts} configures \code{pino} with redaction and secret-pattern scrubbing. \file{src/logging/run-diagnostics.ts} records phase, timing, provider, and quota diagnostics without logging message bodies or credentials. \file{src/core/errors.ts} defines typed application failures and exit codes.
+
+\section{Unsubscribe boundary}
+
+\file{src/unsubscribe/headers.ts} parses List-Unsubscribe values, validates one-click POST metadata, and parses mailto targets. \file{src/unsubscribe/safe-http.ts} is an SSRF-hardened HTTPS client: it blocks private/reserved addresses, validates DNS resolution, restricts redirects and response size, applies connect/total timeouts, and redacts URLs for logs. Unsubscribe is the exceptional outbound path: it is user-confirmed and intentionally not generally reversible.
+
+\chapter{Commands, configuration, and tests}
+
+\section{Configuration and onboarding}
+
+\file{src/config/schema.ts} defines the Zod-validated non-secret configuration, including model/provider, concurrency, pacing, timezone, and feature settings. \file{src/config/paths.ts} chooses OS-appropriate application, database, log, and lock paths. \file{src/config/load.ts} loads/saves validated config and creates defaults.
+
+\file{src/core/bootstrap.ts} builds the command context: config, clock, database, credential store, logger, and paths. \file{src/commands/shared.ts} resolves the signed-in account and authenticated Gmail/Calendar clients. \file{src/commands/work.ts} orchestrates onboarding, scanning, preview, action planning, execution, checkpoint persistence, and final rendering.
+
+\section{Command module reference}
+
+\begingroup\scriptsize
+\begin{longtable}{P{3.5cm}P{4.0cm}P{8.0cm}}
+\toprule
+\textbf{File} & \textbf{Main entrypoints} & \textbf{What to look for} \\
+\midrule
+\endhead
+\file{commands/work.ts} & \code{runWork} & Main cleanup lifecycle, setup, scan, action ledger, Gmail/Calendar writes, checkpoint. \\
+\file{commands/add.ts} & \code{runAdd} & Dispatches spam/important rule creation. \\
+\file{commands/spam.ts} & \code{runSpam} & Current-match discovery, confirmation, rule persistence, Trash/unsubscribe reporting. \\
+\file{commands/important.ts} & \code{runImportant} & Auth-bound important rule creation and immediate star/Important actions. \\
+\file{commands/category.ts} & \code{runCategory} & Direct Gmail label creation/reuse. \\
+\file{commands/cache.ts} & \code{runCache} & Full read-only cache snapshot and history baseline rules. \\
+\file{commands/uncache.ts} & \code{runUncache} & Confirmation and local cache/history clearing. \\
+\file{commands/view.ts} & \code{runView} & Interactive list/read/compose/reply/Trash state machine. \\
+\file{commands/send.ts} & \code{runSend} & Direct compose flow. \\
+\file{commands/auth.ts} & \code{runAuthLogin}, \code{runAuthStatus}, \code{runAuthLogout} & OAuth and credential lifecycle helpers. \\
+\file{commands/config.ts} & \code{runConfigShow} & Display non-secret configuration. \\
+\file{commands/doctor.ts} & \code{runDoctor} & Environment/auth/config diagnostics. \\
+\file{commands/rules.ts} & \code{runRulesList}, \code{runRulesRemove} & Rule inspection/removal helpers. \\
+\file{commands/summary.ts} & \code{runSummary} & Read a durable run and render its summary. \\
+\file{commands/undo.ts} & \code{runUndo} & Reverse eligible durable actions from a run. \\
+\file{commands/progress.ts} & \code{createClassifierProgress}, \code{createReadProgress} & Progress sinks for interactive and JSON-safe output. \\
+\file{commands/shared.ts} & \code{loadAccountContext}, \code{loadGmailClient} & Shared account/client/bootstrap coordination. \\
+\bottomrule
+\end{longtable}
+\endgroup
+
+\section{Test strategy}
+
+The tests are primarily unit tests with fakes and sanitized fixtures, which is appropriate because much of the core behavior is pure or interface-driven. They cover normalization, scanner pagination/history, policy precedence, orchestration, action repositories, database migrations, retry/rate-limit behavior, Calendar idempotency, auth signals, rules, cache projections, interactive view parsing, compose/reply, logging, and CLI help. \file{evals/run.ts} is the evaluation harness for classifier/scenario checks; \file{tests/helpers/scenarios.ts} provides scenario execution support.
+
+The most valuable tests are the ones that pin safety invariants: suspicious/unknown does not mutate; high-risk authenticated mail is not auto-trashed; protected content does not suppress event/label extraction; explicit spam override is deliberate; repeated Calendar insertion reconciles; stale or partial scans do not advance checkpoints; and no permanent-delete API is referenced.
+
+\chapter{File and function reference}
+
+This chapter is a navigational catalog, not generated API documentation. It names the production files, their public/exported functions or classes, and the implementation idea a reader should carry into the source. Private helpers are included where they define an important boundary; small row mappers and constants are grouped with their module.
+
+\section{Core, domain, and reliability}
+
+\begingroup\scriptsize
+\begin{longtable}{P{3.6cm}P{5.8cm}P{7.0cm}}
+\toprule
+\textbf{File} & \textbf{Functions/classes} & \textbf{Purpose} \\
+\midrule
+\endhead
+\file{core/models.ts} & Types/interfaces: \code{AccountRecord}, \code{NormalizedMessage}, \code{EmailAssessment}, \code{EventCandidate}, \code{RuleGroup}, \code{PlannedAction}, \code{RunRecord}, \code{UnsubscribeAttempt}, \code{CalendarLink} & Shared domain vocabulary and discriminated unions. \\
+\file{core/policy.ts} & \code{evaluateMessagePolicy}; helpers \code{trashOnly}, \code{review} & Pure safety/precedence decision function. \\
+\file{core/orchestrator.ts} & \code{runWorkScan}, \code{dedupeStubs}, \code{resolvePostScanHistoryMarker} & Full/incremental scan, normalization, classification, policy, label threshold, cache updates. \\
+\file{core/action-plan.ts} & \code{buildPlannedActions} & Convert intents into keyed durable action rows. \\
+\file{core/ids.ts} & \code{accountHash}, \code{contentHash}, \code{deterministicActionKey}, \code{deterministicCalendarEventId}, \code{payloadHash}, \code{newRunId} & Stable hashes and identifiers for cache, ledger, and idempotency. \\
+\file{core/api-retry.ts} & \code{apiErrorStatus}, \code{isRetryableNetworkError}, \code{isRetryableGoogleQuotaMessage}, \code{isGoogleQuotaError}, \code{retryAfterMs}, \code{isRetryableStatus}, \code{withApiRetry}, class \code{GoogleApiRateLimiter}, \code{subscribeGoogleApiAttempts}, \code{withGoogleApiRetry} & Failure classification, backoff, quota pacing, and diagnostics events. \\
+\file{core/concurrency.ts} & \code{mapWithConcurrency} & Bounded async worker pool preserving result order. \\
+\file{core/clock.ts} & \code{SystemClock}, \code{FixedClock} & Injectable ISO time source. \\
+\file{core/lock.ts} & class \code{ProcessLock} & Cross-process lock acquisition/release and stale-owner checks. \\
+\file{core/bootstrap.ts} & \code{bootstrap} & Construct shared CLI context. \\
+\file{core/high-risk-signal.ts} & \code{hasAuthenticatedHighRiskSignal} & Detect security/financial/etc. signals that gate auto-trash. \\
+\file{core/errors.ts} & \code{GmailAgentError}, \code{EXIT_CODES} & Typed user-facing errors and exit status mapping. \\
+\file{core/keypress.ts} & \code{readCommandLine}, \code{waitForKeypress} & Raw terminal input and immediate-key handling. \\
+\bottomrule
+\end{longtable}
+\endgroup
+
+\section{Gmail and Calendar}
+
+\begingroup\scriptsize
+\begin{longtable}{P{3.6cm}P{5.8cm}P{7.0cm}}
+\toprule
+\textbf{File} & \textbf{Functions/classes} & \textbf{Purpose} \\
+\midrule
+\endhead
+\file{gmail/client.ts} & \code{createGmailClient} & Typed Gmail API client factory. \\
+\file{gmail/scanner.ts} & \code{fetchProfile}, \code{listAllMessageIds}, \code{fetchMessageMetadata}, \code{fetchInboxMessageCount}, \code{listSentThreadIds}, \code{fetchMessageFull}, \code{headersFromMessage}, \code{fetchThreadHasUserSentMessage}, \code{historyIdGreaterThan}, \code{listHistorySince} & Partial-response reads, pagination, history synchronization, Sent-thread index. \\
+\file{gmail/normalize.ts} & \code{extractBodyParts}, \code{headerMapFromList}, \code{parseEmailAddress}, \code{parseEmailAddressList}, \code{htmlToBoundedPlainText}, \code{buildNormalizedMessage} & Header/body parsing, HTML-to-text conversion, bounds, hashes, normalized message. \\
+\file{gmail/labels.ts} & \code{hasLabel}, \code{isRead}, \code{isInInbox}, \code{isNativeSpam}, \code{isPromotionCategory}, \code{hasBulkHeaderSignal} & Gmail system-label and bulk-signal predicates. \\
+\file{gmail/executor.ts} & \code{applyGroupedLabelMutations}, \code{trashMessage}, \code{untrashMessage}, \code{trashMutation}, \code{archiveMutation}, \code{starAndImportantMutation}, \code{starOnlyMutation}, \code{markImportantOnlyMutation}, \code{labelOnlyMutation}, \code{combineMutations} & Batched, retried, reversible Gmail mutations. \\
+\file{gmail/cache-projection.ts} & \code{projectHydratedCacheMessage} & Strip a hydrated message down to a non-body cache row. \\
+\file{gmail/view-sync.ts} & \code{refreshViewCache} & Refresh interactive cache from history or full snapshot. \\
+\file{gmail/custom-labels.ts} & \code{listUserLabels}, \code{getOrCreateLabelId} & User-label discovery and idempotent creation. \\
+\file{gmail/reply.ts} & \code{buildReplyTarget}, \code{buildComposeTarget}, \code{sendReply} & Validate recipients/subjects and send raw RFC-compatible mail after confirmation. \\
+\file{gmail/compose-flow.ts} & \code{promptBody}, \code{reviewAiDraft}, \code{confirmAndSend}, \code{handleCompose} & Manual/AI body collection and exact-message send gate. \\
+\file{gmail/sent-style.ts} & \code{loadSentStyleExamples} & Load bounded recent Sent examples for style derivation. \\
+\file{gmail/writing-style.ts} & \code{getWritingStyleProfile} & Load or refresh the persisted style description. \\
+\file{calendar/client.ts} & \code{createCalendarClient} & Typed Calendar API client factory. \\
+\file{calendar/event-policy.ts} & \code{validateEventCandidate}, \code{sourceEvidencePresent} & Real-code event validation and evidence checks. \\
+\file{calendar/idempotency.ts} & \code{buildEventInsertPlan}, \code{insertIdempotentEvent} & Deterministic event ID, provenance, insert, 409 reconciliation. \\
+\bottomrule
+\end{longtable}
+\endgroup
+
+\section{AI, rules, unsubscribe, auth, config, and reporting}
+
+\begingroup\scriptsize
+\begin{longtable}{P{3.6cm}P{5.8cm}P{7.0cm}}
+\toprule
+\textbf{File} & \textbf{Functions/classes} & \textbf{Purpose} \\
+\midrule
+\endhead
+\file{ai/classifier.ts} & \code{Classifier} interface & Adapter contract for one typed assessment per message. \\
+\file{ai/openai-classifier.ts} & \code{OpenAiClassifier} & Stateless Responses API classifier with schema parsing and unavailable-result mapping. \\
+\file{ai/random-classifier.ts} & \code{RandomClassifier} & Deterministic/test-oriented classifier implementation. \\
+\file{ai/not-configured-classifier.ts} & \code{NotConfiguredClassifier} & Explicit rules-only fallback. \\
+\file{ai/resolve-classifier.ts} & \code{resolveClassifier} & Select provider/model/version from config and credentials. \\
+\file{ai/prompt.ts} & \code{buildDeterministicSummary}, \code{buildClassificationPrompt} & Compact prompt inputs and versioned prompt construction. \\
+\file{ai/schema.ts} & \code{AssessmentSchema}, \code{EventSchema} and related schemas & Zod/Structured Outputs contract. \\
+\file{ai/draft-reply.ts} & \code{draftReply}, \code{describeWritingStyle} & Body-only AI drafting and non-verbatim style summary. \\
+\file{rules/matcher.ts} & \code{normalizeListId}, \code{normalizeAddress}, \code{domainOf}, \code{normalizeSubjectPrefix}, \code{evaluateMatcher}, \code{evaluateRuleGroup}, \code{findMatchingRuleGroups} & Concrete matcher and rule-group evaluation. \\
+\file{rules/resolver.ts} & \code{groupBySubscriptionIdentity}, \code{proposeMatcher}, \code{proposeBoundImportantMatcher}, \code{explicitlyConfirmedDomainMatcher}, \code{findConflictingRuleGroup} & Discover identities, propose safe rules, detect overlap. \\
+\file{rules/auth-signals.ts} & \code{parseAuthenticationResults}, \code{hasAlignedPassingAuth}, \code{selectAuthBindingDomain} & DKIM/DMARC alignment parsing. \\
+\file{unsubscribe/headers.ts} & \code{parseListUnsubscribeHeader}, \code{isOneClickPost}, \code{parseMailtoUri} & Standards-based unsubscribe metadata parsing. \\
+\file{unsubscribe/safe-http.ts} & \code{validateUnsubscribeUrl}, \code{isPrivateOrReservedIp}, \code{resolveAndValidateHostname}, \code{postOneClickUnsubscribe}, \code{redactUrlForLogging}, class \code{UnsafeAddressError} & SSRF-resistant one-click POST client. \\
+\file{auth/google-oauth.ts} & \code{loadDevOAuthClientCredentials}, \code{runInstalledAppLogin}, \code{oauthClientFromRefreshToken} & Installed-app PKCE login and refresh-token client. \\
+\file{auth/credential-store.ts} & \code{CredentialStore}, \code{OsCredentialStore}, \code{InMemoryCredentialStore}, \code{CREDENTIAL_KEYS} & OS secret storage boundary and test double. \\
+\file{config/paths.ts} & \code{appDataDir}, \code{configFilePath}, \code{databaseFilePath}, \code{logDir}, \code{lockFilePath} & Platform-aware local paths. \\
+\file{config/schema.ts} & \code{defaultConfig}, \code{parseConfig}, \code{ConfigSchema} & Validated non-secret settings and defaults. \\
+\file{config/load.ts} & \code{loadConfig}, \code{saveConfig}, \code{loadOrCreateDefaultConfig} & Config file lifecycle. \\
+\file{logging/logger.ts} & \code{redactSecrets}, \code{createLogger} & Redaction and structured logging. \\
+\file{logging/run-diagnostics.ts} & \code{startRunDiagnostics} & Phase/timing/provider diagnostics. \\
+\file{summary/build-summary.ts} & \code{buildRunSummary} & Aggregate outcomes into a complete run summary. \\
+\file{summary/render-human.ts} & \code{renderHumanSummary}, \code{renderExecutiveSummary}, \code{renderImportantEmailsParagraph} & Human-readable previews and final output. \\
+\file{summary/render-json.ts} & \code{renderJsonSummary} & Stable JSON output contract. \\
+\bottomrule
+\end{longtable}
+\endgroup
+
+\section{State repositories and migrations}
+
+\begingroup\scriptsize
+\begin{longtable}{P{4.0cm}P{5.8cm}P{6.6cm}}
+\toprule
+\textbf{File} & \textbf{Class/functions} & \textbf{Stored concept} \\
+\midrule
+\endhead
+\file{state/repositories/accounts.ts} & \code{AccountsRepository} & Account row, setup flags, timezone, history marker. \\
+\file{state/repositories/messages.ts} & \code{MessagesRepository} & Cache projection, assessment versions, category/event metadata, backlog/eviction. \\
+\file{state/repositories/rule-groups.ts} & \code{RuleGroupsRepository} & Rule groups and matchers. \\
+\file{state/repositories/runs.ts} & \code{RunsRepository}, \code{ActionsRepository} & Run lifecycle and durable action ledger. \\
+\file{state/repositories/settings.ts} & \code{SettingsRepository}, \code{SETTING_KEYS} & Versioned non-secret settings. \\
+\file{state/repositories/calendar-links.ts} & \code{CalendarLinksRepository} & Message-to-event provenance links. \\
+\file{state/repositories/label-candidates.ts} & \code{LabelCandidatesRepository} & Cross-run label counts and distinct voter IDs. \\
+\file{state/database.ts} & \code{openDatabase} & Secure SQLite open, pragmas, migration runner. \\
+\file{state/migrations/index.ts} & \code{MIGRATIONS} & Ordered append-only migration registry. \\
+\file{state/migrations/001_initial_schema.ts} & \code{MIGRATION_001_INITIAL_SCHEMA} & Base tables and indexes. \\
+\file{state/migrations/002_label_candidates.ts} & \code{MIGRATION_002_LABEL_CANDIDATES} & Candidate label counts. \\
+\file{state/migrations/003_view_columns.ts} & \code{MIGRATION_003_VIEW_COLUMNS} & Subject/sender/date projection columns. \\
+\file{state/migrations/004_label_candidate_votes.ts} & \code{MIGRATION_004_LABEL_CANDIDATE_VOTES} & Distinct message vote tracking. \\
+\file{state/migrations/005_message_category.ts} & \code{MIGRATION_005_MESSAGE_CATEGORY} & Persisted assessment category. \\
+\file{state/migrations/006_assessment_had_event.ts} & \code{MIGRATION_006_ASSESSMENT_HAD_EVENT} & Event-intent presence without storing event payload. \\
+\bottomrule
+\end{longtable}
+\endgroup
+
+\section{Tests, evaluation, and repository documents}
+
+\begingroup\scriptsize
+\begin{longtable}{P{4.0cm}P{5.6cm}P{6.8cm}}
+\toprule
+\textbf{File/group} & \textbf{Contents} & \textbf{Why it matters} \\
+\midrule
+\endhead
+\file{tests/unit/policy.test.ts}, \file{orchestrator.test.ts} & Safety precedence, full/incremental scans, cache reuse, label threshold, history fencing. & Highest-level behavioral contract for cleanup. \\
+\file{tests/unit/normalize.test.ts}, \file{scanner.test.ts} & HTML/header normalization, pagination, history changes, quota-aware reads. & Boundary correctness for untrusted Gmail data. \\
+\file{tests/unit/database.test.ts}, \file{actions-repository.test.ts}, \file{messages-repository.test.ts} & Migrations, permissions/transactions, status transitions, cache rows. & Durable-state correctness and crash recovery. \\
+\file{tests/unit/api-retry.test.ts}, \file{concurrency.test.ts}, \file{lock.test.ts} & Backoff, quota, worker limits, process exclusion. & Operational behavior under network/load. \\
+\file{tests/unit/event-policy.test.ts}, \file{idempotency.test.ts} & Calendar validation and duplicate/collision semantics. & Prevents unsafe or duplicate events. \\
+\file{tests/unit/rules.test.ts}, \file{auth-signals.test.ts}, \file{unsubscribe.test.ts} & Rule resolution/auth binding and safe unsubscribe parsing/HTTP. & Security-sensitive edges. \\
+\file{tests/unit/view.test.ts}, \file{reply.test.ts}, \file{draft-reply.test.ts}, \file{send.test.ts}, \file{prompt.test.ts} & Interactive controls, recipients, body drafts, confirmation behavior. & Keeps the terminal mail surface safe and usable. \\
+\file{tests/unit/build-summary.test.ts}, \file{renderers}, \file{logger.test.ts}, \file{run-diagnostics.test.ts} & Output completeness and secret redaction. & Makes actions auditable. \\
+\file{tests/helpers/scenarios.ts}, \file{evals/run.ts} & Scenario runner and evaluation entrypoint. & Supports broader behavioral/statistical checks. \\
+\file{README.md} & Performance and quota notes. & Operational expectations for reads, batching, pacing, and cache. \\
+\file{ARCHITECTURE.md} & Current architecture map and policy/data model notes. & Concise source-level architecture reference. \\
+\file{CLAUDE.md} & Product/system design contract. & Declared source of truth for boundaries and intended behavior. \\
+\file{PROGRAM_GUIDE.md} & Plain-language rationale for the cleanup pipeline and trust model. & Explains why the safety mechanisms exist. \\
+\file{docs/commands.md} & Public command reference and interactive controls. & User-facing behavior, including current wired-vs-unwired distinction. \\
+\file{tsconfig*.json}, \file{eslint.config.js}, \file{vitest*.ts}, \file{pnpm-workspace.yaml} & Build, lint, test, and workspace configuration. & Toolchain and repository execution contract. \\
+\bottomrule
+\end{longtable}
+\endgroup
+
+\chapter{How to read the code efficiently}
+
+If you want to understand one real cleanup run, start at \file{src/cli.ts}, follow \code{runWork} in \file{src/commands/work.ts}, then read \code{runWorkScan} and \code{evaluateMessagePolicy}. Next inspect \code{buildPlannedActions}, \code{applyGroupedLabelMutations}, and the checkpoint transaction in \code{runWork}. That path explains the majority of the system's behavior.
+
+For state, read \file{src/state/database.ts}, \file{src/state/migrations/001_initial_schema.ts}, then \file{src/state/repositories/runs.ts} and \file{src/state/repositories/messages.ts}. For security boundaries, read \file{src/auth/credential-store.ts}, \file{src/gmail/normalize.ts}, \file{src/unsubscribe/safe-http.ts}, and \file{src/logging/logger.ts}. For the interactive product, read \file{src/commands/view.ts}, \file{src/gmail/compose-flow.ts}, and \file{src/gmail/reply.ts}.
+
+The central mental model is simple: Gmail and AI supply observations; local code turns observations into bounded, reviewable actions; SQLite records the plan and checkpoint; remote writes are retried or held in explicit states; summaries expose the result. Once that split is clear, the many smaller modules are mostly adapters, projections, validators, or repository methods around the same pipeline.
+
+\backmatter
+\chapter*{Scope note}
+This guide describes the source tree and design notes present in the workspace at generation time. Some modules exist as working code without being registered as public CLI commands; where that distinction matters, the guide calls it out explicitly. The function catalog emphasizes exported production API and important internal boundaries rather than every one-line private mapper.
+
+\end{document}

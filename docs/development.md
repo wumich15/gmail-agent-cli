@@ -9,7 +9,8 @@
 | `src/core/` | Orchestration, policy, action planning, locks, retries. |
 | `src/auth/`, `src/config/` | Google OAuth, credentials, configuration. |
 | `src/gmail/`, `src/calendar/` | Mail and Calendar service adapters and operations. |
-| `src/ai/`, `src/rules/` | Classification, drafting, deterministic rules. |
+| `src/ai/`, `src/rules/` | Classification, drafting, deterministic rules. Hosted (`openai-classifier.ts`) and local (`ollama-classifier.ts`) providers share one prompt, wire schema, and assessment mapping. |
+| `src/ui/`, `src/docs/` | The loopback browser front-end (`gmail ui`) and the shared command reference that terminal help and the web Commands view both render. |
 | `src/state/`, `src/summary/`, `src/logging/` | SQLite state, reporting, diagnostics. |
 | `src/unsubscribe/` | Unsubscribe support used by older handlers. |
 | `tests/` | Unit/integration checks and helpers. |
@@ -40,24 +41,32 @@ Setup creates `config.json` in the platform data directory listed in the README.
 | Setting or environment variable | Behavior |
 | --- | --- |
 | `GMAIL_AGENT_OAUTH_CLIENT_ID`, `GMAIL_AGENT_OAUTH_CLIENT_SECRET` | Desktop OAuth configuration needed for each authenticated development run. |
-| `OPENAI_API_KEY` | AI credential fallback after OS credential lookup; key presence activates AI. |
+| `OPENAI_API_KEY` | AI credential fallback after OS credential lookup, for headless use. Only consulted for a hosted provider. |
 | `timezone` | IANA timezone confirmed during setup. |
 | `model`, `composeModel` | Separate models for classification and drafting. |
 | `GMAIL_AGENT_MODEL`, `GMAIL_AGENT_COMPOSE_MODEL` | Live overrides of saved model names. |
-| `aiProvider` | `openai` or `openai-compatible`. |
-| `aiBaseUrl` | Required when using `openai-compatible`. |
+| `aiProvider` | `openai`, `openai-compatible`, or `ollama`. |
+| `aiBaseUrl` | Required for `openai-compatible`; defaults to `http://127.0.0.1:11434` for `ollama`; ignored for `openai`. |
 | `GMAIL_AGENT_AI_PROVIDER`, `GMAIL_AGENT_AI_BASE_URL` | Seed a newly created config; do not override an existing file on every run. |
 | `concurrency` | Defaults: `gmailReads: 8`, `aiCalls: 5`, `calendarWrites: 2`. Parallelism does not increase quota. |
-| `aiEnabled`, `automationEnabled` | Legacy fields; do not rely on them as operational off switches for the public CLI. |
+| `aiEnabled` | A real off switch as of config schema v2: false means no classification or drafting call is made, whatever credentials exist. Set it through `gmail setup`. |
+| `automationEnabled` | Legacy field; not an operational off switch. |
+| `schemaVersion` | `2`. A `1` file is migrated on read (recording `aiEnabled: true`, which is what those installs were actually doing) and rewritten in place. |
 | `GMAIL_AGENT_RATE_LIMIT_RPS` | Advanced read-equivalent rate override for a verified quota. |
 
-For an existing configuration, change `aiProvider` and `aiBaseUrl` in the file to switch endpoints. Both AI paths still require a key and compatible Responses API support; Chat Completions compatibility alone is insufficient. Finish Google setup before enabling AI and start a new command after configuring an endpoint: the first sign-in process does not reload the config it just created. Remove AI credentials to avoid AI calls; use root `--dry-run` to preview cleanup.
+Prefer `gmail setup` over editing the file: it writes the same fields and validates them. Hand-editing still works for advanced cases.
+
+`openai` and `openai-compatible` both require a key and a Responses API endpoint with Structured Outputs; Chat Completions compatibility alone is insufficient. `ollama` is different in kind — it is a dedicated adapter (`src/ai/ollama.ts`) that speaks Ollama's own `/api/chat` with JSON-Schema-constrained generation, needs no key, and never sends mail off the machine. Setting `aiBaseUrl` at an Ollama server while leaving `aiProvider` as `openai-compatible` will not work, because that runtime does not implement the Responses API.
+
+Config written during sign-in is reloaded into the running process (`core/bootstrap.ts`'s `reloadConfig`), so a provider chosen during first-run setup takes effect in that same run rather than the next one.
 
 The process does not load `.env` automatically. Keep real credentials, local state, and logs outside Git.
 
 ## Gmail performance
 
-The implementation uses Gmail history for incremental work, reusable cached assessments, gzip/partial-response fields, concurrent individual reads, grouped local commits, and grouped label changes. Cache snapshots do not pre-classify mail: the first AI cleanup can still need fresh reads and assessments. Expired history can require a full rescan.
+The implementation uses Gmail history for incremental work, a cache-first path that skips history discovery entirely while the local cache is fresh, reusable cached assessments, a persisted reply-protection Sent-thread index (`sent_threads`, topped up rather than rebuilt), gzip/partial-response fields, concurrent individual reads, grouped local commits, and grouped label changes.
+
+If a run seems to stall *after* reading finishes, the phase to suspect is reply protection: the Sent index gates every Trash action, and building it from scratch pages the whole `SENT` label. That is a one-time cost per account now; a run that pays it says so on stderr. Cache snapshots do not pre-classify mail: the first AI cleanup can still need fresh reads and assessments. Expired history can require a full rescan.
 
 The shared limiter targets **275 message-read equivalents per minute** within a rolling budget. This is a pacing target, not a latency guarantee or Google's universal quota. Retry and auxiliary calls also consume budget. Work and cache default to eight concurrent reads. The old `GMAIL_AGENT_BATCH_HYDRATION` and `GMAIL_AGENT_BATCH_SIZE` variables no longer select multipart read batching.
 
@@ -67,4 +76,6 @@ Measure full scans, incremental scans, retries, and auxiliary calls separately. 
 
 ## Documentation maintenance
 
-Update Commander help, the [command reference](commands.md), and README examples together when commands change. Public setup must not depend on ignored notes. The planned browser front-end should render the maintained reference rather than introduce an independent copy.
+`src/docs/command-reference.ts` is the single source for command documentation: `gmail help`, `gmail help <command>`, and the `gmail ui` Commands view all render it, and `tests/unit/command-reference.test.ts` fails if it stops matching the commands registered in `src/cli.ts` or the commands listed in [commands.md](commands.md). Adding a command therefore means editing `src/cli.ts` and that reference together; the prose in `commands.md` and README examples still need updating by hand.
+
+Public setup must not depend on ignored local notes.

@@ -2,7 +2,7 @@ import pc from "picocolors";
 import { bootstrap } from "../core/bootstrap.js";
 import { AccountsRepository } from "../state/repositories/accounts.js";
 import { CREDENTIAL_KEYS, CredentialStoreUnavailableError } from "../auth/credential-store.js";
-import { loadDevOAuthClientCredentials, oauthClientFromRefreshToken, OAUTH_SCOPES } from "../auth/google-oauth.js";
+import { resolveOAuthClientCredentials, oauthClientFromRefreshToken, OAUTH_SCOPES } from "../auth/google-oauth.js";
 import { createGmailClient } from "../gmail/client.js";
 import { fetchProfile } from "../gmail/scanner.js";
 import { MIGRATIONS } from "../state/migrations/index.js";
@@ -81,7 +81,7 @@ export async function runDoctor(): Promise<number> {
 
   let oauthCredentials: { clientId: string; clientSecret: string } | null = null;
   try {
-    oauthCredentials = loadDevOAuthClientCredentials();
+    oauthCredentials = resolveOAuthClientCredentials();
     results.push({ name: "OAuth client configuration", status: "ok", detail: "development client configured" });
   } catch (error) {
     results.push({

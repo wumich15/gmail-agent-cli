@@ -12,12 +12,13 @@ import { CalendarLinksRepository } from "../state/repositories/calendar-links.js
 import { buildPlannedActions } from "../core/action-plan.js";
 import { POLICY_VERSION } from "../core/policy.js";
 import { renderExecutiveSummary, renderHumanSummary, renderImportantEmailsParagraph } from "../summary/render-human.js";
-import { renderJsonSummary } from "../summary/render-json.js";
+import { renderJsonSummary, type JsonSummaryOutput } from "../summary/render-json.js";
 import { EXIT_CODES } from "../core/errors.js";
 import { newRuleGroupId, newRunId } from "../core/ids.js";
 import { ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 import { DEFAULT_GMAIL_READ_CONCURRENCY } from "../config/schema.js";
+import { SETTING_KEYS, SettingsRepository } from "../state/repositories/settings.js";
 import {
   applyGroupedLabelMutations,
   archiveMutation,
@@ -32,9 +33,10 @@ import { LabelCandidatesRepository } from "../state/repositories/label-candidate
 import { MessagesRepository, type CachedMessageRecord } from "../state/repositories/messages.js";
 import { buildEventInsertPlan, insertIdempotentEvent } from "../calendar/idempotency.js";
 import { googleApiRateLimiter } from "../core/api-retry.js";
-import { listSentThreadIds } from "../gmail/scanner.js";
+import { loadSentThreadIndex } from "../gmail/sent-index.js";
 import { contentHash } from "../core/ids.js";
 import type { CachedAssessmentSnapshot } from "../core/orchestrator.js";
+import type { GmailAgentDatabase } from "../state/database.js";
 import type { AutomaticSpamRuleCandidate, MessageOutcome } from "../summary/build-summary.js";
 import type { PolicyActionIntent } from "../core/policy.js";
 import type { ActionType, PlannedAction, ReasonCode } from "../core/models.js";
@@ -45,6 +47,48 @@ export interface WorkOptions {
   json: boolean;
   /** Caps the Inbox and native-Spam scans to this many most-recent messages each, to bound Gmail API quota usage. */
   limit?: number;
+  /**
+   * Receives the same structured summary `--json` prints, whether or not
+   * `--json` was passed. This exists so a non-terminal caller — the local
+   * browser UI — can show a preview or a result as typed data instead of
+   * parsing stdout, which would make the page's correctness depend on
+   * terminal formatting.
+   */
+  onJsonSummary?: (summary: JsonSummaryOutput & { runId: string | null }) => void;
+}
+
+/**
+ * How recently the local cache must have been refreshed for a run to trust
+ * it and skip asking Gmail what changed.
+ *
+ * Short on purpose. The point is to make back-to-back commands cheap — a
+ * `gmail cache` or a `gmail view` session immediately followed by `gmail`
+ * — not to let a run ignore genuinely new mail. Past this window a normal
+ * incremental history check runs, which is cheap anyway (2 quota units).
+ */
+export const CACHE_FIRST_FRESHNESS_MS = 15 * 60 * 1000;
+
+/**
+ * The most recent moment the local cache is known to be accurate: `gmail
+ * cache`'s own full-snapshot timestamp or a `gmail view` session's
+ * incremental refresh, whichever happened later. Tracked separately (see
+ * gmail/view-sync.ts), but only the later of the two answers "how stale is
+ * what I already have" — reading just the `gmail cache` one would call a
+ * cache that a view session refreshed a minute ago as old as whenever
+ * `gmail cache` last ran.
+ */
+export function latestCacheRefreshAt(db: GmailAgentDatabase, accountHash: string): string | null {
+  const settings = new SettingsRepository(db);
+  return (
+    [
+      settings.get(accountHash, SETTING_KEYS.cacheLastRunAt),
+      settings.get(accountHash, SETTING_KEYS.viewLastRefreshAt)
+    ]
+      .filter((value): value is string => value !== null)
+      // ISO-8601 UTC timestamps sort lexicographically in time order.
+      .sort()
+      .at(-1) ?? null
+  );
 }
 
 export interface CurrentCacheVersions {
@@ -202,7 +246,28 @@ export async function runWork(options: WorkOptions): Promise<number> {
     const loadSentThreadIds = (): Promise<ReadonlySet<string>> => {
       if (!sentIndexPromise) {
         readProgress.onPhase("reconciling");
-        sentIndexPromise = listSentThreadIds(gmailClient, (count) => readProgress.onProgress(count))
+        // Persisted and topped up rather than rebuilt (see
+        // gmail/sent-index.ts): rebuilding it paginated the whole SENT
+        // label between "reads finished" and "the first trash", which is
+        // where runs appeared to stall.
+        sentIndexPromise = loadSentThreadIndex(
+          ctx.db,
+          account.accountHash,
+          gmailClient,
+          ctx.clock.nowIso(),
+          (count) => readProgress.onProgress(count)
+        )
+          .then((index) => {
+            if (index.coldStart) {
+              console.error(
+                pc.dim(
+                  `Built the reply-protection index from ${index.discovered} sent message(s). ` +
+                    "Later runs only check for newly sent mail."
+                )
+              );
+            }
+            return index.threadIds;
+          })
           .finally(() => readProgress.onFinish());
       }
       return sentIndexPromise;
@@ -301,6 +366,29 @@ export async function runWork(options: WorkOptions): Promise<number> {
     }
     const cachedBacklogStubs = [...cachedBacklogStubsById.values()];
 
+    // Cache-first: when the local cache was refreshed moments ago and
+    // already has queued work, spend this run on that queue instead of
+    // asking Gmail what changed first. The history marker stays put, so
+    // anything that arrives meanwhile is still picked up by the next run.
+    const lastCacheRefreshAt = latestCacheRefreshAt(ctx.db, account.accountHash);
+    const cacheAgeMs =
+      lastCacheRefreshAt !== null ? Date.parse(ctx.clock.nowIso()) - Date.parse(lastCacheRefreshAt) : null;
+    const preferCache =
+      account.historyMarker !== null &&
+      cachedBacklogStubs.length > 0 &&
+      cacheAgeMs !== null &&
+      Number.isFinite(cacheAgeMs) &&
+      cacheAgeMs >= 0 &&
+      cacheAgeMs < CACHE_FIRST_FRESHNESS_MS;
+    if (preferCache) {
+      console.error(
+        pc.dim(
+          `Using mail cached ${Math.round((cacheAgeMs ?? 0) / 60_000)} minute(s) ago: ` +
+            `working through ${cachedBacklogStubs.length} queued message(s) without re-checking Gmail for changes.`
+        )
+      );
+    }
+
     diagnosticsLog.phase("scan");
     const {
       summary,
@@ -332,6 +420,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
       cachePolicyVersion,
       cachedAssessments,
       cachedBacklogStubs,
+      preferCache,
       loadSentThreadIds,
       progress: createClassifierProgress({ interactive: !options.json }),
       readProgress,
@@ -718,6 +807,10 @@ export async function runWork(options: WorkOptions): Promise<number> {
     }
 
     const finalSummary = { ...summary, failureCount, scanNote };
+
+    if (options.onJsonSummary) {
+      options.onJsonSummary({ ...renderJsonSummary(finalSummary, { dryRun: options.dryRun }), runId: runId ?? null });
+    }
 
     if (options.json) {
       console.error(renderImportantEmailsParagraph(finalSummary));

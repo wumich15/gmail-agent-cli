@@ -1158,3 +1158,78 @@ describe("read failure recovery", () => {
     expect(loadSentThreadIds).not.toHaveBeenCalled();
   });
 });
+
+describe("cache-first scanning", () => {
+  function message(id: string) {
+    return {
+      id,
+      threadId: `t-${id}`,
+      labelIds: ["INBOX"],
+      headers: [
+        { name: "From", value: "someone@example.com" },
+        { name: "Subject", value: `Subject ${id}` }
+      ]
+    };
+  }
+
+  function countingClient(messages: ReturnType<typeof message>[]) {
+    const client = fakeClient(messages);
+    const historyList = vi.fn(async () => ({ data: { history: [], historyId: "200" } }));
+    const messagesList = vi.fn(async () => ({ data: { messages: [] } }));
+    (client as unknown as { users: { history: { list: unknown } } }).users.history.list = historyList;
+    (client as unknown as { users: { messages: { list: unknown } } }).users.messages.list = messagesList;
+    return { client, historyList, messagesList };
+  }
+
+  it("works the cached backlog without asking Gmail what changed", async () => {
+    const { client, historyList, messagesList } = countingClient([message("m1")]);
+
+    const result = await runWorkScan(
+      baseDeps({
+        gmailClient: client,
+        classifier: new FixedClassifier({ ok: false, unavailable: { reason: "not_configured", detail: "off" } }),
+        historyMarker: "100",
+        preferCache: true,
+        cachedBacklogStubs: [{ id: "m1", threadId: "t-m1" }]
+      })
+    );
+
+    expect(historyList).not.toHaveBeenCalled();
+    expect(messagesList).not.toHaveBeenCalled();
+    // The queued message is still hydrated live — bodies are never stored.
+    expect(result.outcomes.map((outcome) => outcome.gmailMessageId)).toEqual(["m1"]);
+    expect(result.scanNote).toContain("Cache-first scan");
+  });
+
+  it("leaves the history marker untouched, so skipping discovery cannot hide changes from the next run", async () => {
+    const { client } = countingClient([message("m1")]);
+
+    const result = await runWorkScan(
+      baseDeps({
+        gmailClient: client,
+        classifier: new FixedClassifier({ ok: false, unavailable: { reason: "not_configured", detail: "off" } }),
+        historyMarker: "100",
+        preferCache: true,
+        cachedBacklogStubs: [{ id: "m1", threadId: "t-m1" }]
+      })
+    );
+
+    expect(result.newHistoryMarker).toBe("100");
+  });
+
+  it("falls back to a normal history check when the cache has nothing queued", async () => {
+    const { client, historyList } = countingClient([message("m1")]);
+
+    await runWorkScan(
+      baseDeps({
+        gmailClient: client,
+        classifier: NEVER_CALLED_CLASSIFIER,
+        historyMarker: "100",
+        preferCache: true,
+        cachedBacklogStubs: []
+      })
+    );
+
+    expect(historyList).toHaveBeenCalled();
+  });
+});

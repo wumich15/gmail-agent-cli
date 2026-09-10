@@ -6,6 +6,8 @@
 
 The CLI also includes documentation through `gmail help`, `gmail help <command>`, and `gmail view --help`.
 
-A minimal browser front-end for guided setup and this reference is planned. There is no live front-end URL yet. This directory is the current documentation home; the README should link to the verified deployed front-end when it launches.
+`gmail ui` serves a minimal browser front-end — **Setup**, **Commands**, **Status** — from `127.0.0.1` on this computer, for as long as that command runs. It renders the same command reference as this directory, so the two cannot disagree.
+
+There is no hosted documentation site yet, and no live URL to link to. This directory remains the documentation home; a verified public URL belongs at the top of the README when one actually exists.
 
 The [archived program guide](archive/program-guide.md) records an earlier design. It is not setup guidance or a description of the current command surface.

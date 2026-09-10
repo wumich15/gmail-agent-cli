@@ -3,16 +3,9 @@ import pc from "picocolors";
 import { bootstrap } from "../core/bootstrap.js";
 import { AccountsRepository } from "../state/repositories/accounts.js";
 import { CREDENTIAL_KEYS } from "../auth/credential-store.js";
-import {
-  loadDevOAuthClientCredentials,
-  oauthClientFromRefreshToken,
-  runInstalledAppLogin,
-  OAUTH_SCOPES
-} from "../auth/google-oauth.js";
-import { createGmailClient } from "../gmail/client.js";
-import { fetchProfile } from "../gmail/scanner.js";
-import { accountHashFromEmail } from "../core/ids.js";
-import { loadOrCreateDefaultConfig, saveConfig } from "../config/load.js";
+import { connectGoogleAccount } from "../core/connect.js";
+import { chooseAiAccessInteractively } from "./setup-ai.js";
+import { disconnectAccount } from "../core/onboarding.js";
 import { EXIT_CODES } from "../core/errors.js";
 import { ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
@@ -22,13 +15,18 @@ export async function authLogin(): Promise<number> {
   p.intro("Sign in to Google");
 
   p.log.message(
-    "This app can, on your account: move spam/promotions/low-value mail to Trash (never permanently\n" +
-      "delete), star and label important mail, archive read Inbox mail, and create Calendar events\n" +
-      "from actionable mail. It never sends replies, never adds Calendar attendees or Meet links, and\n" +
-      "the only outbound email it can send is a confirmed unsubscribe request you approve.\n\n" +
-      "If you enable AI classification, selected email text (not attachments) is sent to the\n" +
-      "configured AI provider to help decide what's spam or important. That provider's standard\n" +
-      "abuse-monitoring retention may still apply even with storage disabled on the API call."
+    "Automatic changes this app can make on your account: move spam, promotions, and low-value mail\n" +
+      "to Trash (never permanently delete), star and label important mail, archive read Inbox mail,\n" +
+      "and create Calendar events from actionable mail. It never adds Calendar attendees, sends\n" +
+      "invitations, or creates Meet links.\n\n" +
+      "Sending mail is never automatic. `gmail view` and `gmail send` can reply to a message or\n" +
+      "compose a new one — including with an AI-written draft — but every outbound message, and\n" +
+      "every unsubscribe request, stops at a screen showing the exact recipient, subject, and body\n" +
+      "and is sent only if you confirm it there. The answer defaults to no, and no flag skips it.\n\n" +
+      "If you choose a hosted AI provider, selected email text (never attachments) is sent to it to\n" +
+      "help decide what is spam or important and to draft replies you review. That provider's\n" +
+      "standard abuse-monitoring retention may still apply even with storage disabled on the call.\n" +
+      "Choosing the local-model option instead keeps every message on this computer."
   );
 
   const proceed = await p.confirm({ message: "Continue and sign in with Google in your browser?" });
@@ -37,89 +35,49 @@ export async function authLogin(): Promise<number> {
     return EXIT_CODES.safetyBlocked;
   }
 
-  const credentials = loadDevOAuthClientCredentials();
-
   const spinner = p.spinner();
   spinner.start("Waiting for browser sign-in");
   let authorizeUrl: string | null = null;
   try {
-    const result = await runInstalledAppLogin(credentials, (url) => {
-      authorizeUrl = url;
-    });
-    spinner.stop("Signed in.");
-
-    const oauthClient = oauthClientFromRefreshToken(credentials, result.refreshToken);
-    const gmailClient = createGmailClient(oauthClient);
-    const profile = await fetchProfile(gmailClient);
-    const accountHash = accountHashFromEmail(profile.emailAddress);
-
-    // Acquire the per-account lock as soon as an account is identified —
-    // CLAUDE.md explicitly names "auth login/logout" among the commands
-    // that must hold it, since everything from here on mutates the
-    // credential store and durable account state.
-    const lock = new ProcessLock(lockFilePath(accountHash));
-    lock.acquire();
-    try {
-      await ctx.credentialStore.setSecret(CREDENTIAL_KEYS.oauthRefreshToken(accountHash), result.refreshToken);
-
-      // v1 supports exactly one signed-in account. Enforce that
-      // explicitly rather than letting a fresh sign-in as a different
-      // Google account silently leave a stale row (and its stored
-      // credential) behind — resolveAccount would otherwise have no
-      // principled way to know which of two rows is "current."
-      const accountsRepo = new AccountsRepository(ctx.db);
-      const staleRows = ctx.db
-        .prepare("SELECT account_hash FROM accounts WHERE account_hash != ?")
-        .all(accountHash) as { account_hash: string }[];
-      for (const { account_hash: staleHash } of staleRows) {
-        await ctx.credentialStore.deleteSecret(CREDENTIAL_KEYS.oauthRefreshToken(staleHash));
+    // All of the actual work — OAuth, profile lookup, single-account
+    // enforcement, credential and config writes — lives in
+    // `core/connect.ts` so the browser setup view performs the identical
+    // operation instead of a parallel implementation. This function only
+    // asks the questions and prints the result.
+    const result = await connectGoogleAccount(ctx, {
+      onAuthorizeUrl: (url) => {
+        authorizeUrl = url;
+      },
+      resolveTimezone: async (detected) => {
+        spinner.stop("Signed in.");
+        const answer = await p.text({
+          message: "Confirm your IANA timezone",
+          initialValue: detected,
+          placeholder: detected
+        });
+        return p.isCancel(answer) ? detected : answer;
       }
-      ctx.db.prepare("DELETE FROM accounts WHERE account_hash != ?").run(accountHash);
+    });
 
-      const detectedTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      const timezoneInput = await p.text({
-        message: "Confirm your IANA timezone",
-        initialValue: detectedTimezone,
-        placeholder: detectedTimezone
-      });
-      const timezone = p.isCancel(timezoneInput) ? detectedTimezone : timezoneInput;
+    await chooseAiAccessInteractively(ctx, result.accountHash);
 
-      const now = ctx.clock.nowIso();
-      accountsRepo.upsert({
-        accountHash,
-        emailDisplay: profile.emailAddress,
-        timezone,
-        historyMarker: null,
-        setupComplete: true,
-        automationEnabled: false,
-        createdAt: now,
-        updatedAt: now
-      });
-
-      const config = loadOrCreateDefaultConfig(timezone);
-      saveConfig({ ...config, timezone });
-
-      // Report what Google actually granted, not merely what was
-      // requested — a Workspace admin policy can restrict a scope (most
-      // plausibly Calendar) even when the OAuth consent screen showed it,
-      // and silently claiming it was granted means the first real
-      // failure the user sees is an unexplained Calendar API error much
-      // later, with no link back to the actual cause.
-      const missingScopes = OAUTH_SCOPES.filter((scope) => !result.scopes.includes(scope));
-      p.outro(
-        `Signed in as ${profile.emailAddress}.\n` +
-          `Granted scopes: ${result.scopes.length > 0 ? result.scopes.join(", ") : "(none reported by Google)"}\n` +
-          (missingScopes.length > 0
-            ? pc.yellow(
-                `Warning: Google did not report granting: ${missingScopes.join(", ")}. Related features (e.g. Calendar) will fail until this is resolved.\n`
-              )
-            : "") +
-          "Run 'gmail --dry-run' to preview what this account would do."
-      );
-      return EXIT_CODES.ok;
-    } finally {
-      lock.release();
-    }
+    // Report what Google actually granted, not merely what was requested —
+    // a Workspace admin policy can restrict a scope (most plausibly
+    // Calendar) even when the consent screen showed it, and silently
+    // claiming it was granted means the first real failure the user sees
+    // is an unexplained Calendar API error much later, with no link back
+    // to the actual cause.
+    p.outro(
+      `Signed in as ${result.emailDisplay}.\n` +
+        `Granted scopes: ${result.grantedScopes.length > 0 ? result.grantedScopes.join(", ") : "(none reported by Google)"}\n` +
+        (result.missingScopes.length > 0
+          ? pc.yellow(
+              `Warning: Google did not report granting: ${result.missingScopes.join(", ")}. Related features (e.g. Calendar) will fail until this is resolved.\n`
+            )
+          : "") +
+        "Signing in changed nothing in your mailbox. Run 'gmail --dry-run' to preview what it would do."
+    );
+    return EXIT_CODES.ok;
   } catch (error) {
     spinner.stop("Sign-in failed.");
     if (authorizeUrl) {
@@ -192,25 +150,21 @@ async function logoutOneAccount(
   accountHash: string
 ): Promise<void> {
   const account = accountsRepo.get(accountHash);
-  const secretKey = CREDENTIAL_KEYS.oauthRefreshToken(accountHash);
-  const refreshToken = await ctx.credentialStore.getSecret(secretKey);
 
-  if (refreshToken) {
-    try {
-      const credentials = loadDevOAuthClientCredentials();
-      const oauthClient = oauthClientFromRefreshToken(credentials, refreshToken);
-      await oauthClient.revokeToken(refreshToken);
-    } catch (error) {
-      p.log.warn(`Could not revoke the Google grant remotely: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-  await ctx.credentialStore.deleteSecret(secretKey);
-
+  // Asked before anything is erased: removing local history is a separate
+  // decision from disconnecting, and the user should not discover after
+  // the fact that their rules and run log went with the credentials.
   const keepHistory = await p.confirm({
     message: `Keep local non-secret run/rule history for ${account?.emailDisplay ?? accountHash}?`,
     initialValue: true
   });
-  if (!p.isCancel(keepHistory) && !keepHistory) {
-    ctx.db.prepare("DELETE FROM accounts WHERE account_hash = ?").run(accountHash);
+  const removeHistory = !p.isCancel(keepHistory) && !keepHistory;
+
+  const result = await disconnectAccount(ctx, accountHash, { removeHistory });
+  if (result.revokeProblem) {
+    p.log.warn(
+      `Local credentials were removed, but Google could not be told to drop the grant: ${result.revokeProblem}\n` +
+        "You can revoke it yourself at https://myaccount.google.com/permissions."
+    );
   }
 }

@@ -9,24 +9,18 @@ import OpenAI, {
 } from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import { withApiRetry } from "../core/api-retry.js";
-import { EmailFlagsSchema, type EmailFlags } from "./schema.js";
-import {
-  buildClassificationInput,
-  buildDeterministicSummary,
-  buildDeveloperInstructions,
-  FEW_SHOT_EXAMPLES,
-  normalizeCategoryLabel,
-  PROMPT_VERSION
-} from "./prompt.js";
+import { EmailFlagsSchema } from "./schema.js";
+import { mapFlagsToAssessment, SCHEMA_VERSION } from "./assessment-mapping.js";
+import { buildClassificationInput, buildDeveloperInstructions, FEW_SHOT_EXAMPLES } from "./prompt.js";
 import type { ClassifyContext, Classifier } from "./classifier.js";
-import type { AssessmentResult, AssessmentUnavailable, EmailAssessment, NormalizedMessage } from "../core/models.js";
+import type { AssessmentResult, AssessmentUnavailable, NormalizedMessage } from "../core/models.js";
 
-export const SCHEMA_VERSION = "schema-v5";
+// Re-exported for the many call sites (and the cache-version tuple) that
+// have always imported it from here; it now lives beside the mapping it
+// versions, which the local and hosted classifiers share.
+export { SCHEMA_VERSION };
+
 const DEFAULT_TIMEOUT_MS = 20_000;
-
-/** Clearly above/below the 0.90 policy thresholds — the flags themselves are the decision; these just satisfy the existing threshold-based policy engine. */
-const HIGH_CONFIDENCE = 0.98;
-const LOW_CONFIDENCE = 0;
 
 export interface OpenAiClassifierOptions {
   /** Falls back to the OPENAI_API_KEY environment variable when omitted (the SDK's own default). */
@@ -117,7 +111,7 @@ export class OpenAiClassifier implements Classifier {
 
       return {
         ok: true,
-        assessment: mapFlagsToAssessment(response.output_parsed, message, this.model)
+        assessment: mapFlagsToAssessment(response.output_parsed, message, `openai:${this.model}`)
       };
     } catch (error) {
       return { ok: false, unavailable: mapErrorToUnavailable(error) };
@@ -132,74 +126,6 @@ function buildInputWithExamples(message: NormalizedMessage) {
     { role: "assistant" as const, content: JSON.stringify(example.output) }
   ]);
   return [...exampleTurns, { role: "user" as const, content: buildClassificationInput(message) }];
-}
-
-/**
- * Deterministically maps the model's cheap `tag` (replacing the earlier
- * spam/suspicious/important boolean triplet — see schema.ts) onto the
- * richer internal EmailAssessment shape core/policy.ts already knows how
- * to consume, at fixed confidence values that clearly clear or miss its
- * 0.90 thresholds — the tag *is* the decision; these numbers only exist
- * to satisfy a policy engine built around graded confidence. `suspicious`
- * maps to a kind policy.ts already treats as "no AI-derived mutation,
- * route to Review," so a model output that also set event/category
- * fields for a suspicious tag is still safe by construction (and this
- * function additionally zeroes both out below, defense in depth).
- * `hasEvent` is inferred from `eventTitle !== null` rather than being its
- * own field, since the model has to fill in eventTitle either way.
- */
-function mapFlagsToAssessment(flags: EmailFlags, message: NormalizedMessage, model: string): EmailAssessment {
-  const kind =
-    flags.tag === "suspicious"
-      ? "suspicious"
-      : flags.tag === "spam"
-        ? "promotion"
-        : flags.tag === "important"
-          ? "personal_important"
-          : "personal_routine";
-  const hasEvent = flags.eventTitle !== null;
-  const isSuspicious = flags.tag === "suspicious";
-  return {
-    kind,
-    confidence: isSuspicious || flags.tag === "spam" ? HIGH_CONFIDENCE : LOW_CONFIDENCE,
-    importanceScore: flags.tag === "important" ? HIGH_CONFIDENCE : LOW_CONFIDENCE,
-    importanceConfidence: flags.tag === "important" ? HIGH_CONFIDENCE : LOW_CONFIDENCE,
-    summary: buildDeterministicSummary(message),
-    reasonCodes: [],
-    // A suspicious message's extracted facts are never trusted for either
-    // field — policy.ts's isUnresolvedKind gate already makes this safe
-    // today (no star/event/label ever fires for a suspicious kind), but
-    // enforcing it symmetrically here too means that invariant doesn't
-    // depend entirely on a single downstream gate staying correct forever.
-    event:
-      hasEvent && !isSuspicious
-        ? {
-            intent: "create",
-            confidence: HIGH_CONFIDENCE,
-            title: flags.eventTitle,
-            start: flags.eventStart,
-            end: flags.eventEnd,
-            allDay: flags.eventAllDay,
-            timeZone: null,
-            location: null,
-            sourceEvidence: flags.eventSourceEvidence
-          }
-        : {
-            intent: "none",
-            confidence: LOW_CONFIDENCE,
-            title: null,
-            start: null,
-            end: null,
-            allDay: false,
-            timeZone: null,
-            location: null,
-            sourceEvidence: null
-          },
-    category: isSuspicious ? null : normalizeCategoryLabel(flags.category),
-    classifierVersion: `openai:${model}`,
-    promptVersion: PROMPT_VERSION,
-    schemaVersion: SCHEMA_VERSION
-  };
 }
 
 function extractRefusal(response: { output?: readonly unknown[] }): string | null {

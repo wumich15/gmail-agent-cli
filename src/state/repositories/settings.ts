@@ -29,6 +29,13 @@ export const SETTING_KEYS = {
   cacheLastRunAt: "gmail_cache_last_run_at",
   viewLastRefreshAt: "gmail_view_last_refresh_at",
   /**
+   * Newest SENT message ID recorded by the reply-protection thread index
+   * (see `gmail/sent-index.ts`). Its presence is what lets a later run
+   * page the SENT label only down to this point instead of re-walking the
+   * entire mailbox before it can trash anything.
+   */
+  sentIndexNewestMessageId: "gmail_sent_index_newest_message_id",
+  /**
    * A short, non-verbatim description of the user's writing style (see
    * `gmail/writing-style.ts`), computed once from a Sent-mail sample and
    * reused across sessions instead of re-deriving it on every AI draft.

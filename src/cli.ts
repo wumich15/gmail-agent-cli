@@ -8,6 +8,9 @@ import { runCache } from "./commands/cache.js";
 import { runUncache } from "./commands/uncache.js";
 import { runView } from "./commands/view.js";
 import { runSend } from "./commands/send.js";
+import { runSetup } from "./commands/setup.js";
+import { runUi } from "./commands/ui.js";
+import { renderViewControlsHelp } from "./docs/command-reference.js";
 import { GmailAgentError, EXIT_CODES } from "./core/errors.js";
 import { redactSecrets } from "./logging/logger.js";
 
@@ -19,54 +22,30 @@ function parsePositiveInt(value: string): number {
   return parsed;
 }
 
-const VIEW_HELP_TEXT =
-  "\nGmail view controls:\n" +
-  "  up/down      move the highlighted row (no Enter needed)\n" +
-  "  enter        open the highlighted row\n" +
-  "  number       type email number to open\n" +
-  "  <n> r        reply to message n immediately, without opening it first\n" +
-  "  <n> ;r       AI-draft a reply to message n immediately (e.g. \"2 ;r\")\n" +
-  "  <n> d        delete (Trash) message n immediately, without opening it\n" +
-  "  d            delete (Trash) the highlighted row, without opening it\n" +
-  "  left/right   previous or next page in the list (no Enter needed)\n" +
-  "  n / p        next or previous page\n" +
-  "  [ / ]        back or forward through prior list views\n" +
-  "  esc          go home: clear search/filters, first page (never quits)\n" +
-  "  + / -        increase or decrease page size\n" +
-  "  l <number>   set an exact page size\n" +
-  "  f            filter by Gmail label\n" +
-  "  s <text>     search subjects and senders (s alone clears)\n" +
-  "  c / a        compose manually or with AI\n" +
-  "  ;s           refresh your saved writing style from recent Sent mail\n" +
-  "  ;u           undo the last delete from this session\n" +
-  "  u            refresh Gmail (also updates the \"cached ... ago\" timestamp)\n" +
-  "  q            quit\n" +
-  "  left/right   previous or next message while reading one\n" +
-  "  r / ;r       reply manually or with AI while reading\n" +
-  "  d            delete (move to Trash) while reading — default answer is yes\n" +
-  "  l            show this message's link URLs (links are shown shortened\n" +
-  "               and clickable in a terminal that supports it)\n" +
-  "  o            open one of this message's links in your system browser\n" +
-  "  esc          return to the message list\n" +
-  "\n" +
-  "The \"<n> r\"/\"<n> ;r\" shortcuts only jump straight to composing — the same\n" +
-  "exact-message confirmation screen still appears before anything sends;\n" +
-  "there is no way to skip it. \"Delete\" always means Gmail's Trash (reversible\n" +
-  "from Gmail itself, or instantly via \";u\" for the last one this session),\n" +
-  "never permanent deletion — deleting always updates the list immediately.\n";
+// Generated from the same reference data the browser Commands view
+// renders (src/docs/command-reference.ts), so terminal help and web docs
+// cannot drift apart when a control changes.
+const VIEW_HELP_TEXT = renderViewControlsHelp();
 
-// MVP command surface: `gmail` (scan + clean up, with inline sign-in on
-// first run), `gmail add` (create a spam/important rule), `gmail category`
+// Command surface: `gmail` (scan + clean up, with inline sign-in on first
+// run), `gmail add` (create a spam/important rule), `gmail category`
 // (create a Gmail label directly, on demand), `gmail cache` (read-only
 // full-inbox snapshot that seeds incremental scanning), `gmail uncache`
 // (clears that local scan cache/history marker, no Gmail/Calendar changes),
 // `gmail view` (terminal inbox with automatic cache refresh, reading,
-// composing, replies, and Sent-style-aware AI drafts), and `gmail send`
-// (the same compose/AI-draft/confirm flow as gmail view's "c"/"a", reachable
-// directly from the command line). The other commands (spam/important/rules/summary/
-// undo/auth/config/doctor) still exist as working code under
-// src/commands/ — they're just not wired up as CLI subcommands yet.
-// Re-add them here when they're back in scope.
+// composing, replies, and Sent-style-aware AI drafts), `gmail send` (the
+// same compose/AI-draft/confirm flow as gmail view's "c"/"a", reachable
+// directly from the command line), `gmail setup` (connect/reconnect and
+// choose how AI works, touching no mail), and `gmail ui` (the same setup,
+// command reference, and status in a loopback browser page).
+//
+// Every command registered here must also appear in
+// src/docs/command-reference.ts, which is what `gmail help` and the
+// browser Commands view both render. The other modules under
+// src/commands/ (spam/important/rules/summary/undo/auth/config/doctor)
+// still exist as working code but are not wired up as subcommands, and so
+// are deliberately absent from the public reference. Re-add them in both
+// places when they are back in scope.
 
 const program = new Command();
 
@@ -188,6 +167,28 @@ program
   });
 
 program
+  .command("setup")
+  .description(
+    "Connect or reconnect Gmail, choose how AI works (local model, your own API key, or off), and see " +
+      "current status — without touching any mail"
+  )
+  .action(() => {
+    withExitHandling(() => runSetup());
+  });
+
+program
+  .command("ui")
+  .description(
+    "Open the local setup, command reference, and status pages in your browser (served from 127.0.0.1 only, " +
+      "for as long as this command runs)"
+  )
+  .option("--port <n>", "listen on a specific port instead of an OS-assigned one", parsePositiveInt)
+  .option("--no-open", "print the URL instead of opening a browser")
+  .action((opts: { port?: number; open: boolean }) => {
+    withExitHandling(() => runUi({ ...(opts.port !== undefined ? { port: opts.port } : {}), open: opts.open }));
+  });
+
+program
   .command("help [command]")
   .description("Show all commands and Gmail view controls, or focused help for one command")
   .action((commandName?: string) => {
@@ -211,7 +212,17 @@ program
 // otherwise silently run the full mutating pipeline instead of erroring.
 // Since bare `gmail` performs real mailbox mutations, that's a dangerous
 // default; check the first token explicitly before letting Commander parse.
-const KNOWN_SUBCOMMANDS = new Set(["add", "category", "cache", "uncache", "view", "send", "help"]);
+const KNOWN_SUBCOMMANDS = new Set([
+  "add",
+  "category",
+  "cache",
+  "uncache",
+  "view",
+  "send",
+  "setup",
+  "ui",
+  "help"
+]);
 const firstArg = process.argv[2];
 if (firstArg !== undefined && !firstArg.startsWith("-") && !KNOWN_SUBCOMMANDS.has(firstArg)) {
   console.error(pc.red(`Unknown command: ${firstArg}`));

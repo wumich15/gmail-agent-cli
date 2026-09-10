@@ -80,6 +80,14 @@ export interface ListMessagesParams {
   includeSpamTrash: boolean;
   /** Stop paginating after this many results and report truncation, rather than looping forever. */
   safetyCapCount?: number;
+  /**
+   * Stop as soon as this message ID appears in a page, excluding it and
+   * everything after it. `messages.list` returns newest-first, so this
+   * turns "everything under this label" into "everything newer than the
+   * last one I already know about" — the difference between re-paginating
+   * a whole mailbox on every run and fetching a single page.
+   */
+  stopAtMessageId?: string;
   onProgress?: (discovered: number) => void;
 }
 
@@ -129,13 +137,18 @@ export async function listAllMessageIds(
     if (estimatedTotal === null && typeof data.resultSizeEstimate === "number") {
       estimatedTotal = data.resultSizeEstimate;
     }
+    let reachedStopId = false;
     for (const m of data.messages ?? []) {
+      if (params.stopAtMessageId !== undefined && m.id === params.stopAtMessageId) {
+        reachedStopId = true;
+        break;
+      }
       if (m.id && m.threadId && !seenIds.has(m.id)) {
         seenIds.add(m.id);
         messages.push({ id: m.id, threadId: m.threadId });
       }
     }
-    pageToken = data.nextPageToken ?? undefined;
+    pageToken = reachedStopId ? undefined : data.nextPageToken ?? undefined;
 
     params.onProgress?.(Math.min(messages.length, params.safetyCapCount ?? Infinity));
     if (pageToken) {

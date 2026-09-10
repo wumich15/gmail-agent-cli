@@ -1,7 +1,7 @@
-import type { CliContext } from "../core/bootstrap.js";
+import { reloadConfig, type CliContext } from "../core/bootstrap.js";
 import { AccountsRepository } from "../state/repositories/accounts.js";
 import { CREDENTIAL_KEYS } from "../auth/credential-store.js";
-import { loadDevOAuthClientCredentials, oauthClientFromRefreshToken } from "../auth/google-oauth.js";
+import { isInvalidGrantError, resolveOAuthClientCredentials, oauthClientFromRefreshToken } from "../auth/google-oauth.js";
 import { createGmailClient, type GmailClient } from "../gmail/client.js";
 import { createCalendarClient, type CalendarClient } from "../calendar/client.js";
 import { AuthRequiredError } from "../core/errors.js";
@@ -39,7 +39,7 @@ export async function resolveAccount(ctx: CliContext): Promise<ResolvedAccount> 
   if (!refreshToken) {
     throw new AuthRequiredError();
   }
-  const credentials = loadDevOAuthClientCredentials();
+  const credentials = resolveOAuthClientCredentials();
   const oauthClient = oauthClientFromRefreshToken(credentials, refreshToken);
   return {
     account,
@@ -50,14 +50,47 @@ export async function resolveAccount(ctx: CliContext): Promise<ResolvedAccount> 
 }
 
 /**
+ * Exchanges the stored refresh token for an access token up front, so a
+ * credential Google no longer honors is discovered here — at one known
+ * point, before any mailbox work begins — instead of surfacing later as an
+ * unexplained Gmail failure partway through a run. The token this obtains
+ * is cached on the client, so the first real API call does not pay for it
+ * twice.
+ *
+ * On `invalid_grant` (the user revoked access, the password changed, or a
+ * Testing-mode grant hit its seven-day expiry) the unusable token is
+ * erased, because retrying it can only keep failing.
+ */
+async function assertCredentialsUsable(ctx: CliContext, resolved: ResolvedAccount): Promise<void> {
+  try {
+    await resolved.oauthClient.getAccessToken();
+  } catch (error) {
+    if (!isInvalidGrantError(error)) {
+      throw error;
+    }
+    await ctx.credentialStore.deleteSecret(CREDENTIAL_KEYS.oauthRefreshToken(resolved.account.accountHash));
+    throw new AuthRequiredError(
+      "Your Google sign-in is no longer valid — it was revoked, expired, or the account password changed. " +
+        "Reconnecting requires signing in again."
+    );
+  }
+}
+
+/**
  * Same as `resolveAccount`, but signs in inline (in the system browser) the
  * first time there's no account yet, rather than requiring a separate
  * `gmail auth login` first — this is what lets `gmail` and `gmail cache`
  * both work as one-shot commands with no prerequisite setup step.
+ *
+ * A revoked or expired grant takes the same path: the dead credential is
+ * erased and consent is requested again, exactly once. There is no retry
+ * loop — if the fresh sign-in also fails, the original error is raised.
  */
 export async function resolveAccountSigningInIfNeeded(ctx: CliContext): Promise<ResolvedAccount> {
   try {
-    return await resolveAccount(ctx);
+    const resolved = await resolveAccount(ctx);
+    await assertCredentialsUsable(ctx, resolved);
+    return resolved;
   } catch (error) {
     if (!(error instanceof AuthRequiredError)) {
       throw error;
@@ -66,6 +99,10 @@ export async function resolveAccountSigningInIfNeeded(ctx: CliContext): Promise<
     if (loginExitCode !== 0) {
       throw error;
     }
+    // Sign-in writes config.json (timezone, and the AI access choice made
+    // during onboarding). Without this, the rest of this same process
+    // would keep using the config snapshot taken before any of it existed.
+    reloadConfig(ctx);
     return resolveAccount(ctx);
   }
 }

@@ -50,3 +50,31 @@ export const EmailFlagsSchema = z
   .strict();
 
 export type EmailFlags = z.infer<typeof EmailFlagsSchema>;
+
+/**
+ * The same wire schema as `EmailFlagsSchema`, expressed as JSON Schema for
+ * runtimes that constrain generation directly rather than through the
+ * OpenAI SDK's Zod helper — currently Ollama's `format` parameter (see
+ * `ai/ollama.ts`). Kept adjacent to the Zod schema on purpose: the two must
+ * describe the same object, and `EmailFlagsSchema.safeParse` is still the
+ * only thing that decides whether a response is acceptable, so a drift
+ * between them degrades to a rejected assessment (Review), never to an
+ * unvalidated field reaching policy.
+ *
+ * Every property is required and `additionalProperties` is false, matching
+ * the strictness CLAUDE.md's "AI assessment contract" requires.
+ */
+export const EMAIL_FLAGS_JSON_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["tag", "eventTitle", "eventStart", "eventEnd", "eventAllDay", "eventSourceEvidence", "category"],
+  properties: {
+    tag: { type: "string", enum: [...EMAIL_TAGS] },
+    eventTitle: { type: ["string", "null"] },
+    eventStart: { type: ["string", "null"] },
+    eventEnd: { type: ["string", "null"] },
+    eventAllDay: { type: "boolean" },
+    eventSourceEvidence: { type: ["string", "null"] },
+    category: { type: ["string", "null"] }
+  }
+} as const;

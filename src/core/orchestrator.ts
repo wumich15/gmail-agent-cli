@@ -145,6 +145,23 @@ export interface OrchestratorDeps {
   loadSentThreadIds?: () => Promise<ReadonlySet<string>>;
   /** True when the Sent index could not be built; Trash must be held for review. */
   sentThreadIndexUnavailable?: boolean;
+  /**
+   * Work from what is already cached instead of asking Gmail what changed.
+   *
+   * When the local cache was refreshed moments ago — by `gmail cache`, or
+   * by a `gmail view` session that has been syncing itself — a fresh
+   * `users.history.list` pass is very likely to report nothing new, so the
+   * caller can skip discovery entirely and spend the run on the cached
+   * backlog it already knows needs evaluating.
+   *
+   * This never skips *hydration*: message bodies are deliberately not
+   * persisted, so each queued message is still fetched live before it is
+   * classified. And because nothing was discovered, the history marker is
+   * left exactly where it was, so the next ordinary run still picks up
+   * every change that arrived in the meantime. Ignored when there is no
+   * marker or no cached backlog to work on.
+   */
+  preferCache?: boolean;
   /** Optional progress sink used by the CLI; omitted by library/test callers. */
   progress?: ClassifierProgress;
   readProgress?: ReadProgress;
@@ -332,6 +349,34 @@ export async function runWorkScan(deps: OrchestratorDeps): Promise<WorkScanResul
   const totalStartedAt = performance.now();
   const diagnostics = emptyScanDiagnostics();
   deps.readProgress?.onPhase("discovering");
+  if (deps.historyMarker && deps.preferCache && (deps.cachedBacklogStubs?.length ?? 0) > 0) {
+    // Cache-first: no history request at all. The marker is carried
+    // through unchanged as this scan's end marker, so skipping discovery
+    // now cannot make the changes it would have found invisible later.
+    //
+    // The signed-in address normally comes from the account row; fetching
+    // the profile is only a fallback for the rare case where it is absent,
+    // since normalization needs it to tell the user's own mail apart.
+    let userEmail = deps.userEmail;
+    if (userEmail.trim().length === 0) {
+      const profileStartedAt = performance.now();
+      userEmail = (await fetchProfile(deps.gmailClient)).emailAddress;
+      diagnostics.profileMs = performance.now() - profileStartedAt;
+    }
+    const result = await runIncrementalScan(
+      deps,
+      userEmail,
+      {
+        changedMessages: new Map(),
+        deletedMessageIds: new Set(),
+        endHistoryId: deps.historyMarker,
+        expiredMarker: false
+      },
+      diagnostics
+    );
+    diagnostics.totalMs = performance.now() - totalStartedAt;
+    return result;
+  }
   if (deps.historyMarker) {
     const historyStartedAt = performance.now();
     const history = await listHistorySince(deps.gmailClient, deps.historyMarker,
@@ -720,9 +765,11 @@ async function runIncrementalScan(
   summary.failureCount = failed.length;
 
   const cachedBacklogCount = stubs.filter((stub) => !history.changedMessages.has(stub.id)).length;
-  const incrementalNote =
-    `Incremental scan: reconciled ${preprocessed.length} currently Inbox/Spam message(s) ` +
-    `(${allChanged.length} Gmail change(s), ${cachedBacklogCount} cached backlog message(s)).`;
+  const incrementalNote = deps.preferCache
+    ? `Cache-first scan: reconciled ${preprocessed.length} currently Inbox/Spam message(s) from ` +
+      `${cachedBacklogCount} cached message(s); Gmail was not asked what changed, so the next run still will.`
+    : `Incremental scan: reconciled ${preprocessed.length} currently Inbox/Spam message(s) ` +
+      `(${allChanged.length} Gmail change(s), ${cachedBacklogCount} cached backlog message(s)).`;
 
   return {
     summary,

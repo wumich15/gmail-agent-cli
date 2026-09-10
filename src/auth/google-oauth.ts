@@ -4,6 +4,11 @@ import { randomBytes, createHash } from "node:crypto";
 import { exec } from "node:child_process";
 import { CodeChallengeMethod, OAuth2Client } from "google-auth-library";
 import { AuthRequiredError, InvalidConfigError } from "../core/errors.js";
+import {
+  PUBLISHER_OAUTH_CLIENT_ID,
+  PUBLISHER_OAUTH_CLIENT_SECRET,
+  publisherOAuthClientConfigured
+} from "./publisher-client.js";
 
 /**
  * Restricted Gmail scope plus a narrow Calendar scope limited to events on
@@ -23,24 +28,62 @@ export interface OAuthClientCredentials {
 }
 
 /**
- * Development builds authenticate with a user-supplied Desktop OAuth
- * client (Google Cloud Console > Credentials > OAuth client ID > Desktop
- * app). A public release must instead ship a publisher-managed, verified
- * OAuth project; that client is not read from the environment.
+ * Where the OAuth installed-app client came from. Surfaced to the user
+ * (and to `gmail doctor`/the setup UI) because the two have very different
+ * onboarding stories: a publisher client means "just press Connect", while
+ * a development client means the operator supplied their own Cloud project.
  */
-export function loadDevOAuthClientCredentials(
-  env: NodeJS.ProcessEnv = process.env
-): OAuthClientCredentials {
+export type OAuthClientSource = "publisher" | "environment";
+
+export interface ResolvedOAuthClient extends OAuthClientCredentials {
+  source: OAuthClientSource;
+}
+
+/**
+ * Resolves the installed-app OAuth client, preferring an explicit
+ * environment override (development, or an operator running against their
+ * own Cloud project) over the publisher client shipped with a release
+ * build. Neither is confidential — see `publisher-client.ts` — so the
+ * precedence here is purely about which project the consent screen and
+ * quota belong to, not about secrecy.
+ *
+ * Throws only when this build has no publisher client *and* no environment
+ * override, which is the state of the source tree today.
+ */
+export function resolveOAuthClientCredentials(env: NodeJS.ProcessEnv = process.env): ResolvedOAuthClient {
   const clientId = env["GMAIL_AGENT_OAUTH_CLIENT_ID"];
   const clientSecret = env["GMAIL_AGENT_OAUTH_CLIENT_SECRET"];
-  if (!clientId || !clientSecret) {
-    throw new InvalidConfigError(
-      "No OAuth client is configured. Development builds need GMAIL_AGENT_OAUTH_CLIENT_ID and " +
-        "GMAIL_AGENT_OAUTH_CLIENT_SECRET for a Desktop-type OAuth client from the Google Cloud " +
-        "Console. A public release would ship a verified, publisher-managed client instead."
-    );
+  if (clientId && clientSecret) {
+    return { clientId, clientSecret, source: "environment" };
   }
-  return { clientId, clientSecret };
+  if (publisherOAuthClientConfigured()) {
+    return {
+      clientId: PUBLISHER_OAUTH_CLIENT_ID,
+      clientSecret: PUBLISHER_OAUTH_CLIENT_SECRET,
+      source: "publisher"
+    };
+  }
+  throw new InvalidConfigError(
+    "This build has no Google OAuth client, so it cannot sign in yet. A release build ships a " +
+      "verified publisher client and needs nothing from you. To run this development build, create " +
+      "a Desktop-type OAuth client in the Google Cloud Console (with the Gmail and Calendar APIs " +
+      "enabled) and set GMAIL_AGENT_OAUTH_CLIENT_ID and GMAIL_AGENT_OAUTH_CLIENT_SECRET."
+  );
+}
+
+/**
+ * True for the one Google OAuth failure that is not transient and not a
+ * configuration mistake: the stored refresh token is no longer usable
+ * (the user revoked access at myaccount.google.com, the grant expired —
+ * seven days for a Testing-mode app using Gmail scopes — or the password
+ * changed). The stored token must be erased and consent obtained again;
+ * retrying the same token can only keep failing.
+ */
+export function isInvalidGrantError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const candidate = error as { message?: unknown; response?: { data?: { error?: unknown } } };
+  if (candidate.response?.data?.error === "invalid_grant") return true;
+  return typeof candidate.message === "string" && candidate.message.includes("invalid_grant");
 }
 
 function base64Url(input: Buffer): string {

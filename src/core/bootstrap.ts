@@ -32,3 +32,24 @@ export function bootstrap(): CliContext {
   };
   return cached;
 }
+
+/**
+ * Re-reads config.json into the process-wide context.
+ *
+ * `bootstrap()` snapshots the config once, which is wrong for any command
+ * that *writes* config during its own run — first-time sign-in is exactly
+ * that. Without this, a run that signs in and chooses, say, a local AI
+ * provider would spend the rest of that same process with `ctx.config`
+ * still holding the pre-login value (usually `null`), silently falling back
+ * to the default provider until the next invocation. Call this immediately
+ * after any code path that persists a new config.
+ */
+export function reloadConfig(ctx: CliContext = bootstrap()): Config | null {
+  ctx.config = loadConfig();
+  return ctx.config;
+}
+
+/** Test seam: drops the process-wide singletons so the next bootstrap() rebuilds them. */
+export function resetBootstrapForTesting(): void {
+  cached = null;
+}

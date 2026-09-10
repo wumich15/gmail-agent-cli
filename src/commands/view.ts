@@ -38,7 +38,7 @@ const DEFAULT_PAGE_SIZE = 20;
 const PAGE_SIZE_STEPS = [5, 10, 20, 50, 100] as const;
 
 const LIST_CONTROLS =
-  "↑/↓ select · enter open · type email number to open · d delete highlighted row · " +
+  "↑/↓ select · enter open · type email number to open · d delete highlighted row · dd delete it without asking · " +
   "<n> r/;r/d reply/AI-reply/delete without opening it · " +
   "←/→ page · [ ] history · esc home · +/- size · l <n> · f filter · s search · c/a compose · " +
   ";s refresh writing style · ;u undo last delete · u refresh · q quit";
@@ -373,6 +373,29 @@ export async function runView(options: ViewOptions): Promise<number> {
         notice = `Restored "${toRestore.subject || "(no subject)"}".`;
       } catch (error) {
         notice = `Could not undo: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      continue;
+    }
+    if (cmd === "dd") {
+      // "dd" — the same delete as "d" on the highlighted row, with the
+      // confirmation skipped, for clearing a run of junk quickly. Deleting
+      // still means Gmail's Trash, never a permanent delete, and is still
+      // undoable both from Gmail and, for the last one this session, with
+      // ";u" — which is precisely what makes skipping the question
+      // acceptable here when skipping a *send* confirmation never is.
+      //
+      // No "press any key" pause either: the point is speed, so the result
+      // is carried as a notice and printed by the next render instead. The
+      // cursor stays on the same row number, which after the list shifts up
+      // is the following message — so repeating "dd" walks down the list.
+      if (pageItems.length > 0) {
+        const target = pageItems[selectedRow]!;
+        const trashed = await trashCached(gmailClient, messagesRepo, target);
+        if (trashed) {
+          lastTrashed = trashed;
+          notice = `Moved "${trashed.subject || "(no subject)"}" to Trash. ";u" undoes it.`;
+          all = messagesRepo.listForAccount(account.accountHash);
+        }
       }
       continue;
     }
@@ -769,10 +792,30 @@ async function confirmAndTrash(
     console.log(pc.dim("Not deleted."));
     return null;
   }
+  const trashed = await trashCached(gmailClient, messagesRepo, cached);
+  if (trashed) console.log(pc.green('Moved to Trash. Type ";u" to undo.'));
+  return trashed;
+}
+
+/**
+ * The Trash move itself, with no prompting and no output of its own.
+ *
+ * Separated from `confirmAndTrash` so the unprompted "dd" path and the
+ * confirmed "d" path cannot diverge on what deleting actually does: the
+ * same reversible `messages.trash`, the same immediate local-cache
+ * eviction, and the same returned record that makes ";u" able to undo it.
+ * Only the question in front of it differs. Returns null on failure after
+ * reporting it, so a caller never records an undo for a delete that did
+ * not happen.
+ */
+export async function trashCached(
+  gmailClient: GmailClient,
+  messagesRepo: MessagesRepository,
+  cached: CachedMessageRecord
+): Promise<CachedMessageRecord | null> {
   try {
     await trashMessage(gmailClient, cached.gmailMessageId);
     messagesRepo.delete(cached.accountHash, cached.gmailMessageId);
-    console.log(pc.green('Moved to Trash. Type ";u" to undo.'));
     return cached;
   } catch (error) {
     console.error(pc.red(`Failed to move to Trash: ${error instanceof Error ? error.message : String(error)}`));

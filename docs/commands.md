@@ -15,13 +15,15 @@ This reference describes the commands currently registered in `src/cli.ts`. For 
 | `gmail uncache` | Clear the local scan cache after confirmation. |
 | `gmail view` | Browse messages, read, compose, reply, and move messages to Trash in the terminal. |
 | `gmail send` | Interactively compose and confirm one new email. |
+| `gmail setup` | Connect or reconnect Gmail, choose how AI works, or disconnect. Touches no mail. |
+| `gmail ui` | Open the same setup, command reference, and status in a local browser page. |
 | `gmail help` | Show command help and inbox controls. |
 | `gmail help <command>` | Show help for one command. |
 | `gmail --version` | Print the installed CLI version. |
 
 All commands support `-h` / `--help`. The version shortcut is `-V`.
 
-`gmail`, `gmail cache`, `gmail view`, and `gmail send` start browser sign-in if needed. `add`, `category`, and `uncache` require an existing sign-in. One Google account is supported at a time.
+`gmail`, `gmail cache`, `gmail view`, and `gmail send` start browser sign-in if needed. `add`, `category`, and `uncache` require an existing sign-in. One Google account is supported at a time. `gmail setup` and `gmail ui` are the places to connect, reconnect, disconnect, or change the AI setting deliberately, without any mailbox work happening as a side effect.
 
 **Bare `gmail` applies changes without a separate approval prompt after the scan. Start with `gmail --dry-run` to review its behavior.** The root `--dry-run` and `--json` options apply to the bare cleanup command only; they do not make other commands read-only or change their output format.
 
@@ -58,6 +60,10 @@ Without an AI credential, cleanup runs in rules-only mode. That still permits na
 Dry runs still read Gmail, consume API quota, and call the configured AI provider. First-time sign-in stores credentials and configuration, and normal local logging still occurs. Dry runs do not advance the cleanup checkpoint or save planned mailbox actions.
 
 After a complete initial snapshot, later runs use Gmail history plus cached messages that need evaluation. An expired checkpoint triggers a full snapshot. A `gmail cache` snapshot can seed this process, but uncategorized cached messages still need a subsequent live cleanup assessment.
+
+**Cache-first.** If the cache was refreshed within the last 15 minutes — by `gmail cache`, or by a `gmail view` session that has been refreshing itself, whichever happened later — and there is already queued work, the run skips the "what changed in Gmail?" check and works straight through that queue. It says so on stderr. Each queued message is still fetched live before it is classified, because bodies are never stored. The sync checkpoint is left where it was, so the next run still picks up anything that arrived in the meantime; nothing is skipped, only deferred.
+
+The first cleanup on an account also builds a reply-protection index of the threads you have sent mail on, which requires paging your Sent mail once and can take a while on a large mailbox. It is saved locally, so later runs only look for newly sent messages.
 
 For scripted JSON output, complete sign-in first: interactive first-run prompts are not a JSON interface.
 
@@ -169,6 +175,7 @@ Type commands and press **Enter**, except for arrow keys and Escape, which act i
 | `<n> ;r` | Start an AI reply to message `n`. |
 | `<n> d` | Confirm moving message `n` to Trash without fetching its body. |
 | `d` | Confirm moving the highlighted message to Trash. |
+| `dd` | Move the highlighted message to Trash **with no confirmation**, and stay in the list. The cursor keeps its row number, so it lands on the next message and repeating `dd` deletes down the list. |
 | Left / Right | Previous / next page. |
 | `p` / `n` | Previous / next page. |
 | `[` / `]` | Back / forward through previous page, size, search, and filter views. |
@@ -206,6 +213,8 @@ Links are shortened for display and are clickable in terminals that support hype
 
 **Delete means move to Gmail Trash, and its confirmation defaults to Yes.** A successful delete removes the row from the local list immediately. Use `;u` from the list to undo the most recent session delete, or restore messages through Gmail's Trash. The session undo does not reverse cleanup runs or earlier sessions.
 
+`dd` performs the same Trash move with no question asked. It exists because deleting is reversible twice over — from Gmail's own Trash, and from `;u` for the most recent one this session — which is exactly what a send confirmation is not, and why no equivalent shortcut exists for sending. `;u` holds one message, so `dd` twice in a row leaves only the second recoverable in-session; both remain in Gmail's Trash.
+
 ## New email: `gmail send`
 
 ```sh
@@ -235,6 +244,57 @@ AI drafts are displayed locally for review; this workflow does not save a draft 
 
 AI drafting requires the currently supported provider configuration and credential described in the [README](../README.md). When no AI credential is available, use manual composition/replies.
 
+## Setup: `gmail setup`
+
+```sh
+gmail setup
+```
+
+Interactive, with no options. Shows the connected account and timezone, explains what each requested Google permission is used for, reports whether AI would actually work right now, and offers exactly one action at a time:
+
+- **Connect / Reconnect Gmail** — runs the same browser sign-in as a first run. Use it after revoking access, changing the account password, or switching Google accounts. Connecting never starts a cleanup.
+- **Change how AI works** — see below.
+- **Disconnect** — revokes the grant with Google where possible and erases this computer's stored credentials. It then asks separately whether to keep local non-secret run and rule history; keeping it is the default.
+
+Nothing in this command reads or changes mail.
+
+### Choosing how AI works
+
+Three options, each shown with its cost and requirements before it is selectable:
+
+| Option | What it needs | Where mail is processed |
+| --- | --- | --- |
+| Local model | Ollama installed and running, plus one pulled model (roughly 2–5 GB of disk and several GB of RAM). No account, no payment. | Entirely on this computer. No message text leaves the machine. |
+| Your own OpenAI API key | An OpenAI account and key that you create and pay for per use. | Selected message text (never attachments) is sent to the OpenAI API. |
+| No AI — rules only | Nothing. | Nowhere. Native spam, your rules, and archiving of read mail still work. |
+
+The local option is the one that satisfies "real AI without managing an API key". A key, if you choose that option, is typed without being echoed and stored in the operating system's credential store — never in `config.json`, a log line, a command-line flag, or shell history.
+
+Choosing an option that is not currently usable (for example, selecting the local model before installing Ollama) is saved but reported honestly: runs fall back to rules-only mode until the runtime is actually reachable, and `gmail setup` says so.
+
+## Browser interface: `gmail ui`
+
+```sh
+gmail ui
+gmail ui --port 8123
+gmail ui --no-open
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--port <n>` | OS-assigned | Listen on a specific port. Must be a positive whole number. |
+| `--no-open` | Off | Print the URL instead of opening a browser. |
+
+Serves three plain pages — **Setup**, **Commands**, **Status** — for as long as the command runs. Stopping the command (Ctrl+C) stops the server.
+
+- The listener binds `127.0.0.1` only, so nothing on the network can reach it.
+- The launch URL carries a session key generated fresh for each run. The page keeps it in memory and removes it from the address bar, and it stops working when the command exits.
+- The command reference works without signing in. Account operations require the session key.
+- No Google token and no AI key is ever sent to the browser. The page asks this local process to perform named operations; the process holds the credentials.
+- **Preview** and **Run cleanup** are separate actions, and cleanup stays disabled until a preview has been produced. Finishing sign-in never starts a run.
+
+Composing and sending mail is not exposed in the browser pages; that stays in `gmail view` and `gmail send`, where the exact-message confirmation lives.
+
 ## Help, output, and exit status
 
 ```sh
@@ -242,6 +302,8 @@ gmail help
 gmail help add
 gmail help cache
 gmail help view
+gmail help setup
+gmail help ui
 gmail send --help
 gmail --version
 ```
@@ -256,4 +318,4 @@ gmail --version
 
 `gmail send` currently returns `0` even when a compose flow is cancelled or a send failure is caught and displayed. Check its `Sent.` / `Not sent.` / error message; exit zero alone does not prove delivery. Interactive inbox actions also display individual errors without necessarily making the eventual session exit fail.
 
-The following names have implementations or historical documentation but are **not registered public commands**: `gmail work`, `gmail auth`, `gmail config`, `gmail doctor`, `gmail rules`, `gmail summary`, `gmail undo`, `gmail spam`, and `gmail important`. Use bare `gmail`, `gmail add spam`, and `gmail add important` as documented above. There is currently no command for account switching, logout, general action undo, or rule management.
+The following names have implementations or historical documentation but are **not registered public commands**: `gmail work`, `gmail auth`, `gmail config`, `gmail doctor`, `gmail rules`, `gmail summary`, `gmail undo`, `gmail spam`, and `gmail important`. Use bare `gmail`, `gmail add spam`, and `gmail add important` as documented above. Account switching, disconnecting, and reconnecting are available through `gmail setup` and the `gmail ui` Setup page. There is still no public command for general action undo or rule management.

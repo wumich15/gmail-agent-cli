@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { dirname } from "node:path";
 import { configFilePath } from "./paths.js";
-import { defaultConfig, parseConfig, type Config } from "./schema.js";
+import { defaultConfig, migrateConfig, parseConfig, type Config } from "./schema.js";
 import { InvalidConfigError } from "../core/errors.js";
 
 export function loadConfig(path: string = configFilePath()): Config | null {
@@ -14,11 +14,27 @@ export function loadConfig(path: string = configFilePath()): Config | null {
   } catch (error) {
     throw new InvalidConfigError(`Config file at ${path} is not valid JSON: ${String(error)}`);
   }
+  let parsed: Config;
   try {
-    return parseConfig(raw);
+    parsed = parseConfig(raw);
   } catch (error) {
     throw new InvalidConfigError(`Config file at ${path} failed validation: ${String(error)}`);
   }
+  // Upgrade in place so the meaning of a field never depends on which
+  // version of the app happened to write the file (see `migrateConfig`).
+  // A read-only filesystem must not make the app unusable, so a failed
+  // write-back is tolerated: the migrated value is still returned and the
+  // upgrade is simply retried on the next read.
+  const migrated = migrateConfig(parsed);
+  if (!migrated) {
+    return parsed;
+  }
+  try {
+    saveConfig(migrated, path);
+  } catch {
+    // Intentionally ignored; see above.
+  }
+  return migrated;
 }
 
 export function saveConfig(config: Config, path: string = configFilePath()): void {

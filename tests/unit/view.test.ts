@@ -10,7 +10,8 @@ const {
   parseQuickActionCommand,
   shortenLinksForDisplay,
   terminalHyperlink,
-  openUrlInBrowser
+  openUrlInBrowser,
+  trashCached
 } = await import("../../src/commands/view.js");
 
 function row(id: string, labels: string[], subject: string, sender: string): CachedMessageRecord {
@@ -152,5 +153,47 @@ describe("gmail view page sizing", () => {
     expect(adjustPageSize(1, "smaller")).toBe(1);
     expect(adjustPageSize(500, "larger")).toBe(500);
     expect(adjustPageSize(800, "larger")).toBe(800);
+  });
+});
+
+
+describe("unprompted delete (\"dd\")", () => {
+  function harness(trashImpl: () => Promise<unknown> = () => Promise.resolve({})) {
+    const trash = vi.fn(trashImpl);
+    const client = { users: { messages: { trash } } };
+    const repo = { delete: vi.fn() };
+    return { client, repo, trash };
+  }
+
+  it("moves the message to Trash and evicts the local row, returning the record that makes \";u\" work", async () => {
+    const { client, repo, trash } = harness();
+    const message = row("m1", ["INBOX"], "Junk", "Store");
+
+    // No prompt module is involved at all: this path asks nothing.
+    const result = await trashCached(client as never, repo as never, message);
+
+    expect(result).toBe(message);
+    expect(trash).toHaveBeenCalledWith({ userId: "me", id: "m1" }, expect.anything());
+    expect(repo.delete).toHaveBeenCalledWith("account", "m1");
+  });
+
+  it("never reaches a permanent-delete endpoint", async () => {
+    const trash = vi.fn().mockResolvedValue({});
+    const del = vi.fn();
+    const batchDelete = vi.fn();
+    const client = { users: { messages: { trash, delete: del, batchDelete } } };
+    await trashCached(client as never, { delete: vi.fn() } as never, row("m1", ["INBOX"], "Junk", "Store"));
+    expect(del).not.toHaveBeenCalled();
+    expect(batchDelete).not.toHaveBeenCalled();
+  });
+
+  it("records no undo and keeps the cached row when Gmail rejects the delete", async () => {
+    const { client, repo } = harness(() => Promise.reject(new Error("permission denied")));
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    const result = await trashCached(client as never, repo as never, row("m1", ["INBOX"], "Junk", "Store"));
+
+    expect(result).toBeNull();
+    expect(repo.delete).not.toHaveBeenCalled();
   });
 });

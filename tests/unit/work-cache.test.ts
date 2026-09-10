@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
-import { selectCachedBacklogStubs, type CurrentCacheVersions } from "../../src/commands/work.js";
+import { afterEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { latestCacheRefreshAt, selectCachedBacklogStubs, type CurrentCacheVersions } from "../../src/commands/work.js";
+import { openDatabase, type GmailAgentDatabase } from "../../src/state/database.js";
+import { SETTING_KEYS, SettingsRepository } from "../../src/state/repositories/settings.js";
 import type { CachedMessageRecord } from "../../src/state/repositories/messages.js";
 
 const versions: CurrentCacheVersions = {
@@ -67,5 +72,53 @@ describe("selectCachedBacklogStubs", () => {
       { id: "stale", threadId: "t1" },
       { id: "event", threadId: "t1" }
     ]);
+  });
+});
+
+describe("latestCacheRefreshAt", () => {
+  const directories: string[] = [];
+
+  function freshDatabase(): GmailAgentDatabase {
+    const directory = mkdtempSync(join(tmpdir(), "gmail-work-cache-"));
+    directories.push(directory);
+    const db = openDatabase(join(directory, "state.sqlite"));
+    db.prepare(
+      `INSERT INTO accounts (account_hash, email_display, timezone, history_marker, setup_complete,
+                             automation_enabled, created_at, updated_at)
+       VALUES ('acct', NULL, 'UTC', NULL, 1, 0, '2026-09-09T00:00:00.000Z', '2026-09-09T00:00:00.000Z')`
+    ).run();
+    return db;
+  }
+
+  afterEach(() => {
+    while (directories.length > 0) rmSync(directories.pop()!, { recursive: true, force: true });
+  });
+
+  it("reports nothing when the cache has never been refreshed", () => {
+    const db = freshDatabase();
+    expect(latestCacheRefreshAt(db, "acct")).toBeNull();
+    db.close();
+  });
+
+  it("prefers a view session's refresh over an older gmail cache run, and vice versa", () => {
+    const db = freshDatabase();
+    const settings = new SettingsRepository(db);
+
+    // A view session that has been syncing itself is the more recent truth
+    // about staleness, even though `gmail cache` owns the other timestamp.
+    settings.set("acct", SETTING_KEYS.cacheLastRunAt, "2026-09-09T01:00:00.000Z", "now");
+    settings.set("acct", SETTING_KEYS.viewLastRefreshAt, "2026-09-09T03:00:00.000Z", "now");
+    expect(latestCacheRefreshAt(db, "acct")).toBe("2026-09-09T03:00:00.000Z");
+
+    settings.set("acct", SETTING_KEYS.cacheLastRunAt, "2026-09-09T04:00:00.000Z", "now");
+    expect(latestCacheRefreshAt(db, "acct")).toBe("2026-09-09T04:00:00.000Z");
+    db.close();
+  });
+
+  it("uses whichever single timestamp exists", () => {
+    const db = freshDatabase();
+    new SettingsRepository(db).set("acct", SETTING_KEYS.viewLastRefreshAt, "2026-09-09T02:00:00.000Z", "now");
+    expect(latestCacheRefreshAt(db, "acct")).toBe("2026-09-09T02:00:00.000Z");
+    db.close();
   });
 });
