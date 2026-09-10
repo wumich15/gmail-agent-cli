@@ -1,6 +1,8 @@
-# Gmail Agent CLI: a top-down guide
+# Archived design: Gmail Agent CLI
 
-This document explains the program specified by [`CLAUDE.md`](CLAUDE.md). It is self-contained: you should be able to understand the system with basic coding knowledge and without reading the source code first.
+> Historical design material, preserved for context. This guide predates the current CLI and includes unimplemented commands and outdated behavior, including its statements about composing and sending mail. Do not use it for setup or operational instructions. Read the [current README](../../README.md) and [command reference](../commands.md) instead.
+
+This document records an earlier intended design. It is self-contained and does not require local internal planning notes.
 
 The guide describes the intended completed program. It is an architectural and behavioral explanation, not a report on which pieces happen to be implemented in the current checkout.
 

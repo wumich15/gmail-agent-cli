@@ -9,3 +9,9 @@ dist/
 *.sqlite-wal
 *.sqlite-shm
 coverage/
+
+# Local project notes (case-insensitive spellings; keep on disk, out of Git).
+/[Cc][Ll][Aa][Uu][Dd][Ee].[Mm][Dd]
+/[Aa][Rr][Cc][Hh][Ii][Tt][Ee][Cc][Tt][Uu][Rr][Ee].[Mm][Dd]
+/[Ee][Xx][Pp][Ll][Aa][Ii][Nn][Ee][Rr].[Mm][Dd]
+/[Pp][Ll][Aa][Nn].[Mm][Dd]
