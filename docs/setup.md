@@ -4,6 +4,12 @@ This tool runs entirely on your computer. There is no server, no hosted
 account, and nobody else's credentials in the path — which means you connect it
 to Google yourself, once, with a Google app that belongs to you.
 
+**The short version:** install the tool and run `gmail install`. It walks these
+same steps interactively, opening each Google page for you and collecting what
+it needs, and finishes with a preview that changes nothing. This page is the
+written form of that wizard — useful if you would rather see every field named
+first, or if something went wrong.
+
 Budget about ten minutes. You do this once per computer.
 
 ## Why you have to do this at all
@@ -76,7 +82,8 @@ Google shows you a **client ID** (ending in `.apps.googleusercontent.com`) and a
 Either in the terminal:
 
 ```sh
-gmail setup
+gmail install    # the guided wizard, or:
+gmail setup      # the same prompts, from the settings menu
 ```
 
 …which asks for the client ID and secret, then opens Google sign-in. Or in the
@@ -140,8 +147,8 @@ confirming that exact message first.
 
 ## Troubleshooting
 
-**"This computer has no Google OAuth client yet"** — step 5 hasn't happened, or
-the saved file was deleted. Run `gmail setup`.
+**"This computer isn't set up yet"** — step 5 hasn't happened, or the saved
+file was deleted. Run `gmail install`.
 
 **"Access blocked: this app's request is invalid"** — the consent screen is
 missing one of the two scopes, or the client is not of type *Desktop app*.

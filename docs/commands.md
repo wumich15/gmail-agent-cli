@@ -113,6 +113,23 @@ Creates each named Gmail label immediately, with no confirmation prompt. Existin
 
 There are no command-specific options. The command's current success text mentions a ten-message threshold for future reuse; existing labels actually bypass that threshold in the cleanup implementation.
 
+## Guided setup: `gmail install`
+
+```sh
+gmail install
+```
+
+The first command to run after installing. It checks this machine, walks the
+Google Cloud console steps (opening each page for you), collects your Desktop
+OAuth client ID and secret, signs you in, asks how AI should work, and ends
+with a dry run.
+
+Every step detects what is already configured and offers to keep it, so it is
+safe to re-run after an interruption — it never undoes working configuration.
+The run it finishes with is always a dry run: completing setup must not be what
+first changes your mailbox. Requires an interactive terminal, and exits with
+code `3` if stdin is not a TTY.
+
 ## Snapshot: `gmail cache`
 
 ```sh

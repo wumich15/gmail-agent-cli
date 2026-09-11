@@ -8,7 +8,7 @@ import {
 } from "../../src/unsubscribe/safe-http.js";
 
 describe("unsubscribe header parsing and safe-http validation", () => {
-  it("preserves all 16 scenarios", async () => {
+  it("preserves all 17 scenarios", async () => {
     await runScenarios([
       { name: "parses both an https URL and a mailto in one List-Unsubscribe header", run: () => {
         const result = parseListUnsubscribeHeader(
@@ -63,6 +63,13 @@ describe("unsubscribe header parsing and safe-http validation", () => {
         expect(isPrivateOrReservedIp("192.168.1.1")).toBe(true);
         expect(isPrivateOrReservedIp("169.254.1.1")).toBe(true);
         expect(isPrivateOrReservedIp("93.184.216.34")).toBe(false);
+      } },
+      { name: "isPrivateOrReservedIp flags the IPv6 unspecified address, which reaches the local host", run: () => {
+        expect(isPrivateOrReservedIp("::")).toBe(true);
+        expect(isPrivateOrReservedIp("0:0:0:0:0:0:0:0")).toBe(true);
+        expect(isPrivateOrReservedIp("::1")).toBe(true);
+        expect(isPrivateOrReservedIp("fd00::1")).toBe(true);
+        expect(isPrivateOrReservedIp("2606:2800:220:1:248:1893:25c8:1946")).toBe(false);
       } },
       { name: "isPrivateOrReservedIp flags RFC 6598 shared address space (carrier-grade NAT), a common SSRF-checklist gap", run: () => {
         expect(isPrivateOrReservedIp("100.64.0.1")).toBe(true);

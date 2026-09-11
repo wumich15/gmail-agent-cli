@@ -1,10 +1,15 @@
 import { reloadConfig, type CliContext } from "../core/bootstrap.js";
 import { AccountsRepository } from "../state/repositories/accounts.js";
 import { CREDENTIAL_KEYS } from "../auth/credential-store.js";
-import { isInvalidGrantError, resolveOAuthClientCredentials, oauthClientFromRefreshToken } from "../auth/google-oauth.js";
+import {
+  isInvalidGrantError,
+  oauthClientConfigured,
+  oauthClientFromRefreshToken,
+  resolveOAuthClientCredentials
+} from "../auth/google-oauth.js";
 import { createGmailClient, type GmailClient } from "../gmail/client.js";
 import { createCalendarClient, type CalendarClient } from "../calendar/client.js";
-import { AuthRequiredError } from "../core/errors.js";
+import { AuthRequiredError, InvalidConfigError } from "../core/errors.js";
 import { authLogin } from "./auth.js";
 import type { AccountRecord } from "../core/models.js";
 import type { OAuth2Client } from "google-auth-library";
@@ -92,6 +97,17 @@ export async function resolveAccountSigningInIfNeeded(ctx: CliContext): Promise<
     await assertCredentialsUsable(ctx, resolved);
     return resolved;
   } catch (error) {
+    // Nothing is set up yet: there is no Google app to sign in *with*, so
+    // falling through to an inline sign-in would open a browser flow that
+    // cannot possibly succeed. Point at the wizard instead of reprinting a
+    // console walkthrough in the middle of a command the user thought would
+    // just clean their inbox.
+    if (!oauthClientConfigured()) {
+      throw new InvalidConfigError(
+        "This computer isn't set up yet. Run `gmail install` — it walks through creating your own " +
+          "Google app, signing in, and choosing how AI works, and changes no mail."
+      );
+    }
     if (!(error instanceof AuthRequiredError)) {
       throw error;
     }

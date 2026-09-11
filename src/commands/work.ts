@@ -37,7 +37,7 @@ import { loadSentThreadIndex } from "../gmail/sent-index.js";
 import { contentHash } from "../core/ids.js";
 import type { CachedAssessmentSnapshot } from "../core/orchestrator.js";
 import type { GmailAgentDatabase } from "../state/database.js";
-import type { AutomaticSpamRuleCandidate, MessageOutcome } from "../summary/build-summary.js";
+import { buildRunSummary, type AutomaticSpamRuleCandidate, type MessageOutcome } from "../summary/build-summary.js";
 import type { PolicyActionIntent } from "../core/policy.js";
 import type { ActionType, PlannedAction, ReasonCode } from "../core/models.js";
 import { createClassifierProgress, createReadProgress } from "./progress.js";
@@ -189,6 +189,70 @@ function createAutomaticSpamRules(
     created.push({ categoryName: candidate.categoryName, count: messageIds.size });
   }
   return created;
+}
+
+/**
+ * Reason codes for the two actions that exist only because a Calendar event
+ * was created for this message (see orchestrator.ts). If the event insert
+ * does not actually succeed, both must be withdrawn: labeling mail
+ * "Calendar" and pulling it out of the Inbox tells the user a durable record
+ * exists somewhere, and filing a commitment away on the strength of a record
+ * that was never written is how one silently disappears.
+ */
+export const CALENDAR_CONSEQUENCE_REASON_CODES = ["calendar_label:Calendar", "calendar_archive"] as const;
+
+/** Drops the Calendar-driven label/archive when the event was not created. */
+export function actionsAfterCalendarOutcome(
+  actions: readonly PolicyActionIntent[],
+  eventCreated: boolean
+): readonly PolicyActionIntent[] {
+  if (eventCreated) return actions;
+  return actions.filter(
+    (action) => !(CALENDAR_CONSEQUENCE_REASON_CODES as readonly string[]).includes(action.reasonCode)
+  );
+}
+
+export interface AppliedActionResults {
+  trashedMessageIds: ReadonlySet<string>;
+  labelMutatedMessageIds: ReadonlySet<string>;
+  calendarCreatedMessageIds: ReadonlySet<string>;
+  /** Messages whose Calendar-driven label/archive was withdrawn (see actionsAfterCalendarOutcome). */
+  calendarFailedMessageIds: ReadonlySet<string>;
+}
+
+/**
+ * Rewrites the planned outcomes into what a run actually did, so the printed
+ * summary reports applied actions rather than intentions.
+ *
+ * The summary is the user's only account of what happened to their mail. A
+ * Gmail batch that Gmail rejected must not still be reported as "Trashed
+ * (168)" merely because it was planned — the run prints a failure count, but
+ * a reader reconciling their inbox against the summary would be looking for
+ * messages that are still sitting there. Review flags are left untouched:
+ * they describe the classification, not the write.
+ */
+export function outcomesAsApplied(
+  outcomes: readonly MessageOutcome[],
+  results: AppliedActionResults
+): MessageOutcome[] {
+  return outcomes.map((outcome) => {
+    const id = outcome.gmailMessageId;
+    const surviving = actionsAfterCalendarOutcome(
+      outcome.decision.actions,
+      !results.calendarFailedMessageIds.has(id)
+    );
+    const actions = surviving.filter((action) => {
+      switch (action.type) {
+        case "trash":
+          return results.trashedMessageIds.has(id);
+        case "calendar_create":
+          return results.calendarCreatedMessageIds.has(id);
+        default:
+          return results.labelMutatedMessageIds.has(id);
+      }
+    });
+    return { ...outcome, decision: { ...outcome.decision, actions } };
+  });
 }
 
 /** `labelIdByName` must already hold an entry for every label action's name (lowercased) before this is called. */
@@ -462,6 +526,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
 
     let runId: string | undefined;
     let failureCount = summary.failureCount;
+    let appliedSummary: typeof summary | null = null;
 
     if (!options.dryRun) {
       runId = newRunId();
@@ -560,18 +625,14 @@ export async function runWork(options: WorkOptions): Promise<number> {
         }
       }
 
-      const labelTargets: { messageId: string; mutation: ReturnType<typeof mutationForActions> }[] = [];
-      for (const outcome of nonTrashOutcomes) {
-        const mutation = mutationForActions(outcome.decision.actions, labelIdByName);
-        if (mutation.addLabelIds.length > 0 || mutation.removeLabelIds.length > 0) {
-          labelTargets.push({ messageId: outcome.gmailMessageId, mutation });
-        }
-      }
-
       // Moves this message's action-ledger rows of the given type(s) to a
       // new status. A row already reconciled to a terminal status by
       // upsertPlanned's own guard is simply re-set here, which is fine
       // since this function is the one actually executing right now.
+      // Rows that were planned but deliberately withdrawn before execution
+      // (a Calendar label/archive whose event never got created). They must
+      // not be swept back to "applied" by the type-based marking below.
+      const retractedActionKeys = new Set<string>();
       const markActions = (
         messageId: string,
         types: readonly ActionType[],
@@ -579,7 +640,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
         errorClass: string | null = null
       ): void => {
         for (const row of actionsByMessageId.get(messageId) ?? []) {
-          if (types.includes(row.type)) {
+          if (types.includes(row.type) && !retractedActionKeys.has(row.actionKey)) {
             actionsRepo.updateStatus(row.actionKey, status, ctx.clock.nowIso(), errorClass);
           }
         }
@@ -594,7 +655,11 @@ export async function runWork(options: WorkOptions): Promise<number> {
       // any label change made concurrently by the user.
       diagnosticsLog.phase("trash_writes");
       const survivingTrash = trashTargets;
-      const reconciliationTotal = survivingTrash.length + labelTargets.length;
+      // Counted from non-Trash outcomes rather than the built labelTargets:
+      // those cannot be built until the Calendar writes below have decided
+      // which calendar-driven labels survive, but progress has to be sized
+      // before the first mutation goes out.
+      const reconciliationTotal = survivingTrash.length + nonTrashOutcomes.length;
       if (reconciliationTotal > 0) readProgress.onPhase("applying", reconciliationTotal);
 
       const successfullyTrashed = new Set<string>();
@@ -613,33 +678,6 @@ export async function runWork(options: WorkOptions): Promise<number> {
         readProgress.onProgress(survivingTrash.length, reconciliationTotal, trashResult.failedMessageIds.length);
       }
 
-      for (const { messageId } of labelTargets) {
-        markActions(messageId, ["star", "mark_important", "archive", "label"], "applying");
-      }
-      diagnosticsLog.phase("label_writes");
-      const labelResult = await applyGroupedLabelMutations(gmailClient, labelTargets);
-      for (const messageId of labelResult.succeededMessageIds) {
-        markActions(messageId, ["star", "mark_important", "archive", "label"], "applied");
-      }
-      for (const messageId of labelResult.failedMessageIds) {
-        markActions(messageId, ["star", "mark_important", "archive", "label"], "failed_retryable", "gmail_api_error");
-        failureCount += 1;
-      }
-      if (reconciliationTotal > 0) {
-        readProgress.onProgress(
-          reconciliationTotal,
-          reconciliationTotal,
-          trashResult.failedMessageIds.length + labelResult.failedMessageIds.length
-        );
-        readProgress.onFinish(trashResult.failedMessageIds.length === 0 && labelResult.failedMessageIds.length === 0);
-      }
-      const outcomeByMessageId = new Map(outcomes.map((outcome) => [outcome.gmailMessageId, outcome] as const));
-      const successfullyArchived = new Set(
-        labelResult.succeededMessageIds.filter((messageId) =>
-          outcomeByMessageId.get(messageId)?.decision.actions.some((action) => action.type === "archive")
-        )
-      );
-
       diagnosticsLog.phase("calendar_writes");
       // Calendar creation: only for outcomes whose event candidate already
       // passed real-code date/shape validation (see orchestrator.ts). The
@@ -647,8 +685,16 @@ export async function runWork(options: WorkOptions): Promise<number> {
       // repeat for the same message/candidate never creates a duplicate.
       const calendarLinksRepo = new CalendarLinksRepository(ctx.db);
       let calendarCreated = 0;
+      // Messages whose event did not actually get created. Their "Calendar"
+      // label and out-of-Inbox archive are a 1:1 consequence of a real event
+      // (see orchestrator.ts), so without the event they must not be applied:
+      // filing mail away as if a durable record exists, when it does not, is
+      // how a commitment silently disappears.
+      const calendarFailedMessageIds = new Set<string>();
+      const calendarCreatedMessageIds = new Set<string>();
+      const trashedMessageIdSet = new Set(survivingTrash);
       for (const outcome of outcomes) {
-        if (!outcome.validatedEvent || survivingTrash.includes(outcome.gmailMessageId)) {
+        if (!outcome.validatedEvent || trashedMessageIdSet.has(outcome.gmailMessageId)) {
           continue;
         }
         markActions(outcome.gmailMessageId, ["calendar_create"], "applying");
@@ -674,6 +720,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
               createdAt: ctx.clock.nowIso()
             });
             markActions(outcome.gmailMessageId, ["calendar_create"], "applied");
+            calendarCreatedMessageIds.add(outcome.gmailMessageId);
             calendarCreated += 1;
           } else if (insertResult.kind === "collision") {
             calendarLinksRepo.upsert({
@@ -689,18 +736,92 @@ export async function runWork(options: WorkOptions): Promise<number> {
             // A different app-owned event already holds this deterministic
             // ID with different provenance: needs human review, not a retry.
             markActions(outcome.gmailMessageId, ["calendar_create"], "failed_terminal", "calendar_id_collision");
+            calendarFailedMessageIds.add(outcome.gmailMessageId);
             failureCount += 1;
           } else {
             // ambiguous_retry: the remote result genuinely cannot be known
             // from this response. Never guess; the same deterministic ID is
             // safe to retry on a later run.
             markActions(outcome.gmailMessageId, ["calendar_create"], "unknown_no_retry", "ambiguous_insert_result");
+            calendarFailedMessageIds.add(outcome.gmailMessageId);
           }
         } catch {
           markActions(outcome.gmailMessageId, ["calendar_create"], "failed_retryable", "calendar_api_error");
+          calendarFailedMessageIds.add(outcome.gmailMessageId);
           failureCount += 1;
         }
       }
+
+      // A retracted row is recorded as skipped rather than left dangling in
+      // "planned", so the ledger says what actually happened to it.
+      for (const messageId of calendarFailedMessageIds) {
+        for (const row of actionsByMessageId.get(messageId) ?? []) {
+          if ((CALENDAR_CONSEQUENCE_REASON_CODES as readonly string[]).includes(row.reasonCode)) {
+            retractedActionKeys.add(row.actionKey);
+            actionsRepo.updateStatus(row.actionKey, "skipped_conflict", ctx.clock.nowIso(), "calendar_event_not_created");
+          }
+        }
+      }
+
+      // Built only after the Calendar writes above, because an event that
+      // failed to be created retracts the label/archive it would have earned.
+      const labelTargets: { messageId: string; mutation: ReturnType<typeof mutationForActions> }[] = [];
+      for (const outcome of nonTrashOutcomes) {
+        const actions = actionsAfterCalendarOutcome(
+          outcome.decision.actions,
+          !calendarFailedMessageIds.has(outcome.gmailMessageId)
+        );
+        const mutation = mutationForActions(actions, labelIdByName);
+        if (mutation.addLabelIds.length > 0 || mutation.removeLabelIds.length > 0) {
+          labelTargets.push({ messageId: outcome.gmailMessageId, mutation });
+        }
+      }
+
+      for (const { messageId } of labelTargets) {
+        markActions(messageId, ["star", "mark_important", "archive", "label"], "applying");
+      }
+      diagnosticsLog.phase("label_writes");
+      const labelResult = await applyGroupedLabelMutations(gmailClient, labelTargets);
+      for (const messageId of labelResult.succeededMessageIds) {
+        markActions(messageId, ["star", "mark_important", "archive", "label"], "applied");
+      }
+      for (const messageId of labelResult.failedMessageIds) {
+        markActions(messageId, ["star", "mark_important", "archive", "label"], "failed_retryable", "gmail_api_error");
+        failureCount += 1;
+      }
+      if (reconciliationTotal > 0) {
+        readProgress.onProgress(
+          reconciliationTotal,
+          reconciliationTotal,
+          trashResult.failedMessageIds.length + labelResult.failedMessageIds.length
+        );
+        readProgress.onFinish(trashResult.failedMessageIds.length === 0 && labelResult.failedMessageIds.length === 0);
+      }
+      const outcomeByMessageId = new Map(outcomes.map((outcome) => [outcome.gmailMessageId, outcome] as const));
+      // An archive only counts when it was actually part of the mutation
+      // sent: a message whose Calendar event failed had its calendar-driven
+      // archive retracted above, so it is still in the Inbox.
+      const successfullyArchived = new Set(
+        labelResult.succeededMessageIds.filter((messageId) =>
+          outcomeByMessageId
+            .get(messageId)
+            ?.decision.actions.some(
+              (action) =>
+                actionsAfterCalendarOutcome([action], !calendarFailedMessageIds.has(messageId)).length > 0 &&
+                action.type === "archive"
+            )
+        )
+      );
+
+      appliedSummary = buildRunSummary(
+        summary.inboxCountBefore,
+        outcomesAsApplied(outcomes, {
+          trashedMessageIds: successfullyTrashed,
+          labelMutatedMessageIds: new Set(labelResult.succeededMessageIds),
+          calendarCreatedMessageIds,
+          calendarFailedMessageIds
+        })
+      );
 
       const finishedAt = ctx.clock.nowIso();
       const runCounters = {
@@ -806,7 +927,10 @@ export async function runWork(options: WorkOptions): Promise<number> {
       );
     }
 
-    const finalSummary = { ...summary, failureCount, scanNote };
+    // A dry run applied nothing, so its plan *is* its report; a real run
+    // reports what Gmail and Calendar actually accepted.
+    const reportedSummary = appliedSummary ?? summary;
+    const finalSummary = { ...reportedSummary, failureCount, scanNote };
 
     if (options.onJsonSummary) {
       options.onJsonSummary({ ...renderJsonSummary(finalSummary, { dryRun: options.dryRun }), runId: runId ?? null });

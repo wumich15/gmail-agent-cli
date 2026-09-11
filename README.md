@@ -6,7 +6,7 @@ Clean up Gmail, browse your inbox in the terminal, and compose messages from the
 
 Everything runs on your own computer. There is no server, no hosted account, and no service in the middle: you connect the tool to your own Google project and your own AI provider key, and your mail never passes through anyone else's infrastructure. `gmail ui` opens a small local browser page for setup, the command reference, and status.
 
-**New here? [Follow the setup walkthrough](docs/setup.md)** — about ten minutes, once per computer.
+**New here? Install, then run `gmail install`** — a guided setup that opens each Google page for you, signs you in, and finishes with a preview that changes nothing. About ten minutes, once per computer. The written walkthrough is in [docs/setup.md](docs/setup.md).
 
 ## What it does
 
@@ -49,7 +49,7 @@ Google requires an app to identify itself before it can touch a mailbox, and thi
 2. Enable the **Gmail API** and the **Google Calendar API** in it.
 3. On the **OAuth consent screen**, choose **External**, add your own Gmail address as a test user, and add exactly two scopes: `https://www.googleapis.com/auth/gmail.modify` and `https://www.googleapis.com/auth/calendar.events.owned`.
 4. Under **Credentials**, create an **OAuth client ID** of type **Desktop app**.
-5. Run `gmail setup` (or `gmail ui`) and paste the client ID and client secret.
+5. Run `gmail install` (or `gmail setup`, or `gmail ui`) and paste the client ID and client secret.
 
 They are saved on this computer only, with owner-only permissions; the refresh token from signing in goes to your OS credential store. `GMAIL_AGENT_OAUTH_CLIENT_ID` / `GMAIL_AGENT_OAUTH_CLIENT_SECRET` override the saved file when set.
 
@@ -126,6 +126,7 @@ Review the result before increasing the limit. `gmail` without a limit has no ex
 | `gmail uncache [--yes]` | Clear local scan cache and sync marker. |
 | `gmail view [--limit N] [--previous]` | Browse, read, compose, and reply. |
 | `gmail send [to] [--subject TEXT] [--ai]` | Compose one email and confirm before sending. |
+| `gmail install` | Guided first-time setup: your own Google app, sign-in, AI choice, and a preview. Touches no mail. |
 | `gmail setup` | Connect, reconnect, disconnect, or change how AI works. Touches no mail. |
 | `gmail ui [--port N] [--no-open]` | Open the local Setup / Commands / Status pages in a browser. |
 | `gmail help [command]` | Show all help or help for one command. |

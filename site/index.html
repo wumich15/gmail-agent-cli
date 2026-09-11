@@ -1,557 +1,172 @@
 <title>Gmail Agent CLI</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap">
+<meta name="description" content="A terminal tool that cleans up your Gmail. Runs entirely on your own computer.">
 <style>
   :root {
-    --paper: #efeae1;
-    --surface: #f7f4ee;
-    --panel: #1a1d22;
-    --panel-text: #e7e2d6;
-    --ink: #15181c;
-    --ink-soft: #5d5c55;
-    --rule: #d6cfc2;
-    --accent: #2f49d1;
-    --accent-soft: #dfe1f7;
-    --rust: #a8422a;
-    --amber: #8a6606;
-    --keep: #2f6b4f;
-    --shadow: 0 1px 0 rgba(21, 24, 28, .06);
-
-    --display: "Bricolage Grotesque", "Helvetica Neue", Arial, sans-serif;
-    --body: "Source Serif 4", Georgia, "Times New Roman", serif;
-    --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #5c5c5c;
+    --line: #e2e2e2;
+    --code-bg: #f5f5f5;
+    --link: #1a54c4;
   }
-
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --paper: #121418;
-      --surface: #1a1d22;
-      --panel: #0c0e11;
-      --panel-text: #e2ddd2;
-      --ink: #e9e4d9;
-      --ink-soft: #9a968c;
-      --rule: #2d3138;
-      --accent: #8e9dff;
-      --accent-soft: #222741;
-      --rust: #e08f70;
-      --amber: #d6ab4c;
-      --keep: #74c39a;
-      --shadow: 0 1px 0 rgba(0, 0, 0, .4);
+      --bg: #16181c;
+      --fg: #e8e8e8;
+      --muted: #a0a0a0;
+      --line: #2e3238;
+      --code-bg: #22262c;
+      --link: #85a9f5;
     }
   }
-
   :root[data-theme="dark"] {
-    --paper: #121418;
-    --surface: #1a1d22;
-    --panel: #0c0e11;
-    --panel-text: #e2ddd2;
-    --ink: #e9e4d9;
-    --ink-soft: #9a968c;
-    --rule: #2d3138;
-    --accent: #8e9dff;
-    --accent-soft: #222741;
-    --rust: #e08f70;
-    --amber: #d6ab4c;
-    --keep: #74c39a;
-    --shadow: 0 1px 0 rgba(0, 0, 0, .4);
+    --bg: #16181c;
+    --fg: #e8e8e8;
+    --muted: #a0a0a0;
+    --line: #2e3238;
+    --code-bg: #22262c;
+    --link: #85a9f5;
   }
 
   body {
     margin: 0;
     padding-inline: 20px;
-    background: var(--paper);
-    color: var(--ink);
-    font-family: var(--body);
+    background: var(--bg);
+    color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     font-size: 17px;
-    line-height: 1.62;
-    -webkit-font-smoothing: antialiased;
+    line-height: 1.6;
   }
-
-  .page {
-    max-width: 860px;
+  main {
+    max-width: 640px;
     margin: 0 auto;
-    padding-block: 56px 72px;
+    padding-block: 56px 64px;
     display: flex;
     flex-direction: column;
-    gap: 76px;
+    gap: 38px;
   }
-
-  .col { max-width: 64ch; }
-
-  h1, h2, h3 {
-    font-family: var(--display);
-    font-weight: 700;
-    letter-spacing: -.02em;
-    text-wrap: balance;
-    margin: 0;
-  }
-  h1 { font-size: clamp(2.1rem, 6vw, 3.3rem); line-height: 1.05; }
-  h2 { font-size: clamp(1.5rem, 3.6vw, 2rem); line-height: 1.15; }
-  h3 { font-size: 1.06rem; font-weight: 500; letter-spacing: -.005em; }
-  p { margin: 0; }
-  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
-  a:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
-
-  /* Section eyebrows are written as real mail header fields — the same
-     RFC-822 shape the tool parses all day. */
-  .headers {
-    font-family: var(--mono);
-    font-size: .74rem;
-    line-height: 1.9;
-    color: var(--ink-soft);
-    text-transform: none;
-    letter-spacing: .01em;
-    border-left: 2px solid var(--rule);
-    padding-left: 14px;
-    margin-bottom: 18px;
-  }
-  .headers b { color: var(--accent); font-weight: 500; }
-
-  section { display: flex; flex-direction: column; gap: 22px; }
-  .lede { font-size: 1.18rem; color: var(--ink-soft); }
-  .lede em { font-style: italic; color: var(--ink); }
-
-  /* Terminal panels keep their own dark ground in both themes: it's a
-     screenshot of a terminal, not a themed surface. */
-  .term {
-    background: var(--panel);
-    color: var(--panel-text);
-    border-radius: 6px;
-    font-family: var(--mono);
-    font-size: .82rem;
-    line-height: 1.75;
-    padding: 18px 20px;
-    overflow-x: auto;
-    border: 1px solid rgba(255, 255, 255, .07);
-  }
-  .term pre { margin: 0; white-space: pre; }
-  .term .prompt { color: #7f8ba3; }
-  .term .cmd { color: #fff; font-weight: 600; }
-  .term .b { color: #fff; font-weight: 600; }
-  .term .dim { color: #7f8ba3; }
-  .term .trash { color: #e0917a; }
-  .term .star { color: #e3bc63; }
-  .term .cal { color: #8ea4ff; }
-  .term .ok { color: #79c8a2; }
-  .caret {
-    display: inline-block;
-    width: .55ch;
-    background: #e3bc63;
-    color: transparent;
-  }
-  @media (prefers-reduced-motion: no-preference) {
-    .caret { animation: blink 1.15s steps(1, end) infinite; }
-  }
-  @keyframes blink { 50% { opacity: 0; } }
-
-  .install {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    font-family: var(--mono);
-    font-size: .84rem;
-    background: var(--surface);
-    border: 1px solid var(--rule);
-    border-radius: 6px;
-    padding: 16px 18px;
-    overflow-x: auto;
-  }
-  .install span { white-space: pre; }
-  .install .c { color: var(--ink-soft); }
-
-  /* Actions: a stripe carries the semantics, so the row itself stays quiet. */
-  .actions { display: flex; flex-direction: column; gap: 2px; }
-  .action {
-    display: grid;
-    grid-template-columns: 2px minmax(0, 11rem) minmax(0, 1fr);
-    gap: 0 18px;
-    align-items: baseline;
-    padding: 12px 0 12px 14px;
-    border-bottom: 1px solid var(--rule);
-  }
-  .action::before { content: ""; grid-column: 1; align-self: stretch; background: var(--stripe, var(--rule)); }
-  .action dt { font-family: var(--mono); font-size: .8rem; font-weight: 500; color: var(--stripe, var(--ink)); }
-  .action dd { margin: 0; font-size: .97rem; }
-  .a-trash { --stripe: var(--rust); }
-  .a-keep { --stripe: var(--amber); }
-  .a-cal { --stripe: var(--accent); }
-  .a-file { --stripe: var(--keep); }
-  .a-quiet { --stripe: var(--ink-soft); }
-
-  .never {
-    border: 1px solid var(--rule);
-    border-radius: 6px;
-    background: var(--surface);
-    padding: 22px 24px;
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-  }
-  .never ul { margin: 0; padding-left: 1.1rem; display: flex; flex-direction: column; gap: 9px; }
-  .never li::marker { color: var(--rust); }
-  .never strong { font-weight: 600; }
-
-  figure { margin: 0; display: flex; flex-direction: column; gap: 10px; }
-  figcaption { font-family: var(--mono); font-size: .74rem; color: var(--ink-soft); }
-  svg { max-width: 100%; height: auto; display: block; }
-
-  ol.steps { margin: 0; padding: 0; list-style: none; counter-reset: step; display: flex; flex-direction: column; gap: 26px; }
-  ol.steps > li { counter-increment: step; display: grid; grid-template-columns: 2.4rem minmax(0, 1fr); gap: 0 16px; }
-  ol.steps > li::before {
-    content: counter(step);
-    font-family: var(--mono);
-    font-size: .8rem;
-    color: var(--accent);
-    border-top: 2px solid var(--accent);
-    padding-top: 6px;
-  }
-  ol.steps .body { display: flex; flex-direction: column; gap: 10px; padding-top: 2px; }
-  ol.steps h3 { margin-bottom: -2px; }
-  ol.steps p { font-size: .97rem; }
+  section { display: flex; flex-direction: column; gap: 14px; }
+  h1 { font-size: 1.9rem; line-height: 1.2; margin: 0; text-wrap: balance; }
+  h2 { font-size: 1.15rem; margin: 0; }
+  p, ul { margin: 0; }
+  ul { padding-left: 1.2rem; display: flex; flex-direction: column; gap: 7px; }
+  a { color: var(--link); text-underline-offset: 3px; }
+  a:focus-visible { outline: 2px solid var(--link); outline-offset: 3px; }
+  .lede { color: var(--muted); font-size: 1.05rem; }
   code {
-    font-family: var(--mono);
-    font-size: .84em;
-    background: var(--accent-soft);
-    color: var(--ink);
-    padding: .1em .34em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .88em;
+    background: var(--code-bg);
+    padding: .1em .35em;
     border-radius: 3px;
   }
-
-  .keys { width: 100%; border-collapse: collapse; font-size: .92rem; }
-  .keys caption {
-    text-align: left;
-    font-family: var(--mono);
-    font-size: .74rem;
-    color: var(--ink-soft);
-    padding-bottom: 8px;
+  pre {
+    margin: 0;
+    background: var(--code-bg);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .85rem;
+    line-height: 1.7;
   }
-  .keys td { padding: 8px 14px 8px 0; border-bottom: 1px solid var(--rule); vertical-align: baseline; }
-  .keys td:first-child { font-family: var(--mono); font-size: .8rem; white-space: nowrap; width: 7.5rem; color: var(--accent); }
-  .keys tr:last-child td { border-bottom: 0; }
-  .two-up { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 12px 40px; align-items: start; }
-
-  .cost { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; }
-  .cost > div { display: flex; flex-direction: column; gap: 8px; border-top: 2px solid var(--rule); padding-top: 14px; }
-  .cost h3 { font-family: var(--mono); font-size: .78rem; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--ink-soft); }
-  .cost p { font-size: .95rem; }
-  .cost .figure { font-family: var(--display); font-size: 1.5rem; font-weight: 700; letter-spacing: -.02em; }
-
-  footer {
-    border-top: 1px solid var(--rule);
-    padding-top: 26px;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    font-size: .88rem;
-    color: var(--ink-soft);
-  }
-  footer .paths { font-family: var(--mono); font-size: .76rem; line-height: 1.9; }
-
-  @media (max-width: 560px) {
-    .action { grid-template-columns: 2px minmax(0, 1fr); gap: 4px 14px; }
-    .action dt { grid-column: 2; }
-    .action dd { grid-column: 2; }
-    .keys td:first-child { width: 5.6rem; }
-  }
+  pre code { background: none; padding: 0; font-size: 1em; }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 0; }
+  footer { color: var(--muted); font-size: .9rem; }
 </style>
 
-<div class="page">
-
-  <header>
-    <p class="headers">
-      From: <b>your terminal</b><br>
-      To: <b>a mailbox that has stopped being useful</b><br>
-      Subject: <b>gmail-agent-cli</b>
-    </p>
-    <h1>Your inbox, triaged on your own machine.</h1>
-    <p class="lede col" style="margin-top:20px">
-      A terminal tool that reads your Gmail, throws out the junk, stars what actually needs you,
-      turns real appointments into calendar events, and archives everything you've already read.
-      <em>No server, no hosted account, no middleman</em> — it runs on your computer, signed in to
-      your own Google project, using your own AI key or none at all.
-    </p>
-
-    <div class="term" style="margin-top:30px" aria-label="Example terminal session running the gmail command">
-<pre><span class="prompt">$</span> <span class="cmd">gmail</span>
-
-<span class="b">Run complete</span>
-
-Inbox: 213 before -&gt; 19 after
-
-<span class="b">Most recent unread (4)</span>
-  · Contract redline — Dana Whitfield (direct_question)
-  · Flight AS 1188 gate change — Alaska (reservation)
-  · Invoice 4471 is past due — Northgate (financial)
-  · Re: Thursday's walkthrough — Sam Ortiz (user_action_required)
-
-<span class="b trash">Trashed (168)</span>
-  <span class="trash">126 promotions
-  31 low-value automated
-  11 native Gmail spam</span>
-
-<span class="b star">Starred: 4   Marked important: 4</span>
-
-<span class="b cal">Calendar events created: 1</span>
-  <span class="cal">Added: Dental cleaning — Thu Sep 18, 2:00 PM</span>
-
-<span class="b ok">Archived read mail: 22</span>
-<span class="b">Review: 2</span>
-Failures: 0
-<span class="dim">Run ID: 01J9F2K6QW (every action is recorded in the local action ledger).</span><span class="caret">_</span></pre>
-    </div>
-    <p class="dim" style="font-size:.82rem;color:var(--ink-soft);font-family:var(--mono);margin-top:10px">
-      Example output. Run <code>gmail --dry-run</code> first — it prints the same plan and changes nothing.
-    </p>
-  </header>
+<main>
 
   <section>
-    <div>
-      <p class="headers">X-Section: <b>what one run does</b></p>
-      <h2>Aggressive about bulk mail. Careful about everything else.</h2>
-    </div>
-    <p class="col">
-      "A machine sent it" is not the same as "you don't need it." Receipts, security alerts, travel
-      changes, appointment confirmations and deadlines are automated too, and they're the mail most
-      worth protecting. So the cleanup is deliberately lopsided: obvious bulk goes fast, anything
-      ambiguous is left alone and reported.
+    <h1>Gmail Agent CLI</h1>
+    <p class="lede">
+      A terminal tool that cleans up your Gmail: trashes the junk, stars what needs you,
+      turns real appointments into calendar events, and archives what you have read.
+      It runs entirely on your own computer.
     </p>
+    <pre><code>gmail --dry-run   # see what it would do
+gmail             # do it</code></pre>
+  </section>
 
-    <dl class="actions">
-      <div class="action a-trash">
-        <dt>Trash</dt>
-        <dd>Promotions, newsletters you never open, and Gmail's own spam — moved to Gmail's Trash, where you can pull any of it back.</dd>
-      </div>
-      <div class="action a-keep">
-        <dt>Star + Important</dt>
-        <dd>Mail that asks you a question, names a deadline, or concerns your money, security, or travel.</dd>
-      </div>
-      <div class="action a-cal">
-        <dt>Calendar</dt>
-        <dd>An explicit, future, unambiguous date becomes a private event on your own calendar. No guests, no invitations, no duplicates.</dd>
-      </div>
-      <div class="action a-file">
-        <dt>Labels + archive</dt>
-        <dd>Topical labels once enough messages in a run agree on one, and every read message that survived gets out of the inbox.</dd>
-      </div>
-      <div class="action a-quiet">
-        <dt>Review</dt>
-        <dd>Anything uncertain: no trash, no star, no event. It stays where it is and appears in the summary.</dd>
-      </div>
-    </dl>
+  <hr>
 
-    <div class="never col">
-      <h3 style="font-family:var(--display);font-weight:700;font-size:1.05rem">Fixed rules, not preferences</h3>
-      <ul>
-        <li><strong>It never permanently deletes mail.</strong> Trash only — the permanent-delete endpoints are not called anywhere in the code.</li>
-        <li><strong>It never sends an email you haven't seen.</strong> Every outbound path — manual, AI-drafted, reply, unsubscribe — ends at the same screen showing the exact recipient, subject and body, defaulting to&nbsp;no.</li>
-        <li><strong>It never follows instructions inside an email.</strong> Message text is evidence, never a command, and the model gets no tools, no network and no credentials.</li>
-        <li><strong>It never uploads attachments</strong> — it doesn't even download them.</li>
-      </ul>
-    </div>
+  <section>
+    <h2>What it does</h2>
+    <ul>
+      <li>Moves promotions, newsletters and spam to Gmail's <strong>Trash</strong> — you can always pull them back.</li>
+      <li>Stars mail that asks you something, names a deadline, or concerns money, security or travel.</li>
+      <li>Adds private calendar events from mail with a real date. No guests, no invitations, no duplicates.</li>
+      <li>Archives everything you have already read.</li>
+      <li>Leaves anything uncertain alone, and tells you about it.</li>
+      <li><code>gmail view</code> also reads, searches, deletes, composes and replies — with AI drafts you edit first.</li>
+    </ul>
   </section>
 
   <section>
-    <div>
-      <p class="headers">X-Section: <b>where your mail goes</b></p>
-      <h2>Two connections, both yours.</h2>
-    </div>
-    <p class="col">
-      There is no service in the middle to trust, bill you, get breached, or shut down. The tool
-      talks to Google with an OAuth client <em>you</em> registered, and — only if you turn AI on —
-      to OpenAI with a key <em>you</em> own. Nothing is relayed through anyone else, because there
-      is no one else.
-    </p>
-
-    <figure>
-      <svg viewBox="0 0 720 220" role="img" aria-label="Diagram: your computer connects directly to the Gmail and Calendar APIs, and optionally to the OpenAI API with your own key. No intermediate server exists.">
-        <g font-family="IBM Plex Mono, monospace" font-size="12">
-          <rect x="252" y="72" width="216" height="76" rx="5" fill="var(--surface)" stroke="var(--accent)" stroke-width="2"></rect>
-          <text x="360" y="100" text-anchor="middle" fill="var(--ink)" font-size="13" font-weight="600">your computer</text>
-          <text x="360" y="120" text-anchor="middle" fill="var(--ink-soft)">gmail · config · SQLite</text>
-          <text x="360" y="136" text-anchor="middle" fill="var(--ink-soft)">keys in OS keychain</text>
-
-          <rect x="12" y="26" width="182" height="58" rx="5" fill="none" stroke="var(--rule)" stroke-width="1.5"></rect>
-          <text x="103" y="50" text-anchor="middle" fill="var(--ink)" font-weight="600">Gmail API</text>
-          <text x="103" y="68" text-anchor="middle" fill="var(--ink-soft)">your Google project</text>
-
-          <rect x="12" y="136" width="182" height="58" rx="5" fill="none" stroke="var(--rule)" stroke-width="1.5"></rect>
-          <text x="103" y="160" text-anchor="middle" fill="var(--ink)" font-weight="600">Calendar API</text>
-          <text x="103" y="178" text-anchor="middle" fill="var(--ink-soft)">events it created</text>
-
-          <rect x="526" y="81" width="182" height="58" rx="5" fill="none" stroke="var(--rule)" stroke-width="1.5" stroke-dasharray="5 4"></rect>
-          <text x="617" y="105" text-anchor="middle" fill="var(--ink)" font-weight="600">OpenAI API</text>
-          <text x="617" y="123" text-anchor="middle" fill="var(--ink-soft)">optional · your key</text>
-
-          <g stroke="var(--accent)" stroke-width="1.5" fill="none">
-            <path d="M252 100 L196 56"></path>
-            <path d="M252 124 L196 166"></path>
-            <path d="M468 110 L522 110" stroke-dasharray="5 4"></path>
-          </g>
-          <g fill="var(--accent)">
-            <path d="M196 56 l9 1 -7 5 z"></path>
-            <path d="M196 166 l9 -1 -7 -5 z"></path>
-            <path d="M522 110 l-9 -4 0 8 z"></path>
-          </g>
-
-          <text x="360" y="196" text-anchor="middle" fill="var(--ink-soft)" font-size="11">no publisher server · no shared account · no telemetry</text>
-        </g>
-      </svg>
-      <figcaption>Every arrow is a connection you authorize and can revoke yourself.</figcaption>
-    </figure>
-
-    <div class="two-up col" style="max-width:none">
-      <p style="font-size:.95rem">
-        <strong>What stays on disk:</strong> message IDs, labels, dates, senders, content hashes and
-        an action ledger, in a SQLite file only your user account can read. Message bodies are never
-        written to it — reading a message fetches it live.
-      </p>
-      <p style="font-size:.95rem">
-        <strong>What leaves, if AI is on:</strong> the sender, subject, date and a bounded plain-text
-        excerpt of the message being classified. Calls set <code>store: false</code>. That's not a
-        promise of zero retention at the provider, and the tool says so before you choose.
-      </p>
-    </div>
+    <h2>What it never does</h2>
+    <ul>
+      <li>Never permanently deletes mail.</li>
+      <li>Never sends an email without showing you the exact message and asking.</li>
+      <li>Never follows instructions written inside an email.</li>
+      <li>Never uploads attachments anywhere.</li>
+      <li>Never runs in the background or keeps your mail on a server.</li>
+    </ul>
   </section>
 
   <section>
-    <div>
-      <p class="headers">X-Section: <b>setup</b></p>
-      <h2>Ten minutes, once per computer.</h2>
-    </div>
-    <p class="col">
-      The cost of having no middleman is that you register the Google app yourself. It's free, it
-      stays private to you, and it means your mail is reachable only with your own credentials.
+    <h2>Where your mail goes</h2>
+    <p>
+      Nowhere, unless you turn on AI. There is no service in the middle: the tool talks to
+      Google with an OAuth app you register yourself, and — only if you choose it — to OpenAI
+      with your own API key. Message bodies are never written to disk, and your credentials
+      stay in your operating system's keychain.
     </p>
-
-    <ol class="steps col" style="max-width:none">
-      <li>
-        <div class="body">
-          <h3>Install it</h3>
-          <div class="install">
-            <span class="c"># Node.js 22.19+ and pnpm</span>
-            <span>git clone &lt;repo&gt; gmail-agent-cli &amp;&amp; cd gmail-agent-cli</span>
-            <span>pnpm install --frozen-lockfile</span>
-            <span>pnpm build</span>
-            <span>pnpm link --global</span>
-          </div>
-        </div>
-      </li>
-      <li>
-        <div class="body">
-          <h3>Register your own Google app</h3>
-          <p>
-            In the <a href="https://console.cloud.google.com/projectcreate" target="_blank" rel="noreferrer">Google Cloud Console</a>:
-            create a project, enable the <strong>Gmail API</strong> and <strong>Calendar API</strong>, add yourself
-            as a test user on the consent screen with exactly two scopes — <code>gmail.modify</code> and
-            <code>calendar.events.owned</code> — then create an OAuth client of type <strong>Desktop app</strong>.
-          </p>
-        </div>
-      </li>
-      <li>
-        <div class="body">
-          <h3>Connect and choose how AI works</h3>
-          <div class="install">
-            <span>gmail setup</span>
-            <span class="c"># or: gmail ui — the same thing as a local page in your browser</span>
-          </div>
-          <p>
-            Paste the client ID and secret, sign in through Google in your browser, then pick your
-            OpenAI key or <strong>no AI at all</strong>. Rules-only is a real mode: spam cleanup, your own
-            rules and archiving read mail all still work.
-          </p>
-        </div>
-      </li>
-      <li>
-        <div class="body">
-          <h3>Look before you leap</h3>
-          <div class="install">
-            <span>gmail --dry-run --limit 25</span>
-            <span class="c"># reads mail, changes nothing, prints the plan</span>
-            <span>gmail</span>
-          </div>
-        </div>
-      </li>
-    </ol>
+    <p>
+      Rules-only mode is a real mode: Gmail's own spam handling, your rules, and archiving read
+      mail all work with nothing leaving your computer.
+    </p>
   </section>
 
+  <hr>
+
   <section>
-    <div>
-      <p class="headers">X-Section: <b>gmail view</b></p>
-      <h2>And a mail client, while you're in there.</h2>
-    </div>
-    <p class="col">
-      <code>gmail view</code> browses the local cache, opens messages as bounded plain text with
-      clickable links, and composes or replies — by hand or with an AI draft you edit before it
-      goes anywhere.
+    <h2>Install</h2>
+    <p>Needs Node.js 22.19 or newer, and <code>pnpm</code>.</p>
+    <pre><code>git clone https://github.com/wumich15/gmail-agent-cli.git
+cd gmail-agent-cli
+pnpm install --frozen-lockfile
+pnpm build
+pnpm link --global
+
+gmail install</code></pre>
+    <p>
+      <code>gmail install</code> is a guided setup. It opens each Google Cloud page for you,
+      collects the credentials, signs you in, asks how AI should work, and finishes with a
+      preview that changes nothing. About ten minutes, once.
     </p>
-    <div class="two-up">
-      <table class="keys">
-        <caption>in the list</caption>
-        <tbody>
-          <tr><td>↑ ↓</td><td>move the highlighted row</td></tr>
-          <tr><td>← →</td><td>page back and forward</td></tr>
-          <tr><td>s <em>text</em></td><td>search subjects and senders</td></tr>
-          <tr><td>f</td><td>filter by Gmail label</td></tr>
-          <tr><td>d · dd</td><td>trash the highlighted row (<code>dd</code> skips the question)</td></tr>
-          <tr><td>;u</td><td>undo the last delete</td></tr>
-          <tr><td>c · a</td><td>compose by hand, or with AI</td></tr>
-          <tr><td>2 ;r</td><td>AI-draft a reply to message 2</td></tr>
-        </tbody>
-      </table>
-      <table class="keys">
-        <caption>reading a message</caption>
-        <tbody>
-          <tr><td>← →</td><td>previous and next message</td></tr>
-          <tr><td>r · ;r</td><td>reply by hand, or with AI</td></tr>
-          <tr><td>l</td><td>show every link's real URL</td></tr>
-          <tr><td>o</td><td>open one link in your browser</td></tr>
-          <tr><td>d</td><td>move to Trash</td></tr>
-          <tr><td>esc</td><td>back to the list</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <p class="col" style="font-size:.93rem;color:var(--ink-soft)">
-      <code>dd</code> gets to skip its confirmation because a wrong delete costs one <code>;u</code>.
-      A send never gets that shortcut: there is no flag, key or scripted path anywhere that sends
-      without the exact-message screen.
+    <p>
+      The full walkthrough, with every field named, is in
+      <a href="https://github.com/wumich15/gmail-agent-cli/blob/main/docs/setup.md">docs/setup.md</a>.
     </p>
   </section>
 
   <section>
-    <div>
-      <p class="headers">X-Section: <b>what it costs</b></p>
-      <h2>Free, apart from what you spend on your own model.</h2>
-    </div>
-    <div class="cost">
-      <div>
-        <h3>The tool</h3>
-        <p class="figure">$0 · MIT</p>
-        <p>No account, no subscription, no telemetry. Nothing to sign up for.</p>
-      </div>
-      <div>
-        <h3>Rules-only mode</h3>
-        <p class="figure">$0</p>
-        <p>Gmail's own spam handling, your saved rules, and archiving read mail. Nothing is sent anywhere.</p>
-      </div>
-      <div>
-        <h3>With your OpenAI key</h3>
-        <p class="figure">Cents per run</p>
-        <p>One small classification call per unresolved message, cached by content hash so the same mail isn't re-read.</p>
-      </div>
-    </div>
+    <h2>What it costs</h2>
+    <p>
+      The tool is free and MIT licensed, with no account and no telemetry. Rules-only mode costs
+      nothing at all. With your own OpenAI key you pay OpenAI directly — one small classification
+      call per message, which works out to cents per run.
+    </p>
   </section>
+
+  <hr>
 
   <footer>
-    <p>
-      <strong style="color:var(--ink)">gmail-agent-cli</strong> — MIT licensed. Node.js 22.19+, macOS, Windows or Linux.
-      Setup walkthrough in <code>docs/setup.md</code>; every command, flag and keystroke in <code>docs/commands.md</code>.
-    </p>
-    <p class="paths">
-      state · ~/Library/Application Support/gmail-agent-cli/ · %APPDATA%\gmail-agent-cli\ · ~/.config/gmail-agent-cli/<br>
-      secrets · macOS Keychain · Windows Credential Manager · Linux Secret Service<br>
-      revoke anytime · myaccount.google.com/permissions
-    </p>
+    <a href="https://github.com/wumich15/gmail-agent-cli">Source on GitHub</a> ·
+    <a href="https://github.com/wumich15/gmail-agent-cli/blob/main/docs/commands.md">All commands</a> ·
+    <a href="https://github.com/wumich15/gmail-agent-cli/blob/main/LICENSE">MIT</a>
+    · macOS, Windows and Linux
   </footer>
 
-</div>
+</main>

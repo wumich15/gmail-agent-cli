@@ -49,6 +49,10 @@ export function isPrivateOrReservedIp(address: string): boolean {
   if (isIPv6(address)) {
     const normalized = address.toLowerCase();
     if (normalized === "::1") return true; // loopback
+    // "::" is the unspecified address; connecting to it reaches the local
+    // host, so it belongs with loopback rather than in the "not matched, must
+    // be public" fall-through at the end of this branch.
+    if (normalized === "::" || normalized === "0:0:0:0:0:0:0:0") return true;
     if (normalized.startsWith("::ffff:")) {
       return isPrivateOrReservedIp(normalized.slice("::ffff:".length));
     }

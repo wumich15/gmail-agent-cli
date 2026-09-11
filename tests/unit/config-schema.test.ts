@@ -52,7 +52,7 @@ describe("ConfigSchema", () => {
   });
 
   it("rewrites a retired provider rather than rejecting a config the user cannot fix by hand", () => {
-    for (const retired of ["ollama", "managed"]) {
+    for (const retired of ["ollama", "managed", "some-future-thing"]) {
       const config = parseConfig({
         schemaVersion: 3,
         timezone: "UTC",

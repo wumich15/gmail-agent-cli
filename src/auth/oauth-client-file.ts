@@ -55,7 +55,16 @@ export function readStoredOAuthClient(
       );
     }
   }
-  const parsed = OAuthClientFileSchema.safeParse(JSON.parse(raw));
+  // A truncated or hand-edited file must produce the same actionable message
+  // as a structurally wrong one, not a raw SyntaxError from deep inside a
+  // command the user was running for some unrelated reason.
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    json = null;
+  }
+  const parsed = OAuthClientFileSchema.safeParse(json);
   if (!parsed.success) {
     throw new InvalidConfigError(
       `${path} is not a valid saved Google OAuth client. Delete it and run \`gmail setup\` again.`

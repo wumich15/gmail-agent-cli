@@ -47,21 +47,26 @@ export type AiProvider = (typeof AI_PROVIDERS)[number];
  */
 export const CURRENT_CONFIG_SCHEMA_VERSION = 3;
 
-/** Providers that earlier schema versions offered and this one no longer has. */
-const RETIRED_PROVIDERS = new Set(["ollama", "managed"]);
-
 /**
- * Schema v2 briefly offered a local-runtime path, and a later revision
- * briefly offered a hosted publisher gateway. Neither exists now: AI is the
- * user's own OpenAI key or nothing. A config naming either is rewritten to
+ * Rewrites a config naming a provider this version no longer supports.
+ *
+ * Earlier versions offered other ways to reach a model; none of them exist
+ * now, and AI is the user's own key or nothing. Rather than enumerating the
+ * retired names — a list that only ever grows and gets stale — anything
+ * outside the current `AI_PROVIDERS` is treated as retired and rewritten to
  * the direct OpenAI provider, discarding the incompatible base URL and model
- * names, and `aiEnabled` is cleared so setup asks again rather than silently
- * assuming the user wants to start paying OpenAI directly.
+ * names. `aiEnabled` is cleared so setup asks again instead of silently
+ * assuming the user wants to start paying a provider directly.
  */
 function replaceRetiredProvider(raw: unknown): unknown {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
   const value = raw as Record<string, unknown>;
-  if (typeof value["aiProvider"] !== "string" || !RETIRED_PROVIDERS.has(value["aiProvider"])) return raw;
+  const provider = value["aiProvider"];
+  // An absent provider is not retired — it is just a file written before the
+  // field existed, and the schema default handles it.
+  if (provider === undefined || (typeof provider === "string" && (AI_PROVIDERS as readonly string[]).includes(provider))) {
+    return raw;
+  }
   const upgraded = { ...value };
   delete upgraded["aiBaseUrl"];
   return {

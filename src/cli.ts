@@ -9,6 +9,7 @@ import { runUncache } from "./commands/uncache.js";
 import { runView } from "./commands/view.js";
 import { runSend } from "./commands/send.js";
 import { runSetup } from "./commands/setup.js";
+import { runInstall } from "./commands/install.js";
 import { runUi } from "./commands/ui.js";
 import { renderViewControlsHelp } from "./docs/command-reference.js";
 import { GmailAgentError, EXIT_CODES } from "./core/errors.js";
@@ -167,10 +168,20 @@ program
   });
 
 program
+  .command("install")
+  .description(
+    "Guided first-time setup: register your own Google app, sign in, choose how AI works, and preview a run — " +
+      "changes no mail"
+  )
+  .action(() => {
+    withExitHandling(() => runInstall());
+  });
+
+program
   .command("setup")
   .description(
-    "Connect or reconnect Gmail, choose how AI works (included GPT, your own development API key, or off), and see " +
-      "current status — without touching any mail"
+    "Connect or reconnect Gmail, choose how AI works (your own OpenAI API key, or off), and see current status — " +
+      "without touching any mail"
   )
   .action(() => {
     withExitHandling(() => runSetup());
@@ -219,6 +230,7 @@ const KNOWN_SUBCOMMANDS = new Set([
   "uncache",
   "view",
   "send",
+  "install",
   "setup",
   "ui",
   "help"

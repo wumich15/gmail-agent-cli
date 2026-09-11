@@ -148,7 +148,7 @@ describe("config schema migration", () => {
       schemaVersion: 2,
       timezone: "UTC",
       aiEnabled: true,
-      aiProvider: "ollama",
+      aiProvider: "a-provider-this-version-dropped",
       aiBaseUrl: "http://127.0.0.1:11434",
       model: "llama3.2",
       composeModel: "llama3.2"

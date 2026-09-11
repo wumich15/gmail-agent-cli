@@ -144,6 +144,22 @@ export const COMMANDS: readonly CommandDoc[] = [
     confirmation: "Shows the exact To, Subject, and Body and defaults to no. No flag skips this, and it requires a terminal."
   },
   {
+    name: "gmail install",
+    synopsis: "gmail install",
+    summary: "Guided first-time setup, from a fresh install to a previewed run.",
+    details:
+      "Walks the whole path in order: checks this machine, opens each Google Cloud console page for you " +
+      "so you can register a Google app of your own, collects its Desktop client ID and secret, signs you " +
+      "in, asks how AI should work, and finishes with a dry run. Every step detects what is already done " +
+      "and offers to keep it, so it is safe to re-run after an interruption.",
+    options: [],
+    examples: ["gmail install"],
+    sideEffects:
+      "Saves your Google OAuth client, sign-in, timezone, and AI choice on this computer. Reads mail only " +
+      "for the closing dry run, which changes nothing.",
+    confirmation: "Asks before each step, and the run it finishes with is always a dry run — setup never cleans up mail."
+  },
+  {
     name: "gmail setup",
     synopsis: "gmail setup",
     summary: "Connect or reconnect Gmail, choose how AI works, and see current status.",
