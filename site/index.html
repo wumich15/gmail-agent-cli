@@ -1,0 +1,172 @@
+<title>Gmail Agent CLI</title>
+<meta name="description" content="A terminal tool that cleans up your Gmail. Runs entirely on your own computer.">
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --muted: #5c5c5c;
+    --line: #e2e2e2;
+    --code-bg: #f5f5f5;
+    --link: #1a54c4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #16181c;
+      --fg: #e8e8e8;
+      --muted: #a0a0a0;
+      --line: #2e3238;
+      --code-bg: #22262c;
+      --link: #85a9f5;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #16181c;
+    --fg: #e8e8e8;
+    --muted: #a0a0a0;
+    --line: #2e3238;
+    --code-bg: #22262c;
+    --link: #85a9f5;
+  }
+
+  body {
+    margin: 0;
+    padding-inline: 20px;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 17px;
+    line-height: 1.6;
+  }
+  main {
+    max-width: 640px;
+    margin: 0 auto;
+    padding-block: 56px 64px;
+    display: flex;
+    flex-direction: column;
+    gap: 38px;
+  }
+  section { display: flex; flex-direction: column; gap: 14px; }
+  h1 { font-size: 1.9rem; line-height: 1.2; margin: 0; text-wrap: balance; }
+  h2 { font-size: 1.15rem; margin: 0; }
+  p, ul { margin: 0; }
+  ul { padding-left: 1.2rem; display: flex; flex-direction: column; gap: 7px; }
+  a { color: var(--link); text-underline-offset: 3px; }
+  a:focus-visible { outline: 2px solid var(--link); outline-offset: 3px; }
+  .lede { color: var(--muted); font-size: 1.05rem; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .88em;
+    background: var(--code-bg);
+    padding: .1em .35em;
+    border-radius: 3px;
+  }
+  pre {
+    margin: 0;
+    background: var(--code-bg);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .85rem;
+    line-height: 1.7;
+  }
+  pre code { background: none; padding: 0; font-size: 1em; }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 0; }
+  footer { color: var(--muted); font-size: .9rem; }
+</style>
+
+<main>
+
+  <section>
+    <h1>Gmail Agent CLI</h1>
+    <p class="lede">
+      A terminal tool that cleans up your Gmail: trashes the junk, stars what needs you,
+      turns real appointments into calendar events, and archives what you have read.
+      It runs entirely on your own computer.
+    </p>
+    <pre><code>gmail --dry-run   # see what it would do
+gmail             # do it</code></pre>
+  </section>
+
+  <hr>
+
+  <section>
+    <h2>What it does</h2>
+    <ul>
+      <li>Moves promotions, newsletters and spam to Gmail's <strong>Trash</strong> — you can always pull them back.</li>
+      <li>Stars mail that asks you something, names a deadline, or concerns money, security or travel.</li>
+      <li>Adds private calendar events from mail with a real date. No guests, no invitations, no duplicates.</li>
+      <li>Archives everything you have already read.</li>
+      <li>Leaves anything uncertain alone, and tells you about it.</li>
+      <li><code>gmail view</code> also reads, searches, deletes, composes and replies — with AI drafts you edit first.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>What it never does</h2>
+    <ul>
+      <li>Never permanently deletes mail.</li>
+      <li>Never sends an email without showing you the exact message and asking.</li>
+      <li>Never follows instructions written inside an email.</li>
+      <li>Never uploads attachments anywhere.</li>
+      <li>Never runs in the background or keeps your mail on a server.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Where your mail goes</h2>
+    <p>
+      Nowhere, unless you turn on AI. There is no service in the middle: the tool talks to
+      Google with an OAuth app you register yourself, and — only if you choose it — to OpenAI
+      with your own API key. Message bodies are never written to disk, and your credentials
+      stay in your operating system's keychain.
+    </p>
+    <p>
+      Rules-only mode is a real mode: Gmail's own spam handling, your rules, and archiving read
+      mail all work with nothing leaving your computer.
+    </p>
+  </section>
+
+  <hr>
+
+  <section>
+    <h2>Install</h2>
+    <p>Needs Node.js 22.19 or newer, and <code>pnpm</code>.</p>
+    <pre><code>git clone https://github.com/wumich15/gmail-agent-cli.git
+cd gmail-agent-cli
+pnpm install --frozen-lockfile
+pnpm build
+pnpm link --global
+
+gmail install</code></pre>
+    <p>
+      <code>gmail install</code> is a guided setup. It opens each Google Cloud page for you,
+      collects the credentials, signs you in, asks how AI should work, and finishes with a
+      preview that changes nothing. About ten minutes, once.
+    </p>
+    <p>
+      The full walkthrough, with every field named, is in
+      <a href="https://github.com/wumich15/gmail-agent-cli/blob/main/docs/setup.md">docs/setup.md</a>.
+    </p>
+  </section>
+
+  <section>
+    <h2>What it costs</h2>
+    <p>
+      The tool is free and MIT licensed, with no account and no telemetry. Rules-only mode costs
+      nothing at all. With your own OpenAI key you pay OpenAI directly — one small classification
+      call per message, which works out to cents per run.
+    </p>
+  </section>
+
+  <hr>
+
+  <footer>
+    <a href="https://github.com/wumich15/gmail-agent-cli">Source on GitHub</a> ·
+    <a href="https://github.com/wumich15/gmail-agent-cli/blob/main/docs/commands.md">All commands</a> ·
+    <a href="https://github.com/wumich15/gmail-agent-cli/blob/main/LICENSE">MIT</a>
+    · macOS, Windows and Linux
+  </footer>
+
+</main>

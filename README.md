@@ -9,7 +9,7 @@ gmail             # do it
 
 Everything runs on your own computer. There is no server, no hosted account, and no service in the middle: you connect the tool to your own Google project and your own AI provider key, and your mail never passes through anyone else's infrastructure.
 
-**[Documentation](docs/README.md)** · [Setup walkthrough](docs/setup.md) · [All commands and keyboard shortcuts](docs/commands.md) · [Development](docs/development.md)
+**[gmail-agent-cli](https://wumich15.github.io/gmail-agent-cli/)** · [Documentation](docs/README.md) · [Setup walkthrough](docs/setup.md) · [All commands and keyboard shortcuts](docs/commands.md) · [Development](docs/development.md)
 
 ## What it does
 
