@@ -27,9 +27,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: pnpm
@@ -53,11 +53,11 @@ jobs:
           npm pack --pack-destination dist-artifacts --ignore-scripts
           cd dist-artifacts && shasum -a 256 ./*.tgz | tee SHA256SUMS.txt
 
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v3
         with:
           subject-path: dist-artifacts/*.tgz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: release-artifact
           path: |

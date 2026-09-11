@@ -4,6 +4,7 @@
   "description": "Local terminal agent that cleans up Gmail inbox and creates Calendar events from actionable mail.",
   "license": "MIT",
   "type": "module",
+  "packageManager": "pnpm@11.25.0",
   "bin": {
     "gmail": "./dist/cli.js"
   },
