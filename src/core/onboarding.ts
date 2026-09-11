@@ -42,7 +42,7 @@ export interface ConnectionStatus {
 
 const SCOPE_EXPLANATIONS: Record<string, string> = {
   "https://www.googleapis.com/auth/gmail.modify":
-    "Read your mail's headers and text, move messages to Trash, archive read mail, and add stars and labels. It cannot permanently delete anything.",
+    "Read your mail's headers and text, move messages to Trash, archive mail when you ask it to, and add stars and labels. It cannot permanently delete anything.",
   "https://www.googleapis.com/auth/calendar.events.owned":
     "Create and update only the events this app itself created on your own calendar. It never adds guests, sends invitations, or touches events it did not create."
 };

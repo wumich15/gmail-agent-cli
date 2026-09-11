@@ -118,7 +118,7 @@ export async function runInstall(): Promise<number> {
       "  • move bulk mail to Gmail's " + pc.bold("Trash") + " — never permanent deletion\n" +
       "  • star and mark important what looks like it needs you\n" +
       "  • add events to your own calendar from mail that names a real date\n" +
-      "  • archive mail you've already read\n\n" +
+      "  • archive mail you've already read, when you ask for it with `gmail --archive`\n\n" +
       "It never sends an email without showing you the exact message first, and it\n" +
       "never follows instructions found inside an email."
   );

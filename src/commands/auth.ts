@@ -16,9 +16,9 @@ export async function authLogin(): Promise<number> {
 
   p.log.message(
     "Automatic changes this app can make on your account: move spam, promotions, and low-value mail\n" +
-      "to Trash (never permanently delete), star and label important mail, archive read Inbox mail,\n" +
-      "and create Calendar events from actionable mail. It never adds Calendar attendees, sends\n" +
-      "invitations, or creates Meet links.\n\n" +
+      "to Trash (never permanently delete), star and label important mail, archive read Inbox mail\n" +
+      "when you pass --archive, and create Calendar events from actionable mail. It never adds\n" +
+      "Calendar attendees, sends invitations, or creates Meet links.\n\n" +
       "Sending mail is never automatic. `gmail view` and `gmail send` can reply to a message or\n" +
       "compose a new one — including with an AI-written draft — but every outbound message, and\n" +
       "every unsubscribe request, stops at a screen showing the exact recipient, subject, and body\n" +

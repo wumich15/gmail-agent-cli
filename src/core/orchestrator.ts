@@ -58,6 +58,8 @@ export interface OrchestratorDeps {
    */
   limit?: number;
   policyThresholds?: PolicyThresholds;
+  /** Opt-in (`gmail --archive`): take read, non-trashed mail out of the Inbox. */
+  archiveReadMail?: boolean;
   /** The user's current custom Gmail label names, passed to the classifier so it prefers reusing one. */
   existingLabels?: readonly string[];
   /**
@@ -192,7 +194,28 @@ export interface CachedAssessmentSnapshot {
   importanceConfidence: number;
   reasonCodes: readonly ReasonCode[];
   category: string | null;
+  /**
+   * Always `false`, as a type-level fact rather than a convention.
+   *
+   * An event candidate's validated payload and source evidence are
+   * deliberately never persisted, so an assessment that carried one cannot be
+   * rebuilt from this compact row — reconstructing it anyway yields
+   * `event: none`, which silently drops a real appointment with no failure
+   * and no review item. Callers must therefore exclude event-bearing rows,
+   * and this field makes that a compile error to forget rather than a comment
+   * to remember.
+   */
+  hadEvent: false;
 }
+
+/**
+ * What gets written back to the cache for one message. Deliberately *not*
+ * the same type as the read side above: whether the assessment carried an
+ * event is a sibling field here (`MessageCacheUpdate.assessmentHadEvent`),
+ * because a write records what happened, while a read has to prove the row
+ * is safe to reuse.
+ */
+export type PersistedAssessmentProjection = Omit<CachedAssessmentSnapshot, "hadEvent">;
 
 /** One message's up-to-date cache row to persist after a run — see `OrchestratorDeps.cachedAssessments`. */
 export interface MessageCacheUpdate {
@@ -201,7 +224,7 @@ export interface MessageCacheUpdate {
   contentHash: string;
   labelSnapshot: readonly string[];
   /** Null when this message never reached the classifier (bypassed by an explicit rule or native spam) — nothing to cache. */
-  assessment: CachedAssessmentSnapshot | null;
+  assessment: PersistedAssessmentProjection | null;
   /** Whether the fresh assessment contained any event intent; event payload/evidence itself is deliberately never cached. */
   assessmentHadEvent: boolean | null;
   /**
@@ -484,6 +507,9 @@ async function classifyAndFinalize(
         const cached = deps.cachedAssessments?.get(pre.stub.id);
         if (
           cached &&
+          // Belt and braces with the type above: a row that carried an event
+          // must be re-evaluated live, never reconstructed.
+          cached.hadEvent === false &&
           cached.contentHash === pre.normalized.contentHash &&
           cached.classifierVersion === classifierVersion &&
           cached.promptVersion === promptVersion &&
@@ -1024,7 +1050,8 @@ async function finalizeOutcome(
     explicitSpamOverride: explicitRule?.action === "spam",
     hasAuthenticatedHighRiskSignal: hasAuthenticatedHighRiskSignal(normalized),
     assessment,
-    assessmentUnavailable
+    assessmentUnavailable,
+    archiveReadMail: deps.archiveReadMail === true
   };
   let rawDecision = evaluateMessagePolicy(policyInput, deps.policyThresholds);
 

@@ -64,6 +64,14 @@ export interface MessagePolicyInput {
   assessment: EmailAssessment | null;
   /** True only when AI was expected to run (not bypassed) but did not produce a usable assessment. */
   assessmentUnavailable: boolean;
+  /**
+   * Whether a read message that survives cleanup should also be taken out of
+   * the Inbox. Off unless the user asks for it (`gmail --archive`): archiving
+   * is the one cleanup action with no obvious trace — the mail is neither in
+   * the Inbox nor in Trash — so it is opt-in rather than something a first
+   * run does to a mailbox the user is still evaluating.
+   */
+  archiveReadMail?: boolean;
 }
 
 export type PolicyActionIntent =
@@ -211,9 +219,9 @@ export function evaluateMessagePolicy(
     }
   }
 
-  // 9: every non-Trash message without UNREAD gets archived, even if
-  // starred or used to create an event.
-  if (input.isRead && input.isInInbox) {
+  // 9: with archiving requested, every non-Trash message without UNREAD is
+  // taken out of the Inbox, even if starred or used to create an event.
+  if (input.archiveReadMail === true && input.isRead && input.isInInbox) {
     actions.push({ type: "archive", reasonCode: "read_non_trash" });
   }
 

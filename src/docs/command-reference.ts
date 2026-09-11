@@ -39,22 +39,24 @@ export const COMMANDS: readonly CommandDoc[] = [
   {
     name: "gmail",
     synopsis: "gmail [--dry-run] [--json] [--limit N]",
-    summary: "Clean up the inbox: trash bulk mail, star what matters, add Calendar events, archive read mail.",
+    summary: "Clean up the inbox: trash bulk mail, star what matters, and add Calendar events.",
     details:
       "Runs the full pipeline. On the very first run it signs you in first. Native Gmail spam and your " +
       "own rules are applied without any AI call; everything still unresolved is classified one message " +
       "at a time, and only high-confidence results act. Anything uncertain is listed under Review and " +
-      "left alone. Every change is recorded so it can be listed and undone.",
+      "left alone. Read mail is left in the Inbox unless you pass --archive. Every change is recorded so " +
+      "it can be listed and undone.",
     options: [
       { flag: "--dry-run", description: "Show what would happen and change nothing at all." },
       { flag: "--json", description: "Print one JSON summary to stdout instead of human text." },
+      { flag: "--archive", description: "Also take read mail out of the Inbox. Off by default." },
       { flag: "--limit N", description: "Scan only the N most recent Inbox and Spam messages each, to bound API usage." }
     ],
-    examples: ["gmail --dry-run", "gmail", "gmail --limit 200 --json"],
+    examples: ["gmail --dry-run", "gmail", "gmail --archive", "gmail --limit 200 --json"],
     sideEffects:
-      "Moves mail to Trash (never permanent deletion), archives read mail, adds STARRED/IMPORTANT and " +
-      "topical labels, creates Calendar events on your primary calendar, and may create local spam rules " +
-      "for repeated bulk senders. Sends no email.",
+      "Moves mail to Trash (never permanent deletion), adds STARRED/IMPORTANT and topical labels, creates " +
+      "Calendar events on your primary calendar, and may create local spam rules for repeated bulk senders. " +
+      "Read mail stays in the Inbox unless --archive is passed. Sends no email.",
     confirmation: "The first normal run previews the changes and asks once before applying them. --dry-run never applies anything."
   },
   {

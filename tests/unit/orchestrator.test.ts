@@ -89,6 +89,23 @@ function baseDeps(overrides: Partial<Parameters<typeof runWorkScan>[0]> = {}) {
   };
 }
 
+function contentHashFor(message: FakeMessage): string {
+  return buildNormalizedMessage({
+    gmailMessageId: message.id,
+    gmailThreadId: message.threadId,
+    historyId: "1",
+    internalDate: message.internalDate ?? "1000",
+    labelIds: message.labelIds,
+    snippet: message.snippet ?? "",
+    headers: headerMapFromList(message.headers),
+    htmlBody: null,
+    plainBody: null,
+    userEmail: "me@example.com",
+    threadHasUserSentMessage: false
+  }).contentHash;
+}
+
+
 describe("runWorkScan", () => {
   it("trashes unprotected native spam without calling the classifier", async () => {
     const client = fakeClient([
@@ -256,22 +273,6 @@ describe("runWorkScan", () => {
     expect(outcomes[0]!.decision.reviewReason).toBe("authenticated_high_risk_veto");
   });
 
-  function contentHashFor(message: FakeMessage): string {
-    return buildNormalizedMessage({
-      gmailMessageId: message.id,
-      gmailThreadId: message.threadId,
-      historyId: "1",
-      internalDate: message.internalDate ?? "1000",
-      labelIds: message.labelIds,
-      snippet: message.snippet ?? "",
-      headers: headerMapFromList(message.headers),
-      htmlBody: null,
-      plainBody: null,
-      userEmail: "me@example.com",
-      threadHasUserSentMessage: false
-    }).contentHash;
-  }
-
   describe("cachedAssessments (assessment-reuse cache)", () => {
     const message: FakeMessage = {
       id: "m1",
@@ -290,7 +291,8 @@ describe("runWorkScan", () => {
       importanceScore: 0.95,
       importanceConfidence: 0.95,
       reasonCodes: [],
-      category: "Work"
+      category: "Work",
+      hadEvent: false
     };
 
     it("skips the AI call after the required freshness fetch when content hash and every version match", async () => {
@@ -377,7 +379,7 @@ describe("runWorkScan", () => {
     });
   });
 
-  it("archives a read inbox message using the classifier's assessment", async () => {
+  it("archives a read inbox message only when the run asked for archiving", async () => {
     const client = fakeClient([
       {
         id: "m1",
@@ -390,9 +392,13 @@ describe("runWorkScan", () => {
       ok: false,
       unavailable: { reason: "not_configured", detail: null }
     });
-    const { outcomes, summary } = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
-    expect(outcomes[0]!.decision.actions).toEqual([{ type: "archive", reasonCode: "read_non_trash" }]);
-    expect(summary.archivedCount).toBe(1);
+    const withoutFlag = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
+    expect(withoutFlag.outcomes[0]!.decision.actions).toEqual([]);
+    expect(withoutFlag.summary.archivedCount).toBe(0);
+
+    const withFlag = await runWorkScan(baseDeps({ gmailClient: client, classifier, archiveReadMail: true }));
+    expect(withFlag.outcomes[0]!.decision.actions).toEqual([{ type: "archive", reasonCode: "read_non_trash" }]);
+    expect(withFlag.summary.archivedCount).toBe(1);
   });
 
   it("downgrades a calendar_create action with an invalid/past date to Review instead of executing it", async () => {
@@ -555,11 +561,20 @@ describe("runWorkScan", () => {
         return { ok: false, unavailable: { reason: "not_configured", detail: null } };
       }
     };
-    const { summary } = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
-    // This message is read and in the Inbox, so it *will* be archived —
-    // demonstrating the more common "not unchanged" path stays correct.
-    expect(summary.archivedCount).toBe(1);
-    expect(summary.unchanged).toEqual([]);
+    // With archiving requested this message is read and in the Inbox, so it
+    // *will* be archived — the more common "not unchanged" path.
+    const archiving = await runWorkScan(baseDeps({ gmailClient: client, classifier, archiveReadMail: true }));
+    expect(archiving.summary.archivedCount).toBe(1);
+    expect(archiving.summary.unchanged).toEqual([]);
+
+    // Without it, nothing applies, so the message has to show up as
+    // unchanged rather than vanishing from the summary entirely.
+    // Without it nothing is done to the message at all. An unavailable
+    // assessment still makes it a Review item rather than "unchanged" —
+    // either way it stays visible in the summary instead of disappearing.
+    const untouched = await runWorkScan(baseDeps({ gmailClient: client, classifier }));
+    expect(untouched.summary.archivedCount).toBe(0);
+    expect(untouched.summary.reviewCount).toBe(1);
   });
 
   it("only applies an AI-guessed category label once at least 10 messages in the run agree on it", async () => {
@@ -906,6 +921,10 @@ describe("runWorkScan", () => {
         gmailClient: client,
         classifier,
         historyMarker: "100",
+        // These two tests are about which messages get hydrated and
+        // classified; archiving is requested so the resulting action is
+        // still observable.
+        archiveReadMail: true,
         cachedBacklogStubs: [
           { id: cachedUnassessed.id, threadId: cachedUnassessed.threadId },
           { id: "cached-deleted", threadId: "t-cached-deleted" }
@@ -951,6 +970,7 @@ describe("runWorkScan", () => {
         gmailClient: client,
         classifier,
         historyMarker: "90",
+        archiveReadMail: true,
         cachedBacklogStubs: [{ id: cachedUnassessed.id, threadId: cachedUnassessed.threadId }]
       })
     );
@@ -1231,5 +1251,51 @@ describe("cache-first scanning", () => {
     );
 
     expect(historyList).toHaveBeenCalled();
+  });
+});
+
+describe("event-bearing assessments are never reconstructed from cache", () => {
+  it("re-evaluates live rather than turning a prior Calendar candidate into no event", async () => {
+    const message: FakeMessage = {
+      id: "m-event",
+      threadId: "t-event",
+      labelIds: ["INBOX", "UNREAD"],
+      headers: [{ name: "From", value: "clinic@example.com" }, { name: "Subject", value: "Appointment" }]
+    };
+    const client = fakeClient([message]);
+    const assess = vi.fn().mockResolvedValue({
+      ok: false,
+      unavailable: { reason: "provider_unavailable", detail: "offline" }
+    });
+
+    // A snapshot that matches on every version and content hash, but whose
+    // original assessment carried an event. Reusing it would silently drop
+    // the appointment: the validated payload and evidence are deliberately
+    // never persisted, so there is nothing to rebuild it from.
+    const cached = {
+      contentHash: contentHashFor(message),
+      classifierVersion: "openai:test-model",
+      promptVersion: "prompt-v5",
+      schemaVersion: "schema-v5",
+      policyVersion: "policy-v4",
+      kind: "personal_important" as const,
+      confidence: 0.98,
+      importanceScore: 0.95,
+      importanceConfidence: 0.95,
+      reasonCodes: [],
+      category: null,
+      hadEvent: true as unknown as false
+    };
+
+    await runWorkScan({
+      ...baseDeps({ gmailClient: client, classifier: { assess } }),
+      cachedAssessments: new Map([[message.id, cached]]),
+      classifierVersion: "openai:test-model",
+      promptVersion: "prompt-v5",
+      schemaVersion: "schema-v5",
+      cachePolicyVersion: "policy-v4"
+    });
+
+    expect(assess).toHaveBeenCalledTimes(1);
   });
 });

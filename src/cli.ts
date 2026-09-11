@@ -76,6 +76,7 @@ program
   .version(packageVersion())
   .option("--dry-run", "preview without making changes", false)
   .option("--json", "emit a single JSON summary to stdout", false)
+  .option("--archive", "also take read mail out of the Inbox (off by default)", false)
   .option(
     "--limit <n>",
     "cap the Inbox and native-Spam scans to the N most recent messages each (reduces Gmail API quota usage)",
@@ -103,9 +104,14 @@ function withExitHandling(fn: () => Promise<number>): void {
     });
 }
 
-program.action((opts: { dryRun: boolean; json: boolean; limit?: number }) => {
+program.action((opts: { dryRun: boolean; json: boolean; archive: boolean; limit?: number }) => {
   withExitHandling(() =>
-    runWork({ dryRun: opts.dryRun, json: opts.json, ...(opts.limit !== undefined ? { limit: opts.limit } : {}) })
+    runWork({
+      dryRun: opts.dryRun,
+      json: opts.json,
+      archive: opts.archive,
+      ...(opts.limit !== undefined ? { limit: opts.limit } : {})
+    })
   );
 });
 

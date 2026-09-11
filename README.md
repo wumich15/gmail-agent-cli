@@ -5,6 +5,7 @@ A terminal tool that cleans up your Gmail: trashes the junk, stars what needs yo
 ```sh
 gmail --dry-run   # see what it would do
 gmail             # do it
+gmail --archive   # ...and clear read mail out of the Inbox too
 ```
 
 Everything runs on your own computer. There is no server, no hosted account, and no service in the middle: you connect the tool to your own Google project and your own AI provider key, and your mail never passes through anyone else's infrastructure.
@@ -16,7 +17,7 @@ Everything runs on your own computer. There is no server, no hosted account, and
 - Moves promotions, newsletters and native Gmail spam to **Trash** — you can always pull them back.
 - Stars and marks important the mail that asks you something, names a deadline, or concerns money, security, travel or an appointment.
 - Adds private Calendar events from mail with a real, explicit date. No guests, no invitations, no duplicates.
-- Archives everything you have already read.
+- Archives everything you have already read — only when you ask, with `gmail --archive`.
 - Leaves anything uncertain alone, and lists it under Review.
 - Creates persistent spam/important rules you name (`gmail add`) and applies them before any AI runs.
 - `gmail view` is also a terminal mail client: read, search, delete, compose and reply, with AI drafts you edit before they go anywhere.

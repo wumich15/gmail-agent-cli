@@ -45,6 +45,8 @@ import { createClassifierProgress, createReadProgress } from "./progress.js";
 export interface WorkOptions {
   dryRun: boolean;
   json: boolean;
+  /** `--archive`: also take read, non-trashed mail out of the Inbox. Off by default. */
+  archive?: boolean;
   /** Caps the Inbox and native-Spam scans to this many most-recent messages each, to bound Gmail API quota usage. */
   limit?: number;
   /**
@@ -403,7 +405,8 @@ export async function runWork(options: WorkOptions): Promise<number> {
                 importanceScore: r.importanceScore ?? 0,
                 importanceConfidence: r.importanceConfidence ?? 0,
                 reasonCodes: (r.reasonCodes ?? []) as readonly ReasonCode[],
-                category: r.category
+                category: r.category,
+                hadEvent: false
               } satisfies CachedAssessmentSnapshot
             ] as const
         )
@@ -476,6 +479,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
         aiCalls: ctx.config?.concurrency.aiCalls ?? 5
       },
       existingLabels: existingLabels.map((l) => l.name),
+      archiveReadMail: options.archive === true,
       priorLabelCandidateCounts,
       priorLabelCandidateVotedMessageIds,
       classifierVersion,

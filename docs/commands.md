@@ -41,6 +41,7 @@ gmail
 | --- | --- | --- |
 | `--dry-run` | Off | Scan and show proposed actions without applying Gmail or Calendar changes. |
 | `--json` | Off | Print the final summary as JSON on standard output; status and diagnostics go to standard error. |
+| `--archive` | Off | Also remove `INBOX` from read, non-trashed messages. Left off, read mail stays in the Inbox. |
 | `--limit <n>` | No cap | Limit messages selected for processing. Must be a positive whole number. |
 
 On a full snapshot, `--limit 100` selects up to 100 Inbox messages **and** 100 native Spam messages. On an incremental scan, it caps the combined queue to 100 messages. It is not a maximum number of API calls. Auxiliary reads, retries, AI calls, and writes can add work. A truncated scan clears its history checkpoint so a later uncapped run can recover omitted mail.
@@ -177,7 +178,7 @@ Requires an interactive terminal. Startup normally refreshes via Gmail history a
 
 `--previous` skips the initial refresh; it is not an offline email reader. Opening messages, refreshing, sending, and deleting still use Gmail. Custom labels may appear as IDs until refreshed.
 
-Opening an unread message marks it read in Gmail. The quick reply shortcuts also fetch and mark the original message read. A later `gmail` cleanup may archive that read mail.
+Opening an unread message marks it read in Gmail. The quick reply shortcuts also fetch and mark the original message read. A later `gmail --archive` run would then take that message out of the Inbox; a plain `gmail` run leaves it there.
 
 ### Message list controls
 

@@ -50,7 +50,7 @@ function assessment(overrides: Partial<EmailAssessment> = {}): EmailAssessment {
 }
 
 describe("evaluateMessagePolicy", () => {
-  it("preserves all 24 scenarios", async () => {
+  it("preserves all 25 scenarios", async () => {
     await runScenarios([
       { name: "trashes an explicit spam rule match with no other actions", run: () => {
     const decision = evaluateMessagePolicy(
@@ -96,10 +96,16 @@ describe("evaluateMessagePolicy", () => {
     expect(decision.actions.some((a) => a.type === "trash")).toBe(false);
     expect(decision.reviewReason).toBe("authenticated_high_risk_veto");
   } },
-      { name: "produces no AI-derived mutation when the assessment is unavailable, but still archives if read", run: () => {
-    const decision = evaluateMessagePolicy(baseInput({ assessmentUnavailable: true }));
+      { name: "produces no AI-derived mutation when the assessment is unavailable, but still archives if read and asked to", run: () => {
+    const decision = evaluateMessagePolicy(baseInput({ assessmentUnavailable: true, archiveReadMail: true }));
     expect(decision.actions).toEqual([{ type: "archive", reasonCode: "read_non_trash" }]);
     expect(decision.needsReview).toBe(true);
+  } },
+      { name: "leaves read mail in the Inbox unless archiving was asked for", run: () => {
+    // Archiving is the one cleanup action with no obvious trace — the mail is
+    // in neither the Inbox nor the Trash — so it only happens on request.
+    const decision = evaluateMessagePolicy(baseInput({ isRead: true, isInInbox: true }));
+    expect(decision.actions.some((a) => a.type === "archive")).toBe(false);
   } },
       { name: "stars and marks important on qualifying importance scores", run: () => {
     const decision = evaluateMessagePolicy(
@@ -155,12 +161,12 @@ describe("evaluateMessagePolicy", () => {
     );
     expect(decision.actions.some((a) => a.type === "calendar_create")).toBe(true);
   } },
-      { name: "archives every read non-trash inbox message", run: () => {
-    const decision = evaluateMessagePolicy(baseInput({ isRead: true, isInInbox: true }));
+      { name: "archives every read non-trash inbox message when archiving is requested", run: () => {
+    const decision = evaluateMessagePolicy(baseInput({ isRead: true, isInInbox: true, archiveReadMail: true }));
     expect(decision.actions).toContainEqual({ type: "archive", reasonCode: "read_non_trash" });
   } },
-      { name: "does not archive an unread message", run: () => {
-    const decision = evaluateMessagePolicy(baseInput({ isRead: false }));
+      { name: "does not archive an unread message even when archiving is requested", run: () => {
+    const decision = evaluateMessagePolicy(baseInput({ isRead: false, archiveReadMail: true }));
     expect(decision.actions.some((a) => a.type === "archive")).toBe(false);
   } },
       { name: "never combines trash with any other action (invariant)", run: () => {
