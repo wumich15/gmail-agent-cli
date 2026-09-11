@@ -43,7 +43,13 @@ export function validateEventCandidate(
     return { ok: false, reason: "invalid_timezone" };
   }
 
-  const start = candidate.allDay
+  // A start with no time in it is a whole-day commitment however the model
+  // labelled it. Treating "2026-09-18" as a timed event put a real
+  // appointment on the calendar at midnight, which is both wrong and, for
+  // anything later today, rejected outright as being in the past.
+  const allDay = candidate.allDay || isDateOnly(candidate.start);
+
+  const start = allDay
     ? DateTime.fromISO(candidate.start, { zone })
     : DateTime.fromISO(candidate.start, { zone, setZone: true });
   if (!start.isValid) {
@@ -51,7 +57,7 @@ export function validateEventCandidate(
   }
 
   let end: DateTime;
-  if (candidate.allDay) {
+  if (allDay) {
     // Google Calendar's all-day events use an *exclusive* end date — the
     // day after the event's actual last day. The model reports a natural
     // inclusive last day (a single-day event as start === end; a 3-day
@@ -63,15 +69,19 @@ export function validateEventCandidate(
     // day short and rejected a same-day event outright (start === end
     // both parsing to the same midnight makes `end <= start` true).
     const lastInclusiveDay = candidate.end ? DateTime.fromISO(candidate.end, { zone }) : start;
-    if (!lastInclusiveDay.isValid) {
-      return { ok: false, reason: "invalid_end" };
-    }
-    end = lastInclusiveDay.plus({ days: 1 });
+    end = lastInclusiveDay.isValid ? lastInclusiveDay.plus({ days: 1 }) : start.plus({ days: 1 });
   } else {
-    end = candidate.end ? DateTime.fromISO(candidate.end, { zone, setZone: true }) : start.plus({ hours: 1 });
-    if (!end.isValid) {
-      return { ok: false, reason: "invalid_end" };
-    }
+    const stated = candidate.end ? DateTime.fromISO(candidate.end, { zone, setZone: true }) : null;
+    end = stated?.isValid ? stated : start.plus({ hours: 1 });
+  }
+
+  // The commitment the user cares about is when it *starts*. An end the
+  // model got wrong — before the start, or implausibly far after it — is a
+  // reason to fall back to a sensible default length, not to throw away a
+  // date the message really does state. A bad start is still fatal.
+  const statedDurationHours = end.diff(start, "hours").hours;
+  if (statedDurationHours <= 0 || statedDurationHours > maxDurationHours(allDay)) {
+    end = allDay ? start.plus({ days: 1 }) : start.plus({ hours: 1 });
   }
 
   const nowDt = DateTime.fromJSDate(now).setZone(zone);
@@ -81,43 +91,59 @@ export function validateEventCandidate(
   // the exact instant (as a timed event must) would reject every same-day
   // deadline unconditionally, exactly the "due today" case CLAUDE.md calls
   // out as something this app must be able to act on.
-  const earliestAllowedStart = candidate.allDay ? nowDt.startOf("day") : nowDt;
+  const earliestAllowedStart = allDay ? nowDt.startOf("day") : nowDt;
   if (start < earliestAllowedStart) {
     return { ok: false, reason: "past_event" };
   }
-  if (end <= start) {
-    return { ok: false, reason: "non_positive_duration" };
-  }
-
-  const durationHours = end.diff(start, "hours").hours;
-  if (candidate.allDay && durationHours > MAX_ALL_DAY_DURATION_DAYS * 24) {
-    return { ok: false, reason: "implausible_duration" };
-  }
-  if (!candidate.allDay && durationHours > MAX_TIMED_DURATION_HOURS) {
-    return { ok: false, reason: "implausible_duration" };
-  }
-
   return {
     ok: true,
     event: {
       title: candidate.title.trim(),
-      startIso: candidate.allDay ? start.toISODate()! : start.toISO()!,
-      endIso: candidate.allDay ? end.toISODate()! : end.toISO()!,
-      allDay: candidate.allDay,
+      startIso: allDay ? start.toISODate()! : start.toISO()!,
+      endIso: allDay ? end.toISODate()! : end.toISO()!,
+      allDay,
       timeZone: zone
     }
   };
 }
 
+function maxDurationHours(allDay: boolean): number {
+  return allDay ? MAX_ALL_DAY_DURATION_DAYS * 24 : MAX_TIMED_DURATION_HOURS;
+}
+
+/** True for "2026-09-18" and false for anything carrying a time of day. */
+function isDateOnly(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value.trim());
+}
+
 /**
- * Validates that a short quoted/paraphrased sourceEvidence string is
- * actually present in the normalized message it claims to justify a date
- * from, guarding against a hallucinated or injected date.
+ * Validates that the quoted sourceEvidence really appears in the message it
+ * claims to justify a date from, guarding against a hallucinated or injected
+ * date.
+ *
+ * The comparison is whitespace-insensitive and spans the subject as well as
+ * the body. Both matter in practice: plenty of real mail states the date in
+ * the subject alone ("Your appointment — Thu Sep 18, 2pm"), and a quote of
+ * body text that wrapped across a line arrives with a space where the body
+ * has a newline. Neither is a hallucination, but an exact substring match on
+ * the body alone rejected both, silently dropping real appointments. The
+ * check still requires the model's own words to appear, in order, in text the
+ * sender actually wrote.
  */
-export function sourceEvidencePresent(sourceEvidence: string | null, normalizedBodyText: string | null): boolean {
+export function sourceEvidencePresent(
+  sourceEvidence: string | null,
+  normalizedBodyText: string | null,
+  subject?: string | null
+): boolean {
   if (sourceEvidence === null || sourceEvidence.trim().length === 0) {
     return false;
   }
-  const haystack = (normalizedBodyText ?? "").toLowerCase();
-  return haystack.includes(sourceEvidence.trim().toLowerCase());
+  const needle = collapseForEvidence(sourceEvidence);
+  if (needle.length === 0) return false;
+  const haystack = collapseForEvidence(`${subject ?? ""}\n${normalizedBodyText ?? ""}`);
+  return haystack.includes(needle);
+}
+
+function collapseForEvidence(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, " ").trim();
 }

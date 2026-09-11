@@ -99,12 +99,24 @@ export async function insertIdempotentEvent(
     if (!isConflictError(error)) {
       throw error;
     }
-    const { data: existing } = await withGoogleApiRetry(() =>
-      client.events.get({
-        calendarId: "primary",
-        eventId: plan.eventId
-      }), {}, 1, "calendar.events.get"
-    );
+    let existing: calendar_v3.Schema$Event;
+    try {
+      const response = await withGoogleApiRetry(() =>
+        client.events.get({
+          calendarId: "primary",
+          eventId: plan.eventId
+        }), {}, 1, "calendar.events.get"
+      );
+      existing = response.data;
+    } catch (getError) {
+      if (apiErrorStatus(getError) !== 404) throw getError;
+      // Google reserves the ID of a deleted event, so an insert can conflict
+      // with an ID that then cannot be fetched. Nothing can be concluded
+      // about the remote state from that, and reporting a hard failure would
+      // make every later run repeat it forever. The deterministic ID makes a
+      // retry safe: it can only ever resolve to this same event.
+      return { kind: "ambiguous_retry" };
+    }
     const existingProvenance = existing.extendedProperties?.private?.["payloadHash"];
     if (existingProvenance === plan.provenance.payloadHash) {
       return { kind: "already_applied_by_this_app", event: existing };

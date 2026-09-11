@@ -506,7 +506,8 @@ async function classifyAndFinalize(
             promptVersion,
             schemaVersion,
             policyVersion: POLICY_VERSION,
-            existingLabels: deps.existingLabels ?? []
+            existingLabels: deps.existingLabels ?? [],
+            userTimeZone: deps.userTimezone
           });
         }
       }
@@ -1097,7 +1098,11 @@ async function finalizeOutcome(
     // short sourceEvidence is actually present in the normalized message
     // when it is used to justify a date"). Checked before the date/time
     // shape validation below, using the same downgrade-to-review path.
-    const evidenceOk = sourceEvidencePresent(calendarAction.event.sourceEvidence, normalized.bodyText ?? normalized.snippet);
+    const evidenceOk = sourceEvidencePresent(
+      calendarAction.event.sourceEvidence,
+      normalized.bodyText ?? normalized.snippet,
+      normalized.subject
+    );
     const validation = evidenceOk
       ? validateEventCandidate(calendarAction.event, deps.clock.now(), deps.userTimezone)
       : ({ ok: false, reason: "missing_source_evidence" } as const);

@@ -156,3 +156,49 @@ describe("FEW_SHOT_EXAMPLES", () => {
     expect(tags).toEqual(new Set(["spam", "suspicious", "important", "routine"]));
   });
 });
+
+describe("event date anchoring", () => {
+  const message = (overrides: Record<string, unknown> = {}) =>
+    buildNormalizedMessage({
+      gmailMessageId: "m1",
+      gmailThreadId: "t1",
+      historyId: "1",
+      internalDate: String(Date.UTC(2026, 8, 14, 12, 0, 0)),
+      labelIds: ["INBOX"],
+      snippet: "",
+      headers: headerMapFromList([
+        { name: "From", value: "Clinic <no-reply@clinic.example>" },
+        { name: "Subject", value: "Appointment confirmed" }
+      ]),
+      htmlBody: null,
+      plainBody: "Your appointment is next Thursday at 2pm.",
+      userEmail: "me@example.com",
+      threadHasUserSentMessage: false,
+      ...overrides
+    });
+
+  it("tells the model when the mail was sent and which timezone to resolve into", () => {
+    // Without both, "next Thursday" has no absolute instant and an
+    // unqualified "June 12" has no year — the model can only guess, and a
+    // guess that lands in the past is silently discarded as a past event.
+    const input = buildClassificationInput(message(), { userTimeZone: "America/Los_Angeles" });
+    expect(input).toContain("Email sent: 2026-09-14");
+    expect(input).toContain("Reader's timezone: America/Los_Angeles");
+  });
+
+  it("omits the anchor lines rather than inventing them when they are unknown", () => {
+    const input = buildClassificationInput(message({ internalDate: "0" }), {});
+    expect(input).not.toContain("Email sent:");
+    expect(input).not.toContain("Reader's timezone:");
+  });
+
+  it("keeps enough body for a confirmation that states its date below the boilerplate", () => {
+    const boilerplate = "Thank you for choosing our clinic. ".repeat(60);
+    const input = buildClassificationInput(
+      message({ plainBody: `${boilerplate}\nYour appointment is on 2026-10-02 at 9:15 AM.` }),
+      { userTimeZone: "UTC" }
+    );
+    expect(boilerplate.length).toBeGreaterThan(1500);
+    expect(input).toContain("2026-10-02 at 9:15 AM");
+  });
+});

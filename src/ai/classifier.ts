@@ -8,6 +8,12 @@ export interface ClassifyContext {
   policyVersion: string;
   /** The user's current Gmail label names, so the model prefers reusing one over inventing a near-duplicate. */
   existingLabels?: readonly string[];
+  /**
+   * The user's IANA timezone. Needed for event extraction: a message saying
+   * "Thursday at 2pm" has no absolute instant without one, and the model
+   * cannot ask.
+   */
+  userTimeZone?: string;
 }
 
 /**

@@ -21,7 +21,7 @@ function candidate(overrides: Partial<EventCandidate> = {}): EventCandidate {
 }
 
 describe("validateEventCandidate", () => {
-  it("preserves all 11 scenarios", async () => {
+  it("preserves all 12 scenarios", async () => {
     await runScenarios([
       { name: "accepts a valid future timed event", run: () => {
     const result = validateEventCandidate(candidate(), NOW, "UTC");
@@ -35,21 +35,40 @@ describe("validateEventCandidate", () => {
     );
     expect(result).toEqual({ ok: false, reason: "past_event" });
   } },
-      { name: "rejects end before start", run: () => {
+      { name: "falls back to a default length when the stated end is before the start", run: () => {
+    // The commitment is when it starts; an end the model got backwards is a
+    // reason to use a sensible default length, not to throw away a date the
+    // message really does state. The start is still evidence-checked.
     const result = validateEventCandidate(
       candidate({ start: "2099-06-01T11:00:00Z", end: "2099-06-01T10:00:00Z" }),
       NOW,
       "UTC"
     );
-    expect(result.ok).toBe(false);
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.event.startIso).toContain("2099-06-01T11:00");
+    expect(result.ok && result.event.endIso).toContain("2099-06-01T12:00");
   } },
-      { name: "rejects an implausibly long timed event", run: () => {
+      { name: "shortens an implausibly long timed event instead of discarding it", run: () => {
     const result = validateEventCandidate(
       candidate({ start: "2099-06-01T10:00:00Z", end: "2099-06-05T10:00:00Z" }),
       NOW,
       "UTC"
     );
-    expect(result).toEqual({ ok: false, reason: "implausible_duration" });
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.event.endIso).toContain("2099-06-01T11:00");
+  } },
+      { name: "treats a date-only start as all-day however the model labelled it", run: () => {
+    // "2099-06-01" as a timed event put a real appointment at midnight, and
+    // for anything later the same day it was then rejected as past.
+    const result = validateEventCandidate(
+      candidate({ start: "2099-06-01", end: null, allDay: false }),
+      NOW,
+      "UTC"
+    );
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.event.allDay).toBe(true);
+    expect(result.ok && result.event.startIso).toBe("2099-06-01");
+    expect(result.ok && result.event.endIso).toBe("2099-06-02");
   } },
       { name: "rejects a non-create intent", run: () => {
     const result = validateEventCandidate(candidate({ intent: "none" }), NOW, "UTC");
@@ -138,5 +157,27 @@ describe("sourceEvidencePresent", () => {
     expect(sourceEvidencePresent("  ", "anything")).toBe(false);
   } }
     ]);
+  });
+});
+
+describe("sourceEvidencePresent", () => {
+  const body = "Hi Sam,\n\nYour appointment is confirmed for\nThursday, September 18 at 2:00 PM.\n\nThanks";
+
+  it("accepts a quote whose line break the model rendered as a space", () => {
+    // The body wraps mid-sentence; the model quotes it as one line. An exact
+    // substring match on the raw body called that a hallucination and threw
+    // away a real appointment.
+    expect(sourceEvidencePresent("confirmed for Thursday, September 18 at 2:00 PM", body)).toBe(true);
+  });
+
+  it("accepts evidence that appears only in the subject", () => {
+    // Plenty of mail states the date in the subject and nowhere else.
+    expect(sourceEvidencePresent("Thu Sep 18, 2pm", null, "Your appointment — Thu Sep 18, 2pm")).toBe(true);
+  });
+
+  it("still rejects a date the message never states", () => {
+    expect(sourceEvidencePresent("Friday, September 19 at 4:00 PM", body, "Your appointment")).toBe(false);
+    expect(sourceEvidencePresent(null, body)).toBe(false);
+    expect(sourceEvidencePresent("   ", body)).toBe(false);
   });
 });

@@ -78,7 +78,7 @@ export class OpenAiClassifier implements Classifier {
             {
               model: this.model,
               instructions: buildDeveloperInstructions(context.existingLabels ?? []),
-              input: buildInputWithExamples(message),
+              input: buildInputWithExamples(message, context.userTimeZone),
               store: false,
               text: { format: zodTextFormat(EmailFlagsSchema, "email_flags") },
               // This is a small fixed-schema flag classification, not an
@@ -120,12 +120,15 @@ export class OpenAiClassifier implements Classifier {
 }
 
 /** Few-shot example turns (fixed prefix) followed by the real, untrusted message. */
-function buildInputWithExamples(message: NormalizedMessage) {
+function buildInputWithExamples(message: NormalizedMessage, userTimeZone: string | undefined) {
   const exampleTurns = FEW_SHOT_EXAMPLES.flatMap((example) => [
     { role: "user" as const, content: example.input },
     { role: "assistant" as const, content: JSON.stringify(example.output) }
   ]);
-  return [...exampleTurns, { role: "user" as const, content: buildClassificationInput(message) }];
+  return [
+    ...exampleTurns,
+    { role: "user" as const, content: buildClassificationInput(message, { userTimeZone }) }
+  ];
 }
 
 function extractRefusal(response: { output?: readonly unknown[] }): string | null {
