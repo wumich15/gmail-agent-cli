@@ -364,3 +364,38 @@ describe("openDatabase", () => {
     db.close();
   });
 });
+
+describe("history marker advancement", () => {
+  it("never retreats a marker to null, so a capped scan cannot cost a full rescan", () => {
+    const db = openDatabase(freshDbPath());
+    {
+      const accounts = new AccountsRepository(db);
+      accounts.upsert({
+        accountHash: "acct",
+        emailDisplay: "person@example.com",
+        historyMarker: null,
+        timezone: "UTC",
+        automationEnabled: false,
+        setupComplete: true,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      });
+
+      accounts.advanceHistoryMarker("acct", "1000", "2026-01-02T00:00:00.000Z");
+      expect(accounts.get("acct")?.historyMarker).toBe("1000");
+
+      // A truncated or partly-failed pass earns no new marker. Keeping the
+      // old one is safe — it only ever replays more history, never less —
+      // and clearing it would force the next run to re-list the whole
+      // mailbox, which is the opposite of what --limit is for.
+      accounts.advanceHistoryMarker("acct", null, "2026-01-03T00:00:00.000Z");
+      expect(accounts.get("acct")?.historyMarker).toBe("1000");
+      expect(accounts.get("acct")?.updatedAt).toBe("2026-01-03T00:00:00.000Z");
+
+      // `gmail uncache` still resets it deliberately.
+      accounts.updateHistoryMarker("acct", null, "2026-01-04T00:00:00.000Z");
+      expect(accounts.get("acct")?.historyMarker).toBeNull();
+    }
+    db.close();
+  });
+});

@@ -231,7 +231,10 @@ export async function runCache(options: CacheOptions = {}): Promise<number> {
         const staleIds = existingRows.filter((row) => !activeIds.has(row.gmailMessageId)).map((row) => row.gmailMessageId);
         messagesRepo.applyCacheBatch(account.accountHash, [], staleIds);
       }
-      new AccountsRepository(ctx.db).updateHistoryMarker(account.accountHash, newHistoryMarker, ctx.clock.nowIso());
+      // Advance only on a complete snapshot; an incomplete one keeps whatever
+      // baseline already existed rather than destroying it (see
+      // AccountsRepository.advanceHistoryMarker).
+      new AccountsRepository(ctx.db).advanceHistoryMarker(account.accountHash, newHistoryMarker, ctx.clock.nowIso());
       const completedAt = ctx.clock.nowIso();
       new SettingsRepository(ctx.db).set(account.accountHash, SETTING_KEYS.cacheLastRunAt, completedAt, completedAt);
     })();
@@ -242,7 +245,7 @@ export async function runCache(options: CacheOptions = {}): Promise<number> {
       `Cached ${cached} message(s)${removed > 0 ? ` (${removed} no longer in Inbox/Spam)` : ""}${failed > 0 ? ` (${failed} failed and were skipped)` : ""}. ` +
         (snapshotComplete
           ? "Future `gmail`/`gmail work` runs will hydrate this cached backlog once, then scan incrementally from here."
-          : "The snapshot was incomplete, so its history baseline was cleared; a later full run can safely recover the omitted messages.")
+          : "The snapshot was incomplete, so it did not establish a new history baseline; any existing one is kept and a later full run recovers the omitted messages.")
     );
     return failed > 0 ? EXIT_CODES.operationalFailure : EXIT_CODES.ok;
   } finally {

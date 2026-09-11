@@ -61,9 +61,29 @@ export class AccountsRepository {
   }
 
   /** Pass null to reset the marker (e.g. `gmail uncache`), forcing the next scan to do a full snapshot. */
+  /** Sets the marker to exactly this value, including null. `gmail uncache`'s deliberate reset. */
   updateHistoryMarker(accountHash: string, historyMarker: string | null, updatedAt: string): void {
     this.db
       .prepare("UPDATE accounts SET history_marker = ?, updated_at = ? WHERE account_hash = ?")
+      .run(historyMarker, updatedAt, accountHash);
+  }
+
+  /**
+   * Moves the marker forward, or leaves it alone when this pass did not earn
+   * a new one.
+   *
+   * Scan checkpoints must never *retreat* a marker to null. A marker means
+   * "everything up to here has been seen", which stays true no matter how
+   * little the current run managed to process — while clearing it forces the
+   * next run into a full Inbox+Spam re-listing. That is the opposite of what
+   * a user reaching for `--limit` wants, since they are capping the scan
+   * precisely because they are under Gmail quota pressure.
+   */
+  advanceHistoryMarker(accountHash: string, historyMarker: string | null, updatedAt: string): void {
+    this.db
+      .prepare(
+        "UPDATE accounts SET history_marker = COALESCE(?, history_marker), updated_at = ? WHERE account_hash = ?"
+      )
       .run(historyMarker, updatedAt, accountHash);
   }
 }

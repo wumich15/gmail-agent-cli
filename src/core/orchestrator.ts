@@ -776,8 +776,9 @@ async function runIncrementalScan(
     outcomes,
     // Advancing to history.endHistoryId after slicing the work list would
     // permanently discard the omitted changes despite the old note saying
-    // they would be reconciled later. Clearing the marker forces a safe
-    // full recovery on the next uncapped run.
+    // they would be reconciled later. Returning null earns no new marker;
+    // the caller keeps the existing one, so the omitted changes are replayed
+    // from where the account already was rather than costing a full rescan.
     newHistoryMarker: truncationNote !== null ? null : failed.length > 0 ? deps.historyMarker ?? null : history.endHistoryId,
     usedIncrementalSync: true,
     scanNote: truncationNote ? `${truncationNote} ${incrementalNote}` : incrementalNote,

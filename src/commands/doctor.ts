@@ -21,11 +21,14 @@ interface CheckResult {
 export async function runDoctor(): Promise<number> {
   const results: CheckResult[] = [];
 
-  const nodeMajor = Number(process.versions.node.split(".")[0]);
+  // Must match the `engines` floor in package.json; reporting "ok" on a
+  // runtime the package refuses to install on is worse than no check.
+  const [nodeMajor, nodeMinor] = process.versions.node.split(".").map((part) => Number.parseInt(part, 10));
+  const nodeSupported = (nodeMajor ?? 0) > 22 || ((nodeMajor ?? 0) === 22 && (nodeMinor ?? 0) >= 19);
   results.push({
     name: "Node.js runtime",
-    status: nodeMajor >= 20 ? "ok" : "fail",
-    detail: `Node ${process.version} (>= 20 required)`
+    status: nodeSupported ? "ok" : "fail",
+    detail: `Node ${process.version} (>= 22.19 required)`
   });
 
   let ctx: ReturnType<typeof bootstrap> | null = null;

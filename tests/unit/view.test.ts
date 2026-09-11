@@ -172,7 +172,7 @@ describe("unprompted delete (\"dd\")", () => {
     // No prompt module is involved at all: this path asks nothing.
     const result = await trashCached(client as never, repo as never, message);
 
-    expect(result).toBe(message);
+    expect(result).toEqual({ ok: true, record: message });
     expect(trash).toHaveBeenCalledWith({ userId: "me", id: "m1" }, expect.anything());
     expect(repo.delete).toHaveBeenCalledWith("account", "m1");
   });
@@ -189,11 +189,16 @@ describe("unprompted delete (\"dd\")", () => {
 
   it("records no undo and keeps the cached row when Gmail rejects the delete", async () => {
     const { client, repo } = harness(() => Promise.reject(new Error("permission denied")));
-    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     const result = await trashCached(client as never, repo as never, row("m1", ["INBOX"], "Junk", "Store"));
 
-    expect(result).toBeNull();
+    expect(result.ok).toBe(false);
     expect(repo.delete).not.toHaveBeenCalled();
+    // The failure is returned, not printed: "dd" clears the screen on its
+    // next render, so a printed error would vanish and the message would
+    // look deleted when it is still in the mailbox.
+    expect(errors).not.toHaveBeenCalled();
+    expect(result.ok ? "" : result.message).toContain("permission denied");
   });
 });

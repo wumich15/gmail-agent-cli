@@ -1,7 +1,13 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "rootDir": "src"
+    "rootDir": "src",
+    // This package ships one executable (`bin: gmail`) and no importable API,
+    // and `files: ["dist"]` excludes src/ — so declarations describe an entry
+    // point nobody imports, and every .js.map points at a source file that is
+    // not in the tarball. Both are pure download weight for users.
+    "declaration": false,
+    "sourceMap": false
   },
   "include": ["src"]
 }

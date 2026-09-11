@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readFileSync } from "node:fs";
 import { Command, InvalidArgumentError } from "commander";
 import pc from "picocolors";
 import { runWork } from "./commands/work.js";
@@ -48,12 +49,31 @@ const VIEW_HELP_TEXT = renderViewControlsHelp();
 // are deliberately absent from the public reference. Re-add them in both
 // places when they are back in scope.
 
+/**
+ * The published version, read from the package itself rather than repeated
+ * here. A literal in this file silently drifts the moment package.json is
+ * bumped, and `gmail --version` reporting a different number than the
+ * installed package is exactly the sort of thing a bug report is filed
+ * against. `dist/cli.js` and `src/cli.ts` are both one directory below the
+ * package root, so the same relative path works in a build and from source.
+ */
+function packageVersion(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+      version?: unknown;
+    };
+    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+}
+
 const program = new Command();
 
 program
   .name("gmail")
   .description("Local terminal agent that cleans up Gmail and creates Calendar events from actionable mail.")
-  .version("0.1.0")
+  .version(packageVersion())
   .option("--dry-run", "preview without making changes", false)
   .option("--json", "emit a single JSON summary to stdout", false)
   .option(

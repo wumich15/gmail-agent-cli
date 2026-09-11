@@ -4,9 +4,9 @@ import { spawn } from "node:child_process";
 import { bootstrap } from "../core/bootstrap.js";
 import { resolveAccountSigningInIfNeeded } from "./shared.js";
 import { runCache } from "./cache.js";
+import { latestCacheRefreshAt } from "./work.js";
 import { MessagesRepository, type CachedMessageRecord } from "../state/repositories/messages.js";
 import { AccountsRepository } from "../state/repositories/accounts.js";
-import { SETTING_KEYS, SettingsRepository } from "../state/repositories/settings.js";
 import { fetchMessageFull, headersFromMessage } from "../gmail/scanner.js";
 import { buildNormalizedMessage, extractBodyParts } from "../gmail/normalize.js";
 import { GMAIL_LABELS, isRead } from "../gmail/labels.js";
@@ -74,7 +74,6 @@ export async function runView(options: ViewOptions): Promise<number> {
   if (options.previous) {
     console.error(pc.dim("Using the previous Gmail cache without refreshing it."));
   } else {
-    const settings = new SettingsRepository(ctx.db);
     // `gmail cache`'s own full-snapshot timestamp and gmail view's own
     // incremental-refresh timestamp are tracked separately (see
     // gmail/view-sync.ts), but whichever happened more recently is what
@@ -83,9 +82,7 @@ export async function runView(options: ViewOptions): Promise<number> {
     // been refreshing itself the whole time (via "u" or on every launch)
     // still claim to be looking at data from whenever `gmail cache` last
     // ran, however long ago that was.
-    const lastCacheAt = settings.get(account.accountHash, SETTING_KEYS.cacheLastRunAt);
-    const lastViewRefreshAt = settings.get(account.accountHash, SETTING_KEYS.viewLastRefreshAt);
-    const lastSyncAt = [lastCacheAt, lastViewRefreshAt].filter((value): value is string => value !== null).sort().at(-1) ?? null;
+    const lastSyncAt = latestCacheRefreshAt(ctx.db, account.accountHash);
     console.error(pc.dim(lastSyncAt ? `Updating mail cached ${formatAge(lastSyncAt)}...` : "Updating cached mail..."));
 
     refresh = await refreshViewCacheLocked(ctx, gmailClient, account);
@@ -390,11 +387,13 @@ export async function runView(options: ViewOptions): Promise<number> {
       // is the following message — so repeating "dd" walks down the list.
       if (pageItems.length > 0) {
         const target = pageItems[selectedRow]!;
-        const trashed = await trashCached(gmailClient, messagesRepo, target);
-        if (trashed) {
-          lastTrashed = trashed;
-          notice = `Moved "${trashed.subject || "(no subject)"}" to Trash. ";u" undoes it.`;
+        const outcome = await trashCached(gmailClient, messagesRepo, target);
+        if (outcome.ok) {
+          lastTrashed = outcome.record;
+          notice = `Moved "${outcome.record.subject || "(no subject)"}" to Trash. ";u" undoes it.`;
           all = messagesRepo.listForAccount(account.accountHash);
+        } else {
+          notice = outcome.message;
         }
       }
       continue;
@@ -792,9 +791,13 @@ async function confirmAndTrash(
     console.log(pc.dim("Not deleted."));
     return null;
   }
-  const trashed = await trashCached(gmailClient, messagesRepo, cached);
-  if (trashed) console.log(pc.green('Moved to Trash. Type ";u" to undo.'));
-  return trashed;
+  const outcome = await trashCached(gmailClient, messagesRepo, cached);
+  if (!outcome.ok) {
+    console.error(pc.red(outcome.message));
+    return null;
+  }
+  console.log(pc.green('Moved to Trash. Type ";u" to undo.'));
+  return outcome.record;
 }
 
 /**
@@ -808,18 +811,24 @@ async function confirmAndTrash(
  * reporting it, so a caller never records an undo for a delete that did
  * not happen.
  */
+export type TrashOutcome =
+  | { ok: true; record: CachedMessageRecord }
+  | { ok: false; message: string };
+
 export async function trashCached(
   gmailClient: GmailClient,
   messagesRepo: MessagesRepository,
   cached: CachedMessageRecord
-): Promise<CachedMessageRecord | null> {
+): Promise<TrashOutcome> {
   try {
     await trashMessage(gmailClient, cached.gmailMessageId);
     messagesRepo.delete(cached.accountHash, cached.gmailMessageId);
-    return cached;
+    return { ok: true, record: cached };
   } catch (error) {
-    console.error(pc.red(`Failed to move to Trash: ${error instanceof Error ? error.message : String(error)}`));
-    return null;
+    // Returned rather than printed: "dd" deliberately has no "press any key"
+    // pause, so anything written here would be erased by the next redraw and
+    // the message would appear to have been deleted when it was not.
+    return { ok: false, message: `Could not move to Trash: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
@@ -899,10 +908,19 @@ export function openUrlInBrowser(url: string): void {
     command = "xdg-open";
     args = [url];
   }
-  try {
-    spawn(command, args, { stdio: "ignore", detached: true }).unref();
-  } catch {
+  const fallback = (): void => {
     console.error(pc.yellow(`Could not launch a browser automatically. Open this URL manually: ${url}`));
+  };
+  try {
+    const child = spawn(command, args, { stdio: "ignore", detached: true });
+    // A missing launcher (no xdg-open on a minimal Linux box) surfaces as an
+    // asynchronous "error" event, never as a throw — and an unhandled one
+    // takes the whole CLI down. The catch below only covers synchronous
+    // spawn failures, so both paths need handling.
+    child.on("error", fallback);
+    child.unref();
+  } catch {
+    fallback();
   }
 }
 

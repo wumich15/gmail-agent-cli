@@ -916,7 +916,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
 
         // Advance only after every other part of the checkpoint above is
         // ready to commit atomically.
-        new AccountsRepository(ctx.db).updateHistoryMarker(account.accountHash, newHistoryMarker, finishedAt);
+        new AccountsRepository(ctx.db).advanceHistoryMarker(account.accountHash, newHistoryMarker, finishedAt);
       });
       diagnosticsLog.phase("checkpoint");
       persistCheckpoint();

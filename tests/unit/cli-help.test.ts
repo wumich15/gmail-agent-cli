@@ -44,6 +44,13 @@ describe("gmail help", () => {
 });
 
 describe("packaging", () => {
+  it("reports the package's own version, not a literal that drifts when it is bumped", () => {
+    const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
+    const result = runCli("--version");
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe(pkg.version);
+  });
+
   it.skipIf(process.platform === "win32")(
     "declares a build that leaves the CLI entry point executable",
     () => {
