@@ -24,7 +24,7 @@ Use the sent-mail examples only to imitate the user's usual tone, brevity, greet
 export interface DraftReplyOptions {
   /** Omitted means the direct OpenAI Responses API. */
   provider?: AiProvider;
-  /** Google ID token for managed AI, otherwise the user's provider key. */
+  /** The user's own provider key. */
   apiKey: string;
   model: string;
   baseURL?: string | null;

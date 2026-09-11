@@ -2,9 +2,11 @@
 
 Clean up Gmail, browse your inbox in the terminal, and compose messages from the command line. The executable is `gmail`.
 
-**[Documentation](docs/README.md)** · [All commands and keyboard shortcuts](docs/commands.md) · [Production release](docs/production.md) · [Development](docs/development.md)
+**[Documentation](docs/README.md)** · [Setup walkthrough](docs/setup.md) · [All commands and keyboard shortcuts](docs/commands.md) · [Development](docs/development.md)
 
-Mailbox access and automation run on your own computer. `gmail ui` opens a small local browser page for setup, the command reference, and status. A publisher-built release includes Google sign-in, so setup is just **Connect Gmail** and Google's consent screen. It also includes publisher-funded, server-side GPT access for classification and writing with no user API key or local AI installation. Developers can still test directly with their own OpenAI key.
+Everything runs on your own computer. There is no server, no hosted account, and no service in the middle: you connect the tool to your own Google project and your own AI provider key, and your mail never passes through anyone else's infrastructure. `gmail ui` opens a small local browser page for setup, the command reference, and status.
+
+**New here? [Follow the setup walkthrough](docs/setup.md)** — about ten minutes, once per computer.
 
 ## What it does
 
@@ -39,28 +41,21 @@ gmail --help
 
 If pnpm reports a missing global bin directory, run `pnpm setup`, reopen your terminal, and retry the link. You can also use `node dist/cli.js` in place of `gmail` in every example below. Rebuild after changing source code.
 
-### 2. Connect Gmail
+### 2. Connect it to your own Google project
 
-A publisher-built release needs no Google Cloud setup, credentials file, or API key from the user. Run `gmail ui` and press **Connect Gmail**.
+Google requires an app to identify itself before it can touch a mailbox, and this tool ships no shared identity on purpose — a shared one would put whoever registered it in the path of everyone else's mail and API quota. So you register a Google app of your own, once:
 
-When running directly from a source checkout, use a separate development OAuth project:
+1. Create a project at [console.cloud.google.com](https://console.cloud.google.com/projectcreate) (any name).
+2. Enable the **Gmail API** and the **Google Calendar API** in it.
+3. On the **OAuth consent screen**, choose **External**, add your own Gmail address as a test user, and add exactly two scopes: `https://www.googleapis.com/auth/gmail.modify` and `https://www.googleapis.com/auth/calendar.events.owned`.
+4. Under **Credentials**, create an **OAuth client ID** of type **Desktop app**.
+5. Run `gmail setup` (or `gmail ui`) and paste the client ID and client secret.
 
-1. Create or select a project in the [Google Cloud Console](https://console.cloud.google.com/).
-2. Enable **Gmail API** and **Google Calendar API**.
-3. Configure the Google Auth platform consent screen with the app name and contact details. For personal Gmail, select an external audience and add your Gmail address as a test user while the app is in Testing.
-4. Configure the requested scopes: `openid`, `email`, `https://www.googleapis.com/auth/gmail.modify`, and `https://www.googleapis.com/auth/calendar.events.owned`.
-5. Under **Clients**, create an OAuth client with application type **Desktop app**. Obtain the client ID and client secret. This is an OAuth client, not an API key; the app handles its local browser callback.
+They are saved on this computer only, with owner-only permissions; the refresh token from signing in goes to your OS credential store. `GMAIL_AGENT_OAUTH_CLIENT_ID` / `GMAIL_AGENT_OAUTH_CLIENT_SECRET` override the saved file when set.
 
-See Google's [desktop OAuth guide](https://developers.google.com/identity/protocols/oauth2/native-app) and [Gmail scope documentation](https://developers.google.com/workspace/gmail/api/auth/scopes). External apps in Testing using Gmail scopes have refresh tokens that expire after seven days; public distribution needs the applicable verification process. [Token expiration documentation](https://developers.google.com/identity/protocols/oauth2#expiration)
+While the consent screen is in **Testing**, Google expires the sign-in every 7 days for Gmail scopes. Pressing **Publish app** (and clicking past the one-time "unverified app" warning) makes it persist. You are the only user either way — verification only matters if you hand the app to other people.
 
-Set these variables in the terminal running the CLI. Example syntax for macOS/Linux shells:
-
-```sh
-export GMAIL_AGENT_OAUTH_CLIENT_ID="your-desktop-client-id"
-export GMAIL_AGENT_OAUTH_CLIENT_SECRET="your-desktop-client-secret"
-```
-
-Both variables are needed on subsequent authenticated development runs too. Keep real credentials outside the repository, in a private environment or secret manager. The app does **not** automatically load `.env` files. Publishers should follow the separate [production release guide](docs/production.md); its build command embeds the verified Desktop client only in the generated release artifact and refuses to publish an unconfigured build.
+The [setup walkthrough](docs/setup.md) has the same steps with every field named, plus troubleshooting.
 
 ### 3. Sign in and preview
 
@@ -94,25 +89,22 @@ gmail view --previous
 
 ### 4. Choose how AI works
 
-`gmail setup` (or the Setup page in `gmail ui`) offers three options and shows what each one costs before you pick it:
+`gmail setup` (or the Setup page in `gmail ui`) offers two options and shows what each one costs before you pick it:
 
 | Option | What it needs | Where your mail is processed |
 | --- | --- | --- |
-| **Included GPT (no API key)** | A publisher release with its AI service enabled. No OpenAI account, key, model download, or extra software. Usage limits may apply. | Selected message text goes through the publisher-operated gateway to OpenAI. Gmail tokens and attachments do not. |
-| Your own OpenAI API key (advanced development) | An OpenAI account and key you create and pay for per use. | Selected message text (never attachments) goes directly to the OpenAI API. |
-| No AI — rules only | Nothing. | Nowhere. |
+| **Your own OpenAI API key** | An OpenAI account and a key you create at [platform.openai.com](https://platform.openai.com/api-keys). You pay per use — triage is a fraction of a cent per message. | Selected message text (never attachments) goes from this computer directly to the OpenAI API, under your account. |
+| **No AI — rules only** | Nothing. | Nowhere. |
 
-Included GPT is the normal production path. The publisher keeps its OpenAI key on the server; users never receive it and do not install or run a local model. Choosing Included GPT still asks for explicit consent before selected message text is sent off the device.
+Choosing the key option asks for explicit consent before any message text leaves the device, and stores the key in your OS credential store — never in `config.json`, a log, or a shell command.
 
 Rules-only mode is a real mode, not a preview: native-spam cleanup, your own rules, and archiving read mail all still work without any AI. Manual reading, composing, and replying never need AI.
 
-`aiEnabled` in `config.json` is a genuine off switch — with it off, no classification or drafting call is made even if a hosted provider is configured. A schema-v2 local-model configuration is migrated to Included GPT on first read and its incompatible local URL/model values are removed.
+`aiEnabled` in `config.json` is a genuine off switch — with it off, no classification or drafting call is made even if a key is present. Configurations left behind by earlier versions that offered a local model runtime or a hosted gateway are migrated to the direct-OpenAI provider with AI switched off, so setup asks before anything starts billing your account.
 
-Classification uses the saved `model`; drafting uses `composeModel`. `GMAIL_AGENT_MODEL` and `GMAIL_AGENT_COMPOSE_MODEL` override them on each run. For headless automation, `OPENAI_API_KEY` is still read from the environment when no key is stored in the credential store. Advanced users can point `aiProvider`/`aiBaseUrl` at an `openai-compatible` Responses API endpoint; see [configuration details](docs/development.md#configuration).
+Classification uses the saved `model`; drafting uses `composeModel`. `GMAIL_AGENT_MODEL` and `GMAIL_AGENT_COMPOSE_MODEL` override them on each run. For headless automation, `OPENAI_API_KEY` is read from the environment when no key is stored in the credential store. To use any other endpoint implementing the same Responses API — including a model you run yourself — set `aiProvider`/`aiBaseUrl` to `openai-compatible`; see [configuration details](docs/development.md#configuration).
 
-To test against real GPT models from a source checkout, set `OPENAI_API_KEY`, leave `GMAIL_AGENT_MODEL` / `GMAIL_AGENT_COMPOSE_MODEL` at their defaults (or set another enabled GPT model), and choose **Your own OpenAI API key** in setup. This direct developer path does not depend on the publisher gateway.
-
-Hosted AI sends selected email text to the provider. Drafting can use recent Sent mail to build a saved writing-style description (only the description is stored, never the sampled mail). Calls use `store: false`, which is not a promise of zero provider retention — review the provider's data handling before choosing that option.
+Sending mail text to OpenAI is still sending it to a third party. Calls use `store: false`, which is not a promise of zero provider retention — review OpenAI's data handling before choosing that option. Drafting can use recent Sent mail to build a saved writing-style description (only the description is stored, never the sampled mail).
 
 ### 5. Run cleanup when ready
 
@@ -161,12 +153,12 @@ Tokens and stored AI keys use the OS credential store. SQLite contains mailbox m
 | Problem | What to check |
 | --- | --- |
 | `gmail` is not found | Reopen the terminal after pnpm setup/linking, or run `node dist/cli.js`. |
-| No OAuth client configured | Use a publisher-built release, or set both `GMAIL_AGENT_OAUTH_CLIENT_*` variables for a source checkout. |
+| No OAuth client configured | Run `gmail setup` and paste your Desktop OAuth client, or set both `GMAIL_AGENT_OAUTH_CLIENT_*` variables. See [setup](docs/setup.md). |
 | Google rejects sign-in | Check the Desktop client, enabled APIs, test-user address, and Workspace administrator restrictions. |
 | Sign-in expires after a week | Check the OAuth app's Testing status and token expiration. |
 | Expired or revoked authorization | Run `gmail setup` and choose **Reconnect Gmail**, or press Connect on the `gmail ui` Setup page. The unusable token is erased automatically the next time it is found to be dead, and a normal run offers to sign in again. |
 | Credential store unavailable | Install/rebuild `keytar` if needed and unlock/start the OS credential service. There is no plaintext fallback. |
-| AI unavailable | Run `gmail setup`: it reports whether Included GPT can authenticate to the publisher service or whether a development key is usable. Rules-only cleanup can still change mail. |
+| AI unavailable | Run `gmail setup`: it reports whether your stored API key is usable. Rules-only cleanup can still change mail. |
 | Browser page will not load | The `gmail ui` URL only works while that command is running, and only from this computer. Restart it to get a fresh link. |
 | Gmail quota exceeded | Let the queue back off; extra keys in one project do not add quota. See [performance notes](docs/development.md#gmail-performance). |
 | Cache looks stale | Refresh with `u` in the view or `gmail cache`. `gmail uncache` forces a rebuild on the next scan. |

@@ -21,9 +21,12 @@ describe("defaultConfig", () => {
     expect(config.aiBaseUrl).toBeUndefined();
   });
 
-  it("defaults a gateway-configured development build to the managed provider", () => {
-    process.env["GMAIL_AGENT_AI_GATEWAY_URL"] = "https://ai.example.test";
-    expect(defaultConfig("UTC").aiProvider).toBe("managed");
+  it("honors an explicit provider override for a headless install", () => {
+    process.env["GMAIL_AGENT_AI_PROVIDER"] = "openai-compatible";
+    process.env["GMAIL_AGENT_AI_BASE_URL"] = "https://models.example.test/v1";
+    const config = defaultConfig("UTC");
+    expect(config.aiProvider).toBe("openai-compatible");
+    expect(config.aiBaseUrl).toBe("https://models.example.test/v1");
   });
 });
 
@@ -48,14 +51,19 @@ describe("ConfigSchema", () => {
     ).toThrow();
   });
 
-  it("rejects the removed local provider in current configs", () => {
-    expect(() =>
-      parseConfig({
+  it("rewrites a retired provider rather than rejecting a config the user cannot fix by hand", () => {
+    for (const retired of ["ollama", "managed"]) {
+      const config = parseConfig({
         schemaVersion: 3,
         timezone: "UTC",
-        aiProvider: "ollama"
-      })
-    ).toThrow();
+        aiEnabled: true,
+        aiProvider: retired,
+        aiBaseUrl: "http://127.0.0.1:11434"
+      });
+      expect(config.aiProvider).toBe("openai");
+      expect(config.aiEnabled).toBe(false);
+      expect(config.aiBaseUrl).toBeUndefined();
+    }
   });
 
   it("fills in composeModel for a config file written before it existed", () => {

@@ -9,8 +9,7 @@
 | `src/core/` | Orchestration, policy, action planning, locks, retries. |
 | `src/auth/`, `src/config/` | Google OAuth, credentials, configuration. |
 | `src/gmail/`, `src/calendar/` | Mail and Calendar service adapters and operations. |
-| `src/ai/`, `src/rules/` | Hosted classification and drafting plus deterministic rules. |
-| `src/gateway/` | Publisher-operated GPT gateway: Google identity verification, request restrictions, quotas, and server-side OpenAI access. |
+| `src/ai/`, `src/rules/` | Classification and drafting against the user's own provider, plus deterministic rules. |
 | `src/ui/`, `src/docs/` | The loopback browser front-end (`gmail ui`) and the shared command reference that terminal help and the web Commands view both render. |
 | `src/state/`, `src/summary/`, `src/logging/` | SQLite state, reporting, diagnostics. |
 | `src/unsubscribe/` | Unsubscribe support used by older handlers. |
@@ -43,24 +42,24 @@ Setup creates `config.json` in the platform data directory listed in the README.
 
 | Setting or environment variable | Behavior |
 | --- | --- |
-| `GMAIL_AGENT_OAUTH_CLIENT_ID`, `GMAIL_AGENT_OAUTH_CLIENT_SECRET` | Desktop OAuth configuration needed for each authenticated development run. |
-| `GMAIL_AGENT_AI_GATEWAY_URL` | Development override for the included GPT gateway. HTTPS required except on loopback. |
-| `OPENAI_API_KEY` | AI credential fallback after OS credential lookup, for headless use. Only consulted for a hosted provider. |
+| `GMAIL_AGENT_OAUTH_CLIENT_ID`, `GMAIL_AGENT_OAUTH_CLIENT_SECRET` | Desktop OAuth client. Takes precedence over the client saved by `gmail setup` in `google-oauth-client.json`. |
+| `GMAIL_AGENT_DATA_DIR` | Relocates config, SQLite state, logs, and the saved OAuth client. Used by tests; also useful for keeping state on an encrypted volume. |
+| `OPENAI_API_KEY` | AI credential fallback after OS credential lookup, for headless use. |
 | `timezone` | IANA timezone confirmed during setup. |
 | `model`, `composeModel` | Separate models for classification and drafting. |
 | `GMAIL_AGENT_MODEL`, `GMAIL_AGENT_COMPOSE_MODEL` | Live overrides of saved model names. |
-| `aiProvider` | `managed`, `openai`, or `openai-compatible`. |
-| `aiBaseUrl` | Required for `openai-compatible`; ignored for `managed` and `openai`. |
+| `aiProvider` | `openai` or `openai-compatible`. |
+| `aiBaseUrl` | Required for `openai-compatible`; ignored for `openai`. |
 | `GMAIL_AGENT_AI_PROVIDER`, `GMAIL_AGENT_AI_BASE_URL` | Seed a newly created config; do not override an existing file on every run. |
 | `concurrency` | Defaults: `gmailReads: 8`, `aiCalls: 5`, `calendarWrites: 2`. Parallelism does not increase quota. |
 | `aiEnabled` | A real off switch: false means no classification or drafting call is made, whatever credentials exist. Set it through `gmail setup`. |
 | `automationEnabled` | Legacy field; not an operational off switch. |
-| `schemaVersion` | `3`. A `1` file records its effective legacy AI state; a `2` file using the former local provider moves to Included GPT and discards incompatible local settings. Migrated files are rewritten in place. |
+| `schemaVersion` | `3`. A `1` file records its effective legacy AI state; a file naming a retired provider (the former local runtime, or the former hosted gateway) moves to `openai` with `aiEnabled: false` and discards incompatible settings, so setup asks before anything bills the user's own account. Migrated files are rewritten in place. |
 | `GMAIL_AGENT_RATE_LIMIT_RPS` | Advanced read-equivalent rate override for a verified quota. |
 
 Prefer `gmail setup` over editing the file: it writes the same fields and validates them. Hand-editing still works for advanced cases.
 
-`managed` authenticates the signed-in user to the publisher gateway with a short-lived Google ID token; it never sends the gateway a Gmail access or refresh token. `openai` and `openai-compatible` are development/advanced paths that require a user key and a Responses API endpoint with Structured Outputs; Chat Completions compatibility alone is insufficient. Production users do not install a local model runtime.
+Both providers require the user's own key and a Responses API endpoint with Structured Outputs; Chat Completions compatibility alone is insufficient. There is deliberately no hosted option: this tool has no server, so no third party's key, quota, or logs are ever in the path.
 
 Config written during sign-in is reloaded into the running process (`core/bootstrap.ts`'s `reloadConfig`), so a provider chosen during first-run setup takes effect in that same run rather than the next one.
 

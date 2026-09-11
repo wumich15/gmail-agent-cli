@@ -260,15 +260,14 @@ Nothing in this command reads or changes mail.
 
 ### Choosing how AI works
 
-Three options, each shown with its cost and requirements before it is selectable:
+Two options, each shown with its cost and requirements before it is selectable:
 
 | Option | What it needs | Where mail is processed |
 | --- | --- | --- |
-| Included GPT | A publisher release with its managed AI service enabled. No user OpenAI account, API key, model download, or extra software. Usage limits may apply. | Selected message text (never attachments) passes through the publisher service to OpenAI. |
-| Your own OpenAI API key (advanced development) | An OpenAI account and key that you create and pay for per use. | Selected message text (never attachments) is sent directly to the OpenAI API. |
+| Your own OpenAI API key | An OpenAI account and key that you create and pay for per use. | Selected message text (never attachments) goes from this computer directly to the OpenAI API. |
 | No AI — rules only | Nothing. | Nowhere. Native spam, your rules, and archiving of read mail still work. |
 
-Included GPT is the normal production path and requires no user API key or local AI installation. A key, if a developer chooses the advanced direct-OpenAI option, is typed without being echoed and stored in the operating system's credential store — never in `config.json`, a log line, a command-line flag, or shell history.
+There is no hosted option: this tool has no server of its own, so nothing is processed by anyone but the provider you chose. The key is typed without being echoed and stored in the operating system's credential store — never in `config.json`, a log line, a command-line flag, or shell history.
 
 ## Browser interface: `gmail ui`
 

@@ -2,7 +2,13 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AI_ACCESS_OPTIONS, applyAiAccessChoice, currentAiAccess } from "../../src/core/ai-access.js";
+import {
+  AI_ACCESS_OPTIONS,
+  aiAccessOption,
+  applyAiAccessChoice,
+  availableAiAccessOptions,
+  currentAiAccess
+} from "../../src/core/ai-access.js";
 import { loadConfig } from "../../src/config/load.js";
 import {
   defaultConfig,
@@ -28,18 +34,21 @@ function memoryStore(initial: Record<string, string> = {}): CredentialStore {
 }
 
 describe("AI access options", () => {
-  it("states cost, hardware, and data-sharing consequences for every option before it can be chosen", () => {
-    expect(AI_ACCESS_OPTIONS.map((option) => option.id)).toEqual(["managed", "api-key", "off"]);
+  it("states cost and data-sharing consequences for every option before it can be chosen", () => {
+    expect(AI_ACCESS_OPTIONS.map((option) => option.id)).toEqual(["api-key", "off"]);
     for (const option of AI_ACCESS_OPTIONS) {
       expect(option.requirements.length).toBeGreaterThan(20);
       expect(option.summary.length).toBeGreaterThan(20);
     }
   });
 
-  it("offers a working option that needs no API key, which is the whole point", () => {
-    const noKeyOptions = AI_ACCESS_OPTIONS.filter((option) => !option.needsApiKey && option.id !== "off");
-    expect(noKeyOptions.map((option) => option.id)).toEqual(["managed"]);
-    expect(noKeyOptions[0]?.sendsMailOffDevice).toBe(true);
+  it("keeps the one option that sends mail anywhere clearly marked as doing so", () => {
+    // Nothing may send mail text off the device without the user having seen
+    // that fact attached to the option they picked.
+    const offDevice = AI_ACCESS_OPTIONS.filter((option) => option.sendsMailOffDevice);
+    expect(offDevice.map((option) => option.id)).toEqual(["api-key"]);
+    expect(offDevice[0]?.needsApiKey).toBe(true);
+    expect(aiAccessOption("off").sendsMailOffDevice).toBe(false);
   });
 });
 
@@ -51,37 +60,35 @@ describe("applyAiAccessChoice", () => {
     configPath = join(mkdtempSync(join(tmpdir(), "gmail-agent-config-")), "config.json");
   });
 
-  it("uses included GPT with a Google identity token and no user OpenAI key", async () => {
-    const prior = process.env["GMAIL_AGENT_AI_GATEWAY_URL"];
-    process.env["GMAIL_AGENT_AI_GATEWAY_URL"] = "https://ai.example.test";
-    try {
-      const store = memoryStore();
-      const saved = await applyAiAccessChoice({
-        config: defaultConfig("UTC"),
-        choice: "managed",
-        accountHash: "acct",
-        credentialStore: store,
-        configPath
-      });
-      expect(saved.aiProvider).toBe("managed");
-      expect(await store.getSecret("ai-api-key:acct")).toBeNull();
+  it("keeps AI off until the user supplies their own key, since there is no hosted fallback", async () => {
+    const store = memoryStore();
+    const saved = await applyAiAccessChoice({
+      config: defaultConfig("UTC"),
+      choice: "off",
+      accountHash: "acct",
+      credentialStore: store,
+      configPath
+    });
+    expect(saved.aiEnabled).toBe(false);
+    expect(await resolveAiCredentials({ accountHash: "acct", credentialStore: store, config: saved })).toBeNull();
 
-      const credentials = await resolveAiCredentials({
-        accountHash: "acct",
-        credentialStore: store,
-        config: saved,
-        managedIdentityToken: async () => "google-id-token",
-        managedGatewayBaseURL: "https://ai.example.test/v1"
-      });
-      expect(credentials).toMatchObject({
-        provider: "managed",
-        apiKey: "google-id-token",
-        baseURL: "https://ai.example.test/v1"
-      });
-    } finally {
-      if (prior === undefined) delete process.env["GMAIL_AGENT_AI_GATEWAY_URL"];
-      else process.env["GMAIL_AGENT_AI_GATEWAY_URL"] = prior;
-    }
+    const enabled = await applyAiAccessChoice({
+      config: saved,
+      choice: "api-key",
+      apiKey: "sk-user-owned",
+      accountHash: "acct",
+      credentialStore: store,
+      configPath
+    });
+    expect(enabled.aiProvider).toBe("openai");
+    expect(await store.getSecret("ai-api-key:acct")).toBe("sk-user-owned");
+    expect(
+      await resolveAiCredentials({ accountHash: "acct", credentialStore: store, config: enabled })
+    ).toMatchObject({ provider: "openai", apiKey: "sk-user-owned", baseURL: null });
+  });
+
+  it("offers exactly two choices: the user's own key, or no AI at all", () => {
+    expect(availableAiAccessOptions().map((option) => option.id)).toEqual(["api-key", "off"]);
   });
 
   it("switching from a compatible endpoint back to OpenAI drops the custom base URL", async () => {
@@ -134,7 +141,7 @@ describe("config schema migration", () => {
     expect(parseConfig(JSON.parse(readFileSync(path, "utf-8"))).schemaVersion).toBe(CURRENT_CONFIG_SCHEMA_VERSION);
   });
 
-  it("moves a schema-v2 Ollama choice to Included GPT and removes incompatible local settings", () => {
+  it("moves a retired provider choice to direct OpenAI and asks again before spending the user's money", () => {
     const dir = mkdtempSync(join(tmpdir(), "gmail-agent-config-"));
     const path = join(dir, "config.json");
     writeFileSync(path, JSON.stringify({
@@ -150,11 +157,28 @@ describe("config schema migration", () => {
     const loaded = loadConfig(path);
     expect(loaded).toMatchObject({
       schemaVersion: CURRENT_CONFIG_SCHEMA_VERSION,
-      aiEnabled: true,
-      aiProvider: "managed",
+      // Left off deliberately: the retired providers cost the user nothing,
+      // and direct OpenAI bills their own account, so setup asks first.
+      aiEnabled: false,
+      aiProvider: "openai",
       model: DEFAULT_MODEL,
       composeModel: DEFAULT_COMPOSE_MODEL
     });
     expect(loaded?.aiBaseUrl).toBeUndefined();
+  });
+
+  it("migrates a config left behind by the removed hosted-gateway option the same way", () => {
+    const dir = mkdtempSync(join(tmpdir(), "gmail-agent-config-"));
+    const path = join(dir, "config.json");
+    writeFileSync(path, JSON.stringify({
+      schemaVersion: 3,
+      timezone: "UTC",
+      aiEnabled: true,
+      aiProvider: "managed",
+      model: DEFAULT_MODEL,
+      composeModel: DEFAULT_MODEL
+    }));
+
+    expect(loadConfig(path)).toMatchObject({ aiEnabled: false, aiProvider: "openai" });
   });
 });

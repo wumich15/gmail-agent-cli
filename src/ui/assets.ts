@@ -248,12 +248,37 @@ function setupView() {
   var connection = status.connection;
 
   if (connection.oauthClientSource === "none") {
+    var clientId = el("input", { type: "text", id: "google-client-id", placeholder: "1234567890-abc.apps.googleusercontent.com", autocomplete: "off" });
+    var clientSecret = el("input", { type: "password", id: "google-client-secret", placeholder: "Client secret", autocomplete: "off" });
     nodes.push(
-      el("p", { class: "error", text: "This build has no Google sign-in configured, so it cannot connect an account yet." }),
+      el("h3", { text: "0. Connect this app to your own Google project" }),
       el("p", {
         text:
-          "A released build includes this and needs nothing from you. To run this development build, set " +
-          "GMAIL_AGENT_OAUTH_CLIENT_ID and GMAIL_AGENT_OAUTH_CLIENT_SECRET from a Desktop OAuth client, then restart gmail ui."
+          "This tool has no server and no shared account, so it signs in with a Google app that you own. " +
+          "It is a one-time, five-minute setup, and it means your mail is only ever reachable with your own credentials."
+      }),
+      el("ol", {}, [
+        el("li", {}, [
+          el("span", { text: "Create a project at " }),
+          el("a", { href: "https://console.cloud.google.com/projectcreate", target: "_blank", rel: "noreferrer", text: "console.cloud.google.com" }),
+          el("span", { text: " (any name)." })
+        ]),
+        el("li", { text: "Enable the Gmail API and the Google Calendar API for that project." }),
+        el("li", { text: "On the OAuth consent screen choose External, add your own Gmail address as a test user, and add the scopes gmail.modify and calendar.events.owned." }),
+        el("li", { text: "Under Clients, create an OAuth client with application type Desktop app." }),
+        el("li", { text: "Paste the client ID and client secret below." })
+      ]),
+      el("label", { for: "google-client-id", text: "Client ID" }),
+      clientId,
+      el("label", { for: "google-client-secret", text: "Client secret" }),
+      clientSecret,
+      el("p", { class: "muted", text: "Saved on this computer only, with owner-only permissions. A desktop client secret is not a password: sign-in is still protected by PKCE and Google's own consent screen." }),
+      el("button", {
+        text: "Save Google app",
+        disabled: state.busyAction !== null,
+        onclick: function () {
+          act("oauth-client", "/api/oauth-client", { clientId: clientId.value, clientSecret: clientSecret.value }, "Saved. You can connect Gmail now.");
+        }
       })
     );
   }
@@ -333,8 +358,7 @@ function setupView() {
         if (!selected) return;
         var option = status.ai.options.find(function (candidate) { return candidate.id === selected.value; });
         if (option && option.sendsMailOffDevice) {
-          var destination = selected.value === "managed" ? "the publisher service and OpenAI" : "the selected hosted AI provider";
-          if (!confirm("Send selected message text (never attachments) to " + destination + "?")) return;
+          if (!confirm("Send selected message text (never attachments) to the OpenAI API, at your own cost?")) return;
         }
         act("ai", "/api/ai", { choice: selected.value, apiKey: keyInput.value }, "Saved.");
       }
@@ -479,7 +503,7 @@ function statusView() {
     el("h3", { text: "Connections" }),
     el("p", { text: "Gmail: " + (status.connection.connected ? "connected as " + status.connection.emailDisplay : "not connected") }),
     el("p", { text: "AI: " + status.ai.detail }),
-    el("p", { class: "muted", text: "Sign-in method: " + (status.connection.oauthClientSource === "publisher" ? "included with this app" : status.connection.oauthClientSource === "environment" ? "your own Google Cloud OAuth client" : "not configured") })
+    el("p", { class: "muted", text: "Sign-in method: " + (status.connection.oauthClientSource === "stored" ? "your own Google app, saved on this computer" : status.connection.oauthClientSource === "environment" ? "your own Google app, from environment variables" : "not configured yet") })
   );
 
   nodes.push(el("h3", { text: "Current activity" }));

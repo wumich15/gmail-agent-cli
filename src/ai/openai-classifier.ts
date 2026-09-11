@@ -31,8 +31,6 @@ export interface OpenAiClassifierOptions {
   timeoutMs?: number;
   /** Injectable for tests; constructed from the options above otherwise. */
   client?: OpenAI;
-  /** Distinguishes publisher-gateway assessments from direct OpenAI ones in the cache. */
-  assessmentProvider?: "openai" | "managed";
 }
 
 /**
@@ -48,7 +46,6 @@ export class OpenAiClassifier implements Classifier {
   private readonly client: OpenAI;
   private readonly model: string;
   private readonly timeoutMs: number;
-  private readonly assessmentProvider: "openai" | "managed";
 
   constructor(options: OpenAiClassifierOptions) {
     this.client =
@@ -65,7 +62,6 @@ export class OpenAiClassifier implements Classifier {
       });
     this.model = options.model;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.assessmentProvider = options.assessmentProvider ?? "openai";
   }
 
   async assess(message: NormalizedMessage, context: ClassifyContext): Promise<AssessmentResult> {
@@ -115,10 +111,10 @@ export class OpenAiClassifier implements Classifier {
 
       return {
         ok: true,
-        assessment: mapFlagsToAssessment(response.output_parsed, message, `${this.assessmentProvider}:${this.model}`)
+        assessment: mapFlagsToAssessment(response.output_parsed, message, `openai:${this.model}`)
       };
     } catch (error) {
-      return { ok: false, unavailable: mapErrorToUnavailable(error, this.assessmentProvider) };
+      return { ok: false, unavailable: mapErrorToUnavailable(error) };
     }
   }
 }
@@ -147,10 +143,7 @@ function extractRefusal(response: { output?: readonly unknown[] }): string | nul
   return null;
 }
 
-function mapErrorToUnavailable(
-  error: unknown,
-  provider: "openai" | "managed" = "openai"
-): AssessmentUnavailable {
+function mapErrorToUnavailable(error: unknown): AssessmentUnavailable {
   const detail = error instanceof Error ? error.message : String(error);
 
   if (error instanceof APIConnectionTimeoutError) {
@@ -159,10 +152,7 @@ function mapErrorToUnavailable(
   if (error instanceof AuthenticationError || error instanceof PermissionDeniedError) {
     return {
       reason: "not_configured",
-      detail:
-        provider === "managed"
-          ? "The included AI service could not verify the Google sign-in. Reconnect Gmail and try again."
-          : "The AI provider rejected the API key or denied access to this model."
+      detail: "The AI provider rejected the API key or denied access to this model."
     };
   }
   if (

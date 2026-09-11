@@ -155,9 +155,19 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, path: string
       sendJson(res, 200, await session.status());
       return;
     }
+    case "/api/oauth-client": {
+      const clientId = body["clientId"];
+      const clientSecret = body["clientSecret"];
+      if (typeof clientId !== "string" || typeof clientSecret !== "string") {
+        throw new UiError("A client ID and client secret are both required.", 400);
+      }
+      session.saveOAuthClient(clientId, clientSecret);
+      sendJson(res, 200, await session.status());
+      return;
+    }
     case "/api/ai": {
       const choice = body["choice"];
-      if (choice !== "managed" && choice !== "api-key" && choice !== "off") {
+      if (choice !== "api-key" && choice !== "off") {
         throw new UiError("Unknown AI option.", 400);
       }
       const apiKey = typeof body["apiKey"] === "string" && body["apiKey"].trim() ? body["apiKey"].trim() : null;

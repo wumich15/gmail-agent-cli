@@ -1,20 +1,17 @@
 import { saveConfig } from "../config/load.js";
 import { CREDENTIAL_KEYS, type CredentialStore } from "../auth/credential-store.js";
 import type { Config } from "../config/schema.js";
-import { resolveManagedAiGateway } from "../auth/publisher-client.js";
-import { InvalidConfigError } from "./errors.js";
 
 /**
  * How this install gets AI, as a user-facing choice.
  *
- * The product requirement is that real classification and drafting must be
- * reachable without the user creating, pasting, or managing an API key —
- * and that whatever each option actually costs them (money, hardware, or
- * capability) is visible *before* they choose it, never discovered later.
- * That is why every option carries its own cost/requirement text rather
- * than leaving it to whichever screen happens to render the list.
+ * Everything runs on the user's own computer with the user's own provider
+ * account, so the real requirement is that whatever each option costs them
+ * — money, or capability — is visible *before* they choose it, never
+ * discovered later. That is why every option carries its own cost text
+ * rather than leaving it to whichever screen happens to render the list.
  */
-export type AiAccessId = "managed" | "api-key" | "off";
+export type AiAccessId = "api-key" | "off";
 
 export interface AiAccessOption {
   id: AiAccessId;
@@ -30,25 +27,16 @@ export interface AiAccessOption {
 
 export const AI_ACCESS_OPTIONS: readonly AiAccessOption[] = [
   {
-    id: "managed",
-    title: "Included GPT (no API key)",
-    summary:
-      "Selected message text — never attachments — is sent through this app's publisher-operated AI service to OpenAI for classification and drafts.",
-    requirements:
-      "No OpenAI account, API key, or software installation is required. The publisher pays for usage and may enforce fair-use limits. " +
-      "OpenAI's standard abuse-monitoring retention can still apply even though storage is disabled on every call.",
-    sendsMailOffDevice: true,
-    needsApiKey: false
-  },
-  {
     id: "api-key",
-    title: "Your own OpenAI API key (advanced)",
+    title: "Your own OpenAI API key",
     summary:
-      "Selected message text — never attachments — is sent to the OpenAI API to classify mail and draft " +
-      "replies you review before sending.",
+      "Selected message text — never attachments — is sent from this computer straight to the OpenAI API, " +
+      "under your own account, to classify mail and draft replies you review before sending.",
     requirements:
-      "Requires an OpenAI account and API key that you create and pay for per use. The provider's standard " +
-      "abuse-monitoring retention can still apply even though this app disables storage on every call.",
+      "Requires an OpenAI account and an API key you create at platform.openai.com. You pay OpenAI per use; " +
+      "triage costs a fraction of a cent per message. The key is stored in your OS credential store and is " +
+      "sent to nobody but OpenAI. The provider's standard abuse-monitoring retention can still apply even " +
+      "though this app disables storage on every call.",
     sendsMailOffDevice: true,
     needsApiKey: true
   },
@@ -70,17 +58,18 @@ export function aiAccessOption(id: AiAccessId): AiAccessOption {
   return found;
 }
 
-/** Hides Included GPT in source/development builds that have no gateway configured. */
+/**
+ * Every option is always available: this tool talks to OpenAI directly with
+ * the user's own key, or to nothing at all, so there is no build variant in
+ * which one of them is missing.
+ */
 export function availableAiAccessOptions(): readonly AiAccessOption[] {
-  return resolveManagedAiGateway()
-    ? AI_ACCESS_OPTIONS
-    : AI_ACCESS_OPTIONS.filter((option) => option.id !== "managed");
+  return AI_ACCESS_OPTIONS;
 }
 
 /** Which option a stored config represents, for reporting current state. */
 export function currentAiAccess(config: Config | null): AiAccessId {
   if (!config || !config.aiEnabled) return "off";
-  if (config.aiProvider === "managed") return "managed";
   return "api-key";
 }
 
@@ -105,21 +94,6 @@ export async function applyAiAccessChoice(input: ApplyAiAccessInput): Promise<Co
   let next: Config;
   if (input.choice === "off") {
     next = { ...input.config, aiEnabled: false };
-  } else if (input.choice === "managed") {
-    if (!resolveManagedAiGateway()) {
-      throw new InvalidConfigError(
-        "This build does not include the publisher AI service. Use a release build or the advanced development API-key option."
-      );
-    }
-    const rest = { ...input.config };
-    delete rest.aiBaseUrl;
-    next = {
-      ...rest,
-      aiEnabled: true,
-      aiProvider: "managed",
-      model: input.config.model,
-      composeModel: input.config.composeModel
-    };
   } else {
     if (input.apiKey) {
       await input.credentialStore.setSecret(CREDENTIAL_KEYS.aiApiKey(input.accountHash), input.apiKey);

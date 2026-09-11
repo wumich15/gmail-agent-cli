@@ -47,10 +47,7 @@ export async function chooseAiAccessInteractively(ctx: CliContext, accountHash: 
   let apiKey: string | null = null;
   if (aiAccessOption(choice).sendsMailOffDevice) {
     const consent = await p.confirm({
-      message:
-        choice === "managed"
-          ? "Send selected message text (never attachments) through the publisher service to OpenAI?"
-          : "Send selected message text (never attachments) to the OpenAI API, at your own cost?",
+      message: "Send selected message text (never attachments) to the OpenAI API, at your own cost?",
       initialValue: false
     });
     if (p.isCancel(consent) || !consent) {
@@ -80,11 +77,7 @@ export async function chooseAiAccessInteractively(ctx: CliContext, accountHash: 
   reloadConfig(ctx);
 
   p.log.success(
-    choice === "off"
-      ? "AI is off. Runs will use rules only."
-      : choice === "managed"
-        ? "Using included GPT. You do not need an OpenAI API key."
-        : "Using the OpenAI API with your key."
+    choice === "off" ? "AI is off. Runs will use rules only." : "Using the OpenAI API with your key."
   );
   return choice;
 }

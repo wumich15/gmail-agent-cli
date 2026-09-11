@@ -8,6 +8,7 @@ import {
   type ConnectionStatus
 } from "../core/onboarding.js";
 import { applyAiAccessChoice, type AiAccessId } from "../core/ai-access.js";
+import { validateOAuthClientInput, writeStoredOAuthClient } from "../auth/oauth-client-file.js";
 import { loadOrCreateDefaultConfig } from "../config/load.js";
 import { runWork } from "../commands/work.js";
 import { COMMANDS, VIEW_CONTROLS, VIEW_CONTROLS_NOTE } from "../docs/command-reference.js";
@@ -151,6 +152,17 @@ export class UiSession {
     if (this.state.kind === "connecting") {
       this.state = { ...this.state, kind: "idle", authorizeUrl: null, note: null, lastError: "Sign-in cancelled." };
     }
+  }
+
+  /**
+   * Saves this computer's own Google OAuth client. There is no shared client
+   * to fall back on by design (see `auth/oauth-client-file.ts`), so this is
+   * the browser counterpart of the same one-time paste `gmail setup` asks for.
+   */
+  saveOAuthClient(clientId: string, clientSecret: string): void {
+    const problem = validateOAuthClientInput(clientId, clientSecret);
+    if (problem) throw new UiError(problem, 400);
+    writeStoredOAuthClient({ clientId: clientId.trim(), clientSecret: clientSecret.trim() });
   }
 
   async setAiAccess(choice: AiAccessId, apiKey: string | null): Promise<void> {

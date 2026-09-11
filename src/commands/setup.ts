@@ -4,6 +4,7 @@ import { bootstrap, reloadConfig } from "../core/bootstrap.js";
 import { connectGoogleAccount } from "../core/connect.js";
 import { disconnectAccount, getAiStatus, getConnectionStatus } from "../core/onboarding.js";
 import { chooseAiAccessInteractively } from "./setup-ai.js";
+import { promptForGoogleClient } from "./setup-google-client.js";
 import { EXIT_CODES } from "../core/errors.js";
 
 /**
@@ -19,16 +20,16 @@ export async function runSetup(): Promise<number> {
   const ctx = bootstrap();
   p.intro("Gmail agent setup");
 
-  const connection = await getConnectionStatus(ctx);
+  let connection = await getConnectionStatus(ctx);
 
   if (connection.oauthClientSource === "none") {
-    p.log.error(
-      "This build has no Google OAuth client, so it cannot sign in yet.\n" +
-        "A release build ships a verified publisher client and needs nothing from you. To run this\n" +
-        "development build, create a Desktop-type OAuth client in the Google Cloud Console and set\n" +
-        "GMAIL_AGENT_OAUTH_CLIENT_ID and GMAIL_AGENT_OAUTH_CLIENT_SECRET."
-    );
-    return EXIT_CODES.invalidOrAuthRequired;
+    // Nothing else in setup can proceed without this, so ask for it here
+    // rather than failing with instructions the user has to go act on.
+    if (!(await promptForGoogleClient())) {
+      p.outro("No Google app saved yet, so there is nothing to sign in with. See docs/setup.md, then run `gmail setup` again.");
+      return EXIT_CODES.invalidOrAuthRequired;
+    }
+    connection = await getConnectionStatus(ctx);
   }
 
   p.log.message(
@@ -54,6 +55,7 @@ export async function runSetup(): Promise<number> {
             { value: "disconnect", label: "Disconnect Gmail from this computer" }
           ]
         : [{ value: "connect", label: "Connect Gmail" }]),
+      { value: "google-client", label: "Replace the Google app this computer signs in with" },
       { value: "done", label: "Done" }
     ]
   });
@@ -95,6 +97,12 @@ export async function runSetup(): Promise<number> {
       p.log.error(error instanceof Error ? error.message : String(error));
       return EXIT_CODES.invalidOrAuthRequired;
     }
+  }
+
+  if (action === "google-client") {
+    const saved = await promptForGoogleClient();
+    p.outro(saved ? "Saved. Connect Gmail to sign in with it." : "Nothing changed.");
+    return EXIT_CODES.ok;
   }
 
   if (action === "ai") {

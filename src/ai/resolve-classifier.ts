@@ -9,18 +9,12 @@ import { NotConfiguredClassifier } from "./not-configured-classifier.js";
 import { OpenAiClassifier } from "./openai-classifier.js";
 import { SCHEMA_VERSION } from "./assessment-mapping.js";
 import { PROMPT_VERSION } from "./prompt.js";
-import { googleIdTokenFromRefreshToken, resolveOAuthClientCredentials } from "../auth/google-oauth.js";
-import { resolveManagedAiGateway } from "../auth/publisher-client.js";
 import type { Classifier } from "./classifier.js";
 
 export interface ResolveClassifierInput {
   accountHash: string;
   credentialStore: CredentialStore;
   config: Config | null;
-  /** Test seam for the short-lived Google identity used by managed AI. */
-  managedIdentityToken?: (() => Promise<string>) | undefined;
-  /** Test seam; production resolves the URL embedded in the release. */
-  managedGatewayBaseURL?: string | undefined;
 }
 
 export interface ResolvedClassifier {
@@ -45,34 +39,10 @@ export interface ResolvedClassifier {
 
 export interface ResolvedAiCredentials {
   provider: AiProvider;
-  /** Google ID token for managed AI, otherwise the user's provider key. */
+  /** The user's own provider key, from the OS credential store or the environment. */
   apiKey: string;
   model: string;
   baseURL: string | null;
-}
-
-const managedTokenCache = new Map<string, { token: string; expiresAt: number }>();
-
-function jwtExpiry(token: string): number {
-  try {
-    const payload = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8")) as { exp?: unknown };
-    return typeof payload.exp === "number" ? payload.exp * 1000 : 0;
-  } catch {
-    return 0;
-  }
-}
-
-async function resolveManagedIdentityToken(input: ResolveClassifierInput): Promise<string | null> {
-  if (input.managedIdentityToken) return input.managedIdentityToken();
-
-  const cached = managedTokenCache.get(input.accountHash);
-  if (cached && cached.expiresAt > Date.now() + 5 * 60_000) return cached.token;
-
-  const refreshToken = await input.credentialStore.getSecret(CREDENTIAL_KEYS.oauthRefreshToken(input.accountHash));
-  if (!refreshToken) return null;
-  const token = await googleIdTokenFromRefreshToken(resolveOAuthClientCredentials(), refreshToken);
-  managedTokenCache.set(input.accountHash, { token, expiresAt: jwtExpiry(token) });
-  return token;
 }
 
 /** @deprecated Kept for older call sites; the resolution is no longer OpenAI-specific. */
@@ -123,24 +93,10 @@ export async function resolveAiCredentials(
 
   const provider: AiProvider = input.config?.aiProvider ?? "openai";
 
-  if (provider === "managed") {
-    const gateway = input.managedGatewayBaseURL
-      ? { baseURL: input.managedGatewayBaseURL }
-      : resolveManagedAiGateway();
-    if (!gateway) return null;
-    const identityToken = await resolveManagedIdentityToken(input);
-    if (!identityToken) return null;
-    return {
-      provider,
-      apiKey: identityToken,
-      model: resolveModel(input, purpose, purpose === "compose" ? DEFAULT_COMPOSE_MODEL : DEFAULT_MODEL),
-      baseURL: gateway.baseURL
-    };
-  }
-
-  // Hosted providers: checked in the OS credential store first, then the
+  // The user's own key: checked in the OS credential store first, then the
   // OPENAI_API_KEY environment variable, matching how the OpenAI SDK
-  // itself defaults.
+  // itself defaults. Nothing else can supply one — there is no service in
+  // front of the provider.
   const storedKey = await input.credentialStore.getSecret(CREDENTIAL_KEYS.aiApiKey(input.accountHash));
   const apiKey = storedKey ?? process.env["OPENAI_API_KEY"];
   if (!apiKey) {
@@ -171,7 +127,7 @@ export async function resolveClassifier(input: ResolveClassifierInput): Promise<
       classifier: new NotConfiguredClassifier(),
       description: off
         ? "AI classification is turned off — using rules-only mode."
-        : "AI classification is not configured (no usable hosted provider found) — using rules-only mode.",
+        : "AI classification is not configured (no OpenAI API key found) — using rules-only mode.",
       classifierVersion: "not-configured",
       promptVersion: "not-configured",
       schemaVersion: "not-configured"
@@ -182,14 +138,10 @@ export async function resolveClassifier(input: ResolveClassifierInput): Promise<
     classifier: new OpenAiClassifier({
       apiKey: credentials.apiKey,
       model: credentials.model,
-      ...(credentials.baseURL !== null ? { baseURL: credentials.baseURL } : {}),
-      assessmentProvider: credentials.provider === "managed" ? "managed" : "openai"
+      ...(credentials.baseURL !== null ? { baseURL: credentials.baseURL } : {})
     }),
-    description:
-      credentials.provider === "managed"
-        ? `Using included GPT classification (model: ${credentials.model}); no API key is required from you.`
-        : `Using AI classification via ${credentials.baseURL ?? "the OpenAI API"} (model: ${credentials.model}).`,
-    classifierVersion: `${credentials.provider === "managed" ? "managed" : "openai"}:${credentials.model}`,
+    description: `Using AI classification via ${credentials.baseURL ?? "the OpenAI API"} (model: ${credentials.model}).`,
+    classifierVersion: `openai:${credentials.model}`,
     promptVersion: PROMPT_VERSION,
     schemaVersion: SCHEMA_VERSION
   };

@@ -36,13 +36,11 @@ export interface ConnectionStatus {
   credentialStored: boolean;
   /** The scopes this app requests, with why, for the permissions explanation. */
   scopes: ReadonlyArray<{ scope: string; why: string }>;
-  /** "none" means this build cannot sign anyone in yet; see `auth/publisher-client.ts`. */
+  /** "none" means no Google OAuth client is saved on this computer yet; see `auth/oauth-client-file.ts`. */
   oauthClientSource: OAuthClientSource | "none";
 }
 
 const SCOPE_EXPLANATIONS: Record<string, string> = {
-  openid: "Confirm your Google identity to this app and, when you choose included GPT, its publisher-operated AI service.",
-  email: "Identify which signed-in Gmail account owns the request. Your Gmail access token is never sent to the AI service.",
   "https://www.googleapis.com/auth/gmail.modify":
     "Read your mail's headers and text, move messages to Trash, archive read mail, and add stars and labels. It cannot permanently delete anything.",
   "https://www.googleapis.com/auth/calendar.events.owned":
@@ -106,9 +104,8 @@ export interface AiStatus {
 
 /**
  * Reports whether AI would actually work right now, not merely what is
- * configured. A missing publisher service, stale Google sign-in, or removed
- * development key must read as "not ready" instead of quietly leaving all
- * model-dependent mail for Review.
+ * configured. A removed or rejected API key must read as "not ready" instead
+ * of quietly leaving all model-dependent mail for Review.
  */
 export async function getAiStatus(ctx: CliContext, accountHash: string | null): Promise<AiStatus> {
   const access = currentAiAccess(ctx.config);
@@ -128,10 +125,7 @@ export async function getAiStatus(ctx: CliContext, accountHash: string | null): 
       ...base,
       ready: false,
       model: null,
-      detail:
-        access === "managed"
-          ? "Included GPT is selected, but this build has no usable publisher service or the Google sign-in needs to be refreshed."
-          : "AI is selected but no usable API key was found, so runs fall back to rules only."
+      detail: "AI is selected but no usable API key was found, so runs fall back to rules only."
     };
   }
   return {
@@ -139,9 +133,7 @@ export async function getAiStatus(ctx: CliContext, accountHash: string | null): 
     ready: true,
     model: credentials.model,
     detail:
-      credentials.provider === "managed"
-        ? `Included GPT is ready (model: ${credentials.model}). No API key is required from you.`
-        : credentials.provider === "openai-compatible"
+      credentials.provider === "openai-compatible"
         ? `Using your own API key against ${credentials.baseURL} (model: ${credentials.model}).`
         : `Using the OpenAI API with your own key (model: ${credentials.model}).`
   };

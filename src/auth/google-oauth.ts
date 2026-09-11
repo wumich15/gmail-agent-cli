@@ -4,20 +4,19 @@ import { randomBytes, createHash } from "node:crypto";
 import { exec } from "node:child_process";
 import { CodeChallengeMethod, OAuth2Client } from "google-auth-library";
 import { AuthRequiredError, InvalidConfigError } from "../core/errors.js";
-import {
-  PUBLISHER_OAUTH_CLIENT_ID,
-  PUBLISHER_OAUTH_CLIENT_SECRET,
-  publisherOAuthClientConfigured
-} from "./publisher-client.js";
+import { oauthClientFilePath, readStoredOAuthClient } from "./oauth-client-file.js";
 
 /**
  * Restricted Gmail scope plus a narrow Calendar scope limited to events on
  * the user's own calendars. Requested together at initial consent because
  * installed apps do not reliably support incremental authorization.
+ *
+ * Exactly two scopes, and no identity scopes: everything runs on this
+ * computer, so there is no service to prove an identity to. The signed-in
+ * address comes from Gmail's own `users.getProfile`, which `gmail.modify`
+ * already covers.
  */
 export const OAUTH_SCOPES = [
-  "openid",
-  "email",
   "https://www.googleapis.com/auth/gmail.modify",
   "https://www.googleapis.com/auth/calendar.events.owned"
 ] as const;
@@ -30,27 +29,38 @@ export interface OAuthClientCredentials {
 }
 
 /**
- * Where the OAuth installed-app client came from. Surfaced to the user
- * (and to `gmail doctor`/the setup UI) because the two have very different
- * onboarding stories: a publisher client means "just press Connect", while
- * a development client means the operator supplied their own Cloud project.
+ * Where the OAuth installed-app client came from: the saved file this tool
+ * writes during setup, or environment variables (CI, or someone who prefers
+ * to keep it out of a file). Surfaced to `gmail doctor` and the setup UI so
+ * "which Cloud project am I actually using" is never a guess.
  */
-export type OAuthClientSource = "publisher" | "environment";
+export type OAuthClientSource = "stored" | "environment";
 
 export interface ResolvedOAuthClient extends OAuthClientCredentials {
   source: OAuthClientSource;
 }
 
+/** Message shown whenever no OAuth client is available. Kept in one place so setup, doctor, and login agree. */
+export const OAUTH_CLIENT_SETUP_HELP =
+  "This computer has no Google OAuth client yet, so it cannot sign in.\n\n" +
+  "Everything in this tool runs locally against your own Google project, so you register the app once:\n" +
+  "  1. Open https://console.cloud.google.com/ and create a project (any name).\n" +
+  "  2. Enable the Gmail API and the Google Calendar API.\n" +
+  "  3. On the OAuth consent screen, choose External, add yourself as a test user,\n" +
+  "     and add the scopes gmail.modify and calendar.events.owned.\n" +
+  "  4. Under Clients, create an OAuth client of type Desktop app.\n" +
+  "  5. Run `gmail setup` and paste the client ID and client secret it gives you.\n\n" +
+  "See docs/setup.md for the walkthrough with screenshots of each field.";
+
 /**
- * Resolves the installed-app OAuth client, preferring an explicit
- * environment override (development, or an operator running against their
- * own Cloud project) over the publisher client shipped with a release
- * build. Neither is confidential — see `publisher-client.ts` — so the
- * precedence here is purely about which project the consent screen and
- * quota belong to, not about secrecy.
+ * Resolves the installed-app OAuth client: an explicit environment override
+ * first, then the client saved on this computer by `gmail setup`.
  *
- * Throws only when this build has no publisher client *and* no environment
- * override, which is the state of the source tree today.
+ * There is no third source. This tool ships no shared client, because a
+ * shared client would route every user's consent — and every user's API
+ * quota — through whoever registered it. Neither value is confidential (see
+ * `oauth-client-file.ts`), so the precedence here is about which Cloud
+ * project is in use, not about secrecy.
  */
 export function resolveOAuthClientCredentials(env: NodeJS.ProcessEnv = process.env): ResolvedOAuthClient {
   const clientId = env["GMAIL_AGENT_OAUTH_CLIENT_ID"];
@@ -58,20 +68,24 @@ export function resolveOAuthClientCredentials(env: NodeJS.ProcessEnv = process.e
   if (clientId && clientSecret) {
     return { clientId, clientSecret, source: "environment" };
   }
-  if (publisherOAuthClientConfigured()) {
-    return {
-      clientId: PUBLISHER_OAUTH_CLIENT_ID,
-      clientSecret: PUBLISHER_OAUTH_CLIENT_SECRET,
-      source: "publisher"
-    };
+  const stored = readStoredOAuthClient(env);
+  if (stored) {
+    return { ...stored, source: "stored" };
   }
-  throw new InvalidConfigError(
-    "This build has no Google OAuth client, so it cannot sign in yet. A release build ships a " +
-      "verified publisher client and needs nothing from you. To run this development build, create " +
-      "a Desktop-type OAuth client in the Google Cloud Console (with the Gmail and Calendar APIs " +
-      "enabled) and set GMAIL_AGENT_OAUTH_CLIENT_ID and GMAIL_AGENT_OAUTH_CLIENT_SECRET."
-  );
+  throw new InvalidConfigError(OAUTH_CLIENT_SETUP_HELP);
 }
+
+/** Whether a client is available at all, without throwing — for status screens. */
+export function oauthClientConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  try {
+    resolveOAuthClientCredentials(env);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export { oauthClientFilePath };
 
 /**
  * True for the one Google OAuth failure that is not transient and not a
@@ -229,25 +243,4 @@ export function oauthClientFromRefreshToken(
   const client = new OAuth2Client({ clientId: credentials.clientId, clientSecret: credentials.clientSecret });
   client.setCredentials({ refresh_token: refreshToken });
   return client;
-}
-
-/**
- * Gets a short-lived Google ID token for authenticating this user to the
- * publisher AI gateway. The Gmail access token is never sent to that
- * service. Google can return a new ID token on refresh when `openid` was
- * granted, so nothing beyond the existing refresh token is persisted.
- */
-export async function googleIdTokenFromRefreshToken(
-  credentials: OAuthClientCredentials,
-  refreshToken: string
-): Promise<string> {
-  const client = oauthClientFromRefreshToken(credentials, refreshToken);
-  await client.getAccessToken();
-  const idToken = client.credentials.id_token;
-  if (!idToken) {
-    throw new AuthRequiredError(
-      "Google did not return an identity token for the included AI service. Reconnect Gmail to grant the updated sign-in permissions."
-    );
-  }
-  return idToken;
 }

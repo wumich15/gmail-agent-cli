@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { resolveManagedAiGateway } from "../auth/publisher-client.js";
 
 /** Triage/classification: one cheap call per unresolved message, every run. */
 export const DEFAULT_MODEL = "gpt-5.4-mini";
@@ -27,15 +26,16 @@ export const DEFAULT_GMAIL_READ_CONCURRENCY = 8;
 /**
  * How this install reaches a model.
  *
- * - "openai": the standard OpenAI API, with a user-supplied key. Kept as the
- *   advanced path; it is explicitly not the required normal path.
- * - "managed": the publisher-operated gateway included in a production
- *   release. It authenticates with a short-lived Google ID token and keeps
- *   the publisher's OpenAI key on the server, never in the desktop package.
+ * - "openai": the standard OpenAI API, called directly from this computer
+ *   with the user's own key. This is the normal path.
  * - "openai-compatible": any endpoint implementing the same Responses API +
- *   Structured Outputs shape, via `aiBaseUrl`. Still key-authenticated.
+ *   Structured Outputs shape, via `aiBaseUrl` — including a model the user
+ *   runs themselves. Still key-authenticated.
+ *
+ * There is deliberately no hosted/publisher option: this tool has no server,
+ * so nobody else's key, quota, or infrastructure is ever in the path.
  */
-export const AI_PROVIDERS = ["managed", "openai", "openai-compatible"] as const;
+export const AI_PROVIDERS = ["openai", "openai-compatible"] as const;
 export type AiProvider = (typeof AI_PROVIDERS)[number];
 
 /**
@@ -47,23 +47,27 @@ export type AiProvider = (typeof AI_PROVIDERS)[number];
  */
 export const CURRENT_CONFIG_SCHEMA_VERSION = 3;
 
-const LEGACY_LOCAL_PROVIDER = "ollama";
+/** Providers that earlier schema versions offered and this one no longer has. */
+const RETIRED_PROVIDERS = new Set(["ollama", "managed"]);
 
 /**
- * Schema v2 briefly offered a local-model path. Production now provides AI
- * through the authenticated publisher gateway instead, so old local configs
- * are upgraded to Included GPT and their incompatible model/base URL values
- * are discarded before validation.
+ * Schema v2 briefly offered a local-runtime path, and a later revision
+ * briefly offered a hosted publisher gateway. Neither exists now: AI is the
+ * user's own OpenAI key or nothing. A config naming either is rewritten to
+ * the direct OpenAI provider, discarding the incompatible base URL and model
+ * names, and `aiEnabled` is cleared so setup asks again rather than silently
+ * assuming the user wants to start paying OpenAI directly.
  */
-function replaceLegacyLocalProvider(raw: unknown): unknown {
+function replaceRetiredProvider(raw: unknown): unknown {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
   const value = raw as Record<string, unknown>;
-  if (value["schemaVersion"] !== 2 || value["aiProvider"] !== LEGACY_LOCAL_PROVIDER) return raw;
+  if (typeof value["aiProvider"] !== "string" || !RETIRED_PROVIDERS.has(value["aiProvider"])) return raw;
   const upgraded = { ...value };
   delete upgraded["aiBaseUrl"];
   return {
     ...upgraded,
-    aiProvider: "managed",
+    aiProvider: "openai",
+    aiEnabled: false,
     model: DEFAULT_MODEL,
     composeModel: DEFAULT_COMPOSE_MODEL
   };
@@ -71,7 +75,7 @@ function replaceLegacyLocalProvider(raw: unknown): unknown {
 
 /** Config on disk is non-secret. Secrets always live in the credential store. */
 export const ConfigSchema = z.preprocess(
-  replaceLegacyLocalProvider,
+  replaceRetiredProvider,
   z
     .object({
     schemaVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]),
@@ -138,9 +142,7 @@ export function migrateConfig(config: Config): Config | null {
 }
 
 export function defaultConfig(timezone: string): Config {
-  const aiProvider =
-    (process.env["GMAIL_AGENT_AI_PROVIDER"] as AiProvider | undefined) ??
-    (resolveManagedAiGateway() ? "managed" : "openai");
+  const aiProvider = (process.env["GMAIL_AGENT_AI_PROVIDER"] as AiProvider | undefined) ?? "openai";
   const aiBaseUrl = process.env["GMAIL_AGENT_AI_BASE_URL"];
   // A fresh config must not silently disable AI for the documented
   // headless/automation path, where the operator configures the provider

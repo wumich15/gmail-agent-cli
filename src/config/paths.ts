@@ -3,8 +3,19 @@ import { join } from "node:path";
 
 const APP_DIR_NAME = "gmail-agent-cli";
 
-/** Per-OS app data directory. No network or filesystem access here. */
+/**
+ * Per-OS app data directory. No network or filesystem access here.
+ *
+ * `GMAIL_AGENT_DATA_DIR` relocates everything this app stores — config, the
+ * SQLite database, logs, the saved Google client. It exists so tests (and a
+ * user keeping state on an encrypted volume) never have to touch the real
+ * per-user directory: on macOS the location is derived from `homedir()`,
+ * which ignores a passed-in `env`, so without this override a test that
+ * passes a fake HOME would still write to the real one.
+ */
 export function appDataDir(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): string {
+  const override = env["GMAIL_AGENT_DATA_DIR"];
+  if (override) return override;
   if (platform === "darwin") {
     return join(homedir(), "Library", "Application Support", APP_DIR_NAME);
   }
