@@ -1,24 +1,53 @@
 # Gmail Agent CLI
 
-Clean up Gmail, browse your inbox in the terminal, and compose messages from the command line. The executable is `gmail`.
+A terminal tool that cleans up your Gmail: trashes the junk, stars what needs you, turns real appointments into calendar events, and archives what you have already read. The executable is `gmail`.
+
+```sh
+gmail --dry-run   # see what it would do
+gmail             # do it
+```
+
+Everything runs on your own computer. There is no server, no hosted account, and no service in the middle: you connect the tool to your own Google project and your own AI provider key, and your mail never passes through anyone else's infrastructure.
 
 **[Documentation](docs/README.md)** · [Setup walkthrough](docs/setup.md) · [All commands and keyboard shortcuts](docs/commands.md) · [Development](docs/development.md)
 
-Everything runs on your own computer. There is no server, no hosted account, and no service in the middle: you connect the tool to your own Google project and your own AI provider key, and your mail never passes through anyone else's infrastructure. `gmail ui` opens a small local browser page for setup, the command reference, and status.
-
-**New here? Install, then run `gmail install`** — a guided setup that opens each Google page for you, signs you in, and finishes with a preview that changes nothing. About ten minutes, once per computer. The written walkthrough is in [docs/setup.md](docs/setup.md).
-
 ## What it does
 
-- Scans Inbox and Spam, applies local spam/important rules, and optionally uses AI to classify unresolved mail.
-- Moves eligible mail to Trash, stars and labels important messages, archives read Inbox mail, and can create private Calendar events from actionable messages.
-- Keeps a local cache for incremental scans and terminal browsing.
-- Supports reading, searching, composing, replying, and AI drafts in `gmail view`.
-- Offers the same setup, command reference, and status as three plain pages served on `127.0.0.1` by `gmail ui`.
+- Moves promotions, newsletters and native Gmail spam to **Trash** — you can always pull them back.
+- Stars and marks important the mail that asks you something, names a deadline, or concerns money, security, travel or an appointment.
+- Adds private Calendar events from mail with a real, explicit date. No guests, no invitations, no duplicates.
+- Archives everything you have already read.
+- Leaves anything uncertain alone, and lists it under Review.
+- Creates persistent spam/important rules you name (`gmail add`) and applies them before any AI runs.
+- `gmail view` is also a terminal mail client: read, search, delete, compose and reply, with AI drafts you edit before they go anywhere.
+- `gmail ui` serves the same setup, command reference, and status as three plain pages on `127.0.0.1`, for as long as that command runs.
 
-**Bare `gmail` makes mailbox changes.** Start with `gmail --dry-run` to preview cleanup. Trash is reversible through Gmail; the app does not permanently delete messages. Sending mail requires confirmation showing the exact message. Opening mail in `gmail view` marks it read.
+## What it never does
+
+- **Never permanently deletes mail.** Everything it removes goes to Gmail's own Trash. The permanent-delete endpoints are not called anywhere in the code.
+- **Never sends an email without showing you the exact message and asking.** Every outbound path — manual, AI-drafted, reply, unsubscribe — ends at the same confirmation, which defaults to *no*. There is no flag or keystroke that skips it.
+- **Never follows instructions found inside an email.** Message text is evidence, never a command; the model gets no tools, no network and no credentials.
+- **Never uploads attachments** — it does not even download them.
+- **Never runs in the background** or keeps a copy of your mailbox on a server. Work happens only when you run a command.
+
+**Bare `gmail` makes mailbox changes.** Start with `gmail --dry-run` to preview cleanup. Opening mail in `gmail view` marks it read.
+
+## Where your mail goes
+
+Nowhere, unless you turn on AI. The tool talks to Google with an OAuth app you registered yourself, and — only if you choose it — to OpenAI with your own API key. Nothing is relayed through anyone else, because there is no one else.
+
+- **Your sign-in** lives in your OS credential store (macOS Keychain, Windows Credential Manager, Linux Secret Service), never in a config file or log.
+- **Message bodies are never written to disk.** The local SQLite cache holds IDs, labels, dates, senders, content hashes and an action ledger; reading a message fetches it live.
+- **With AI on**, the sender, subject, date and a bounded plain-text excerpt of the message being classified are sent to OpenAI with `store: false`. Never attachments, never your Gmail tokens.
+- **Rules-only mode is a real mode**, not a preview: Gmail's own spam handling, your rules, and archiving read mail all work with nothing leaving your computer.
+
+## What it costs
+
+Free and MIT licensed, with no account and no telemetry. Rules-only mode costs nothing at all. With your own OpenAI key you pay OpenAI directly — one small classification call per unresolved message, cached by content hash so the same mail is not re-read, which works out to cents per run.
 
 ## Setup
+
+**New here: install, then run `gmail install`.** It is a guided wizard — it checks this machine, opens each Google Cloud page for you, collects the credentials, signs you in, asks how AI should work, and finishes with a preview that changes nothing. About ten minutes, once per computer. The steps below are the same thing written out, for anyone who would rather see every field named first.
 
 ### 1. Install and build
 
@@ -40,6 +69,8 @@ gmail --help
 ```
 
 If pnpm reports a missing global bin directory, run `pnpm setup`, reopen your terminal, and retry the link. You can also use `node dist/cli.js` in place of `gmail` in every example below. Rebuild after changing source code.
+
+Then, for the guided path, run `gmail install` and skip to step 5. Everything between is what that wizard does for you.
 
 ### 2. Connect it to your own Google project
 
