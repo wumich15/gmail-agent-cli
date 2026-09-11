@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync, statSync } from "node:fs";
 
 function runCli(...args: string[]) {
   return spawnSync(process.execPath, ["--import", "tsx", "src/cli.ts", ...args], {
@@ -40,4 +41,24 @@ describe("gmail help", () => {
     expect(result.stdout).toContain("--previous");
     expect(result.stdout).toContain("Gmail view controls:");
   });
+});
+
+describe("packaging", () => {
+  it.skipIf(process.platform === "win32")(
+    "declares a build that leaves the CLI entry point executable",
+    () => {
+      // A linked install (`npm link`, `pnpm link --global`) symlinks the
+      // `gmail` shim straight at dist/cli.js, so that file's own mode is what
+      // the shell checks. tsc writes 0644, and package managers only set the
+      // bit at install time — without this step in the build, any rebuild
+      // breaks the installed command with "permission denied".
+      const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { scripts: Record<string, string> };
+      expect(pkg.scripts["build"]).toContain("make-executable.mjs");
+
+      // And if a build has actually run here, the bit must really be set.
+      if (existsSync("dist/cli.js")) {
+        expect(statSync("dist/cli.js").mode & 0o111).not.toBe(0);
+      }
+    }
+  );
 });
