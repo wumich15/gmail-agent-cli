@@ -16,6 +16,8 @@ import {
  * installed apps do not reliably support incremental authorization.
  */
 export const OAUTH_SCOPES = [
+  "openid",
+  "email",
   "https://www.googleapis.com/auth/gmail.modify",
   "https://www.googleapis.com/auth/calendar.events.owned"
 ] as const;
@@ -227,4 +229,25 @@ export function oauthClientFromRefreshToken(
   const client = new OAuth2Client({ clientId: credentials.clientId, clientSecret: credentials.clientSecret });
   client.setCredentials({ refresh_token: refreshToken });
   return client;
+}
+
+/**
+ * Gets a short-lived Google ID token for authenticating this user to the
+ * publisher AI gateway. The Gmail access token is never sent to that
+ * service. Google can return a new ID token on refresh when `openid` was
+ * granted, so nothing beyond the existing refresh token is persisted.
+ */
+export async function googleIdTokenFromRefreshToken(
+  credentials: OAuthClientCredentials,
+  refreshToken: string
+): Promise<string> {
+  const client = oauthClientFromRefreshToken(credentials, refreshToken);
+  await client.getAccessToken();
+  const idToken = client.credentials.id_token;
+  if (!idToken) {
+    throw new AuthRequiredError(
+      "Google did not return an identity token for the included AI service. Reconnect Gmail to grant the updated sign-in permissions."
+    );
+  }
+  return idToken;
 }

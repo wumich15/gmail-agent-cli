@@ -9,7 +9,8 @@
 | `src/core/` | Orchestration, policy, action planning, locks, retries. |
 | `src/auth/`, `src/config/` | Google OAuth, credentials, configuration. |
 | `src/gmail/`, `src/calendar/` | Mail and Calendar service adapters and operations. |
-| `src/ai/`, `src/rules/` | Classification, drafting, deterministic rules. Hosted (`openai-classifier.ts`) and local (`ollama-classifier.ts`) providers share one prompt, wire schema, and assessment mapping. |
+| `src/ai/`, `src/rules/` | Hosted classification and drafting plus deterministic rules. |
+| `src/gateway/` | Publisher-operated GPT gateway: Google identity verification, request restrictions, quotas, and server-side OpenAI access. |
 | `src/ui/`, `src/docs/` | The loopback browser front-end (`gmail ui`) and the shared command reference that terminal help and the web Commands view both render. |
 | `src/state/`, `src/summary/`, `src/logging/` | SQLite state, reporting, diagnostics. |
 | `src/unsubscribe/` | Unsubscribe support used by older handlers. |
@@ -32,6 +33,8 @@ pnpm lint
 pnpm test
 ```
 
+With `OPENAI_API_KEY` set, `pnpm test:gpt` makes two `store:false` calls using synthetic mail only: one through the production classifier and one through the production drafting path. It uses `GMAIL_AGENT_MODEL` and `GMAIL_AGENT_COMPOSE_MODEL` when set, otherwise the app defaults. This is the opt-in live GPT check; the normal unit suite never spends API credits or sends content off-device.
+
 `pnpm test:integration` is reserved for a future integration suite; its configured `tests/integration/` directory is currently absent, so the command reports no tests. For source-mode help, run `pnpm dev --help`. Build before inspecting `node dist/cli.js --help` so it reflects current source. `src/cli.ts` defines which handlers are exposed to users.
 
 ## Configuration
@@ -41,22 +44,23 @@ Setup creates `config.json` in the platform data directory listed in the README.
 | Setting or environment variable | Behavior |
 | --- | --- |
 | `GMAIL_AGENT_OAUTH_CLIENT_ID`, `GMAIL_AGENT_OAUTH_CLIENT_SECRET` | Desktop OAuth configuration needed for each authenticated development run. |
+| `GMAIL_AGENT_AI_GATEWAY_URL` | Development override for the included GPT gateway. HTTPS required except on loopback. |
 | `OPENAI_API_KEY` | AI credential fallback after OS credential lookup, for headless use. Only consulted for a hosted provider. |
 | `timezone` | IANA timezone confirmed during setup. |
 | `model`, `composeModel` | Separate models for classification and drafting. |
 | `GMAIL_AGENT_MODEL`, `GMAIL_AGENT_COMPOSE_MODEL` | Live overrides of saved model names. |
-| `aiProvider` | `openai`, `openai-compatible`, or `ollama`. |
-| `aiBaseUrl` | Required for `openai-compatible`; defaults to `http://127.0.0.1:11434` for `ollama`; ignored for `openai`. |
+| `aiProvider` | `managed`, `openai`, or `openai-compatible`. |
+| `aiBaseUrl` | Required for `openai-compatible`; ignored for `managed` and `openai`. |
 | `GMAIL_AGENT_AI_PROVIDER`, `GMAIL_AGENT_AI_BASE_URL` | Seed a newly created config; do not override an existing file on every run. |
 | `concurrency` | Defaults: `gmailReads: 8`, `aiCalls: 5`, `calendarWrites: 2`. Parallelism does not increase quota. |
-| `aiEnabled` | A real off switch as of config schema v2: false means no classification or drafting call is made, whatever credentials exist. Set it through `gmail setup`. |
+| `aiEnabled` | A real off switch: false means no classification or drafting call is made, whatever credentials exist. Set it through `gmail setup`. |
 | `automationEnabled` | Legacy field; not an operational off switch. |
-| `schemaVersion` | `2`. A `1` file is migrated on read (recording `aiEnabled: true`, which is what those installs were actually doing) and rewritten in place. |
+| `schemaVersion` | `3`. A `1` file records its effective legacy AI state; a `2` file using the former local provider moves to Included GPT and discards incompatible local settings. Migrated files are rewritten in place. |
 | `GMAIL_AGENT_RATE_LIMIT_RPS` | Advanced read-equivalent rate override for a verified quota. |
 
 Prefer `gmail setup` over editing the file: it writes the same fields and validates them. Hand-editing still works for advanced cases.
 
-`openai` and `openai-compatible` both require a key and a Responses API endpoint with Structured Outputs; Chat Completions compatibility alone is insufficient. `ollama` is different in kind — it is a dedicated adapter (`src/ai/ollama.ts`) that speaks Ollama's own `/api/chat` with JSON-Schema-constrained generation, needs no key, and never sends mail off the machine. Setting `aiBaseUrl` at an Ollama server while leaving `aiProvider` as `openai-compatible` will not work, because that runtime does not implement the Responses API.
+`managed` authenticates the signed-in user to the publisher gateway with a short-lived Google ID token; it never sends the gateway a Gmail access or refresh token. `openai` and `openai-compatible` are development/advanced paths that require a user key and a Responses API endpoint with Structured Outputs; Chat Completions compatibility alone is insufficient. Production users do not install a local model runtime.
 
 Config written during sign-in is reloaded into the running process (`core/bootstrap.ts`'s `reloadConfig`), so a provider chosen during first-run setup takes effect in that same run rather than the next one.
 

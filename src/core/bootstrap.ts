@@ -38,7 +38,7 @@ export function bootstrap(): CliContext {
  *
  * `bootstrap()` snapshots the config once, which is wrong for any command
  * that *writes* config during its own run — first-time sign-in is exactly
- * that. Without this, a run that signs in and chooses, say, a local AI
+ * that. Without this, a run that signs in and chooses, say, Included GPT
  * provider would spend the rest of that same process with `ctx.config`
  * still holding the pre-login value (usually `null`), silently falling back
  * to the default provider until the next invocation. Call this immediately

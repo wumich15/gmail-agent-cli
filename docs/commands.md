@@ -264,13 +264,11 @@ Three options, each shown with its cost and requirements before it is selectable
 
 | Option | What it needs | Where mail is processed |
 | --- | --- | --- |
-| Local model | Ollama installed and running, plus one pulled model (roughly 2–5 GB of disk and several GB of RAM). No account, no payment. | Entirely on this computer. No message text leaves the machine. |
-| Your own OpenAI API key | An OpenAI account and key that you create and pay for per use. | Selected message text (never attachments) is sent to the OpenAI API. |
+| Included GPT | A publisher release with its managed AI service enabled. No user OpenAI account, API key, model download, or extra software. Usage limits may apply. | Selected message text (never attachments) passes through the publisher service to OpenAI. |
+| Your own OpenAI API key (advanced development) | An OpenAI account and key that you create and pay for per use. | Selected message text (never attachments) is sent directly to the OpenAI API. |
 | No AI — rules only | Nothing. | Nowhere. Native spam, your rules, and archiving of read mail still work. |
 
-The local option is the one that satisfies "real AI without managing an API key". A key, if you choose that option, is typed without being echoed and stored in the operating system's credential store — never in `config.json`, a log line, a command-line flag, or shell history.
-
-Choosing an option that is not currently usable (for example, selecting the local model before installing Ollama) is saved but reported honestly: runs fall back to rules-only mode until the runtime is actually reachable, and `gmail setup` says so.
+Included GPT is the normal production path and requires no user API key or local AI installation. A key, if a developer chooses the advanced direct-OpenAI option, is typed without being echoed and stored in the operating system's credential store — never in `config.json`, a log line, a command-line flag, or shell history.
 
 ## Browser interface: `gmail ui`
 

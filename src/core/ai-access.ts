@@ -1,13 +1,8 @@
 import { saveConfig } from "../config/load.js";
 import { CREDENTIAL_KEYS, type CredentialStore } from "../auth/credential-store.js";
-import {
-  DEFAULT_COMPOSE_MODEL,
-  DEFAULT_LOCAL_MODEL,
-  DEFAULT_MODEL,
-  DEFAULT_OLLAMA_BASE_URL,
-  type Config
-} from "../config/schema.js";
-import { ollamaListModels, OllamaError } from "../ai/ollama.js";
+import type { Config } from "../config/schema.js";
+import { resolveManagedAiGateway } from "../auth/publisher-client.js";
+import { InvalidConfigError } from "./errors.js";
 
 /**
  * How this install gets AI, as a user-facing choice.
@@ -19,7 +14,7 @@ import { ollamaListModels, OllamaError } from "../ai/ollama.js";
  * That is why every option carries its own cost/requirement text rather
  * than leaving it to whichever screen happens to render the list.
  */
-export type AiAccessId = "local" | "api-key" | "off";
+export type AiAccessId = "managed" | "api-key" | "off";
 
 export interface AiAccessOption {
   id: AiAccessId;
@@ -35,16 +30,14 @@ export interface AiAccessOption {
 
 export const AI_ACCESS_OPTIONS: readonly AiAccessOption[] = [
   {
-    id: "local",
-    title: "Local model on this computer (no API key)",
+    id: "managed",
+    title: "Included GPT (no API key)",
     summary:
-      "Mail is classified and drafts are written by a model running on this machine through Ollama. " +
-      "No message text leaves the computer and there is no account to create.",
+      "Selected message text — never attachments — is sent through this app's publisher-operated AI service to OpenAI for classification and drafts.",
     requirements:
-      "Requires Ollama installed and running (ollama.com), plus one pulled model — roughly 2-5 GB of disk " +
-      "and several GB of RAM. No money and no sign-up. Slower than a hosted model, and quality depends on " +
-      "the model you pull; uncertain mail is routed to Review rather than acted on.",
-    sendsMailOffDevice: false,
+      "No OpenAI account, API key, or software installation is required. The publisher pays for usage and may enforce fair-use limits. " +
+      "OpenAI's standard abuse-monitoring retention can still apply even though storage is disabled on every call.",
+    sendsMailOffDevice: true,
     needsApiKey: false
   },
   {
@@ -77,10 +70,18 @@ export function aiAccessOption(id: AiAccessId): AiAccessOption {
   return found;
 }
 
+/** Hides Included GPT in source/development builds that have no gateway configured. */
+export function availableAiAccessOptions(): readonly AiAccessOption[] {
+  return resolveManagedAiGateway()
+    ? AI_ACCESS_OPTIONS
+    : AI_ACCESS_OPTIONS.filter((option) => option.id !== "managed");
+}
+
 /** Which option a stored config represents, for reporting current state. */
 export function currentAiAccess(config: Config | null): AiAccessId {
   if (!config || !config.aiEnabled) return "off";
-  return config.aiProvider === "ollama" ? "local" : "api-key";
+  if (config.aiProvider === "managed") return "managed";
+  return "api-key";
 }
 
 export interface ApplyAiAccessInput {
@@ -90,9 +91,6 @@ export interface ApplyAiAccessInput {
   apiKey?: string | null;
   accountHash: string;
   credentialStore: CredentialStore;
-  /** Override for a non-default local runtime address. */
-  localBaseUrl?: string | undefined;
-  localModel?: string | undefined;
   /** Overridable for tests; defaults to the real per-user config path. */
   configPath?: string | undefined;
 }
@@ -107,62 +105,36 @@ export async function applyAiAccessChoice(input: ApplyAiAccessInput): Promise<Co
   let next: Config;
   if (input.choice === "off") {
     next = { ...input.config, aiEnabled: false };
-  } else if (input.choice === "local") {
+  } else if (input.choice === "managed") {
+    if (!resolveManagedAiGateway()) {
+      throw new InvalidConfigError(
+        "This build does not include the publisher AI service. Use a release build or the advanced development API-key option."
+      );
+    }
+    const rest = { ...input.config };
+    delete rest.aiBaseUrl;
     next = {
-      ...input.config,
+      ...rest,
       aiEnabled: true,
-      aiProvider: "ollama",
-      aiBaseUrl: input.localBaseUrl ?? DEFAULT_OLLAMA_BASE_URL,
-      model: input.localModel ?? DEFAULT_LOCAL_MODEL,
-      composeModel: input.localModel ?? DEFAULT_LOCAL_MODEL
+      aiProvider: "managed",
+      model: input.config.model,
+      composeModel: input.config.composeModel
     };
   } else {
     if (input.apiKey) {
       await input.credentialStore.setSecret(CREDENTIAL_KEYS.aiApiKey(input.accountHash), input.apiKey);
     }
-    // Drop any local base URL left over from a previous choice; leaving it
-    // in place would point the OpenAI client at a runtime that does not
-    // implement the Responses API.
+    // Drop a custom endpoint left over from a previous provider choice.
     const rest = { ...input.config };
     delete rest.aiBaseUrl;
     next = {
       ...rest,
       aiEnabled: true,
       aiProvider: "openai",
-      model: input.config.model === DEFAULT_LOCAL_MODEL ? DEFAULT_MODEL : input.config.model,
-      composeModel: input.config.composeModel === DEFAULT_LOCAL_MODEL ? DEFAULT_COMPOSE_MODEL : input.config.composeModel
+      model: input.config.model,
+      composeModel: input.config.composeModel
     };
   }
   saveConfig(next, input.configPath);
   return next;
-}
-
-export interface LocalRuntimeStatus {
-  reachable: boolean;
-  baseUrl: string;
-  models: string[];
-  /** Present when the runtime could not be reached, in words a user can act on. */
-  problem?: string;
-}
-
-/**
- * Checks whether the local runtime is actually usable *before* the user
- * commits to it, so "no API key needed" does not turn into a run that
- * silently classifies nothing. Never throws.
- */
-export async function checkLocalRuntime(baseUrl = DEFAULT_OLLAMA_BASE_URL): Promise<LocalRuntimeStatus> {
-  try {
-    const models = await ollamaListModels(baseUrl);
-    return { reachable: true, baseUrl, models };
-  } catch (error) {
-    return {
-      reachable: false,
-      baseUrl,
-      models: [],
-      problem:
-        error instanceof OllamaError
-          ? error.message
-          : `Could not reach a local model runtime at ${baseUrl}.`
-    };
-  }
 }

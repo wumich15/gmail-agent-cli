@@ -1,11 +1,29 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_COMPOSE_MODEL, DEFAULT_MODEL, defaultConfig, parseConfig } from "../../src/config/schema.js";
+
+const ORIGINAL_ENV = { ...process.env };
+
+beforeEach(() => {
+  delete process.env["GMAIL_AGENT_AI_PROVIDER"];
+  delete process.env["GMAIL_AGENT_AI_BASE_URL"];
+  delete process.env["GMAIL_AGENT_AI_GATEWAY_URL"];
+  delete process.env["OPENAI_API_KEY"];
+});
+
+afterEach(() => {
+  process.env = { ...ORIGINAL_ENV };
+});
 
 describe("defaultConfig", () => {
   it("defaults to the openai provider with no base URL", () => {
     const config = defaultConfig("UTC");
     expect(config.aiProvider).toBe("openai");
     expect(config.aiBaseUrl).toBeUndefined();
+  });
+
+  it("defaults a gateway-configured development build to the managed provider", () => {
+    process.env["GMAIL_AGENT_AI_GATEWAY_URL"] = "https://ai.example.test";
+    expect(defaultConfig("UTC").aiProvider).toBe("managed");
   });
 });
 
@@ -26,6 +44,16 @@ describe("ConfigSchema", () => {
         schemaVersion: 1,
         timezone: "UTC",
         aiProvider: "openai-compatible"
+      })
+    ).toThrow();
+  });
+
+  it("rejects the removed local provider in current configs", () => {
+    expect(() =>
+      parseConfig({
+        schemaVersion: 3,
+        timezone: "UTC",
+        aiProvider: "ollama"
       })
     ).toThrow();
   });

@@ -7,7 +7,7 @@ import {
   type AiStatus,
   type ConnectionStatus
 } from "../core/onboarding.js";
-import { applyAiAccessChoice, checkLocalRuntime, type AiAccessId } from "../core/ai-access.js";
+import { applyAiAccessChoice, type AiAccessId } from "../core/ai-access.js";
 import { loadOrCreateDefaultConfig } from "../config/load.js";
 import { runWork } from "../commands/work.js";
 import { COMMANDS, VIEW_CONTROLS, VIEW_CONTROLS_NOTE } from "../docs/command-reference.js";
@@ -164,15 +164,6 @@ export class UiSession {
       credentialStore: this.ctx.credentialStore
     });
     reloadConfig(this.ctx);
-  }
-
-  async localRuntime(): Promise<{ reachable: boolean; models: string[]; problem?: string }> {
-    const status = await checkLocalRuntime();
-    return {
-      reachable: status.reachable,
-      models: status.models,
-      ...(status.problem ? { problem: status.problem } : {})
-    };
   }
 
   async disconnect(removeHistory: boolean): Promise<void> {

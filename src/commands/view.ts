@@ -348,7 +348,7 @@ export async function runView(options: ViewOptions): Promise<number> {
         "compose"
       );
       if (!credentials) {
-        notice = "AI is not configured (no API key found).";
+        notice = "AI is not ready; check gmail setup.";
         continue;
       }
       const spinner = p.spinner();
@@ -986,7 +986,7 @@ async function handleAiReply(
     "compose"
   );
   if (!credentials) {
-    console.log(pc.yellow("AI is not configured (no API key found) — use r for a manual reply instead."));
+    console.log(pc.yellow("AI is not ready — check `gmail setup`, or use r for a manual reply instead."));
     return;
   }
   const guidance = await p.text({ message: "Optional guidance for the reply", placeholder: "Press Enter to let AI decide" });
@@ -1004,4 +1004,3 @@ async function handleAiReply(
   }
   await confirmAndSend(gmailClient, accountHash, target, edited);
 }
-

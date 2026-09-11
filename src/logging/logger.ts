@@ -28,6 +28,7 @@ const REDACT_PATHS = [
  */
 const SECRET_PATTERNS: readonly RegExp[] = [
   /Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi,
+  /\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, // Google/OpenID JWTs
   /\bsk-[A-Za-z0-9]{16,}\b/g, // OpenAI-style API keys
   /\bya29\.[A-Za-z0-9\-_]+/g, // Google OAuth access tokens
   /\b1\/\/[A-Za-z0-9\-_]{10,}/g, // Google OAuth refresh tokens

@@ -31,7 +31,6 @@ function fakeSession(): UiSession {
     cancelCurrentConnect: vi.fn(),
     setAiAccess: vi.fn().mockResolvedValue(undefined),
     disconnect: vi.fn().mockResolvedValue(undefined),
-    localRuntime: vi.fn().mockResolvedValue({ reachable: false, models: [] }),
     runState: () => status.run,
     busy: () => false
   } as unknown as UiSession;
@@ -128,15 +127,17 @@ describe("local UI server", () => {
     expect(session.startWork).toHaveBeenCalledWith({ dryRun: false, limit: 5 });
   });
 
-  it("rejects an unknown AI option instead of guessing one", async () => {
+  it("rejects the removed local option and unknown AI options instead of guessing", async () => {
     const session = fakeSession();
     handle = await startUiServer({ session });
-    const response = await call(handle.port, "/api/ai", {
-      method: "POST",
-      headers: { authorization: `Bearer ${handle.token}`, "content-type": "application/json" },
-      body: JSON.stringify({ choice: "something-else" })
-    });
-    expect(response.status).toBe(400);
+    for (const choice of ["local", "something-else"]) {
+      const response = await call(handle.port, "/api/ai", {
+        method: "POST",
+        headers: { authorization: `Bearer ${handle.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ choice })
+      });
+      expect(response.status).toBe(400);
+    }
     expect(session.setAiAccess).not.toHaveBeenCalled();
   });
 

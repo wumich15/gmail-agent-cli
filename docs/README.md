@@ -2,7 +2,16 @@
 
 - [Setup and everyday usage](../README.md)
 - [All Gmail commands and terminal shortcuts](commands.md)
+- [Production OAuth, managed GPT gateway, and release build](production.md)
 - [Development, configuration, and performance](development.md)
+
+Publisher/release material (not needed to use the app):
+
+- [Launch decision record](launch/decisions.md) — the placeholders every other launch document uses
+- [Home page, privacy policy, terms, data deletion, security policy](launch/) — the public pages Google's consent screen links to
+- [Google OAuth verification submission](launch/google-verification.md)
+- [Release acceptance checklist](launch/acceptance-checklist.md)
+- [Gateway runbooks](operations/runbooks.md) and [incident response](operations/incident-response.md)
 
 The CLI also includes documentation through `gmail help`, `gmail help <command>`, and `gmail view --help`.
 

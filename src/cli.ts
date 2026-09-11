@@ -169,7 +169,7 @@ program
 program
   .command("setup")
   .description(
-    "Connect or reconnect Gmail, choose how AI works (local model, your own API key, or off), and see " +
+    "Connect or reconnect Gmail, choose how AI works (included GPT, your own development API key, or off), and see " +
       "current status — without touching any mail"
   )
   .action(() => {

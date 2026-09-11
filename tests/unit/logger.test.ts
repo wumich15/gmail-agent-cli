@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { redactSecrets } from "../../src/logging/logger.js";
 
 describe("redactSecrets", () => {
-  it("preserves all 7 scenarios", async () => {
+  it("preserves all 8 scenarios", async () => {
     await runScenarios([
       { name: "redacts a Bearer token", run: () => {
         expect(redactSecrets("Authorization: Bearer abc123XYZ.def")).not.toContain("abc123XYZ");
@@ -16,6 +16,10 @@ describe("redactSecrets", () => {
       } },
       { name: "redacts a Google OAuth refresh token (1//)", run: () => {
         expect(redactSecrets("refresh_token: 1//0abcdefghijklmnop")).not.toContain("1//0abcdefghijklmnop");
+      } },
+      { name: "redacts a Google ID token (JWT)", run: () => {
+        const token = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.signature_value";
+        expect(redactSecrets(`identity ${token}`)).not.toContain(token);
       } },
       { name: "redacts a refresh_token=... query-style parameter", run: () => {
         expect(redactSecrets("url had refresh_token=SuperSecretValue123 in it")).not.toContain("SuperSecretValue123");

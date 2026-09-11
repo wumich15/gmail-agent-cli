@@ -7,7 +7,13 @@ import {
   OAUTH_SCOPES,
   type OAuthClientSource
 } from "../auth/google-oauth.js";
-import { AI_ACCESS_OPTIONS, checkLocalRuntime, currentAiAccess, type AiAccessId, type AiAccessOption } from "./ai-access.js";
+import {
+  aiAccessOption,
+  availableAiAccessOptions,
+  currentAiAccess,
+  type AiAccessId,
+  type AiAccessOption
+} from "./ai-access.js";
 import { resolveAiCredentials } from "../ai/resolve-classifier.js";
 import type { CliContext } from "./bootstrap.js";
 
@@ -35,6 +41,8 @@ export interface ConnectionStatus {
 }
 
 const SCOPE_EXPLANATIONS: Record<string, string> = {
+  openid: "Confirm your Google identity to this app and, when you choose included GPT, its publisher-operated AI service.",
+  email: "Identify which signed-in Gmail account owns the request. Your Gmail access token is never sent to the AI service.",
   "https://www.googleapis.com/auth/gmail.modify":
     "Read your mail's headers and text, move messages to Trash, archive read mail, and add stars and labels. It cannot permanently delete anything.",
   "https://www.googleapis.com/auth/calendar.events.owned":
@@ -98,14 +106,15 @@ export interface AiStatus {
 
 /**
  * Reports whether AI would actually work right now, not merely what is
- * configured — a chosen local runtime that is not running, or a key that
- * was removed from the keychain, both have to read as "not ready" here,
- * because that is the difference between classified mail and a run that
- * quietly leaves everything for Review.
+ * configured. A missing publisher service, stale Google sign-in, or removed
+ * development key must read as "not ready" instead of quietly leaving all
+ * model-dependent mail for Review.
  */
 export async function getAiStatus(ctx: CliContext, accountHash: string | null): Promise<AiStatus> {
   const access = currentAiAccess(ctx.config);
-  const base = { access, options: AI_ACCESS_OPTIONS };
+  const available = availableAiAccessOptions();
+  const options = available.some((option) => option.id === access) ? available : [aiAccessOption(access), ...available];
+  const base = { access, options };
   if (access === "off") {
     return { ...base, ready: false, model: null, detail: "AI is off. Mail is handled by rules only." };
   }
@@ -119,22 +128,10 @@ export async function getAiStatus(ctx: CliContext, accountHash: string | null): 
       ...base,
       ready: false,
       model: null,
-      detail: "AI is selected but no usable API key was found, so runs fall back to rules only."
-    };
-  }
-  if (credentials.provider === "ollama") {
-    const runtime = await checkLocalRuntime(credentials.baseURL ?? undefined);
-    if (!runtime.reachable) {
-      return { ...base, ready: false, model: credentials.model, detail: runtime.problem ?? "The local model runtime is not reachable." };
-    }
-    const pulled = runtime.models.some((name) => name === credentials.model || name.startsWith(`${credentials.model}:`));
-    return {
-      ...base,
-      ready: pulled,
-      model: credentials.model,
-      detail: pulled
-        ? `Local model "${credentials.model}" is running on this computer. No mail leaves the machine.`
-        : `The local runtime is running but has no model named "${credentials.model}". Run: ollama pull ${credentials.model}`
+      detail:
+        access === "managed"
+          ? "Included GPT is selected, but this build has no usable publisher service or the Google sign-in needs to be refreshed."
+          : "AI is selected but no usable API key was found, so runs fall back to rules only."
     };
   }
   return {
@@ -142,7 +139,9 @@ export async function getAiStatus(ctx: CliContext, accountHash: string | null): 
     ready: true,
     model: credentials.model,
     detail:
-      credentials.provider === "openai-compatible"
+      credentials.provider === "managed"
+        ? `Included GPT is ready (model: ${credentials.model}). No API key is required from you.`
+        : credentials.provider === "openai-compatible"
         ? `Using your own API key against ${credentials.baseURL} (model: ${credentials.model}).`
         : `Using the OpenAI API with your own key (model: ${credentials.model}).`
   };

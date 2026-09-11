@@ -8,6 +8,7 @@ import { fetchProfile } from "../gmail/scanner.js";
 import { MIGRATIONS } from "../state/migrations/index.js";
 import { EXIT_CODES } from "../core/errors.js";
 import { DateTime } from "luxon";
+import { getAiStatus, getConnectionStatus } from "../core/onboarding.js";
 
 type CheckStatus = "ok" | "warn" | "fail";
 interface CheckResult {
@@ -137,11 +138,23 @@ export async function runDoctor(): Promise<number> {
     }
   }
 
-  results.push({
-    name: "AI classification",
-    status: "warn",
-    detail: "not implemented in this build; all mail relies on deterministic rules and read-archiving only"
-  });
+  if (ctx) {
+    try {
+      const connection = await getConnectionStatus(ctx);
+      const ai = await getAiStatus(ctx, connection.accountHash);
+      results.push({
+        name: "AI classification",
+        status: ai.ready ? "ok" : "warn",
+        detail: ai.detail
+      });
+    } catch (error) {
+      results.push({
+        name: "AI classification",
+        status: "warn",
+        detail: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
 
   for (const result of results) {
     const icon = result.status === "ok" ? pc.green("✓") : result.status === "warn" ? pc.yellow("!") : pc.red("✗");

@@ -5,7 +5,8 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "gmail": "./dist/cli.js"
+    "gmail": "./dist/cli.js",
+    "gmail-ai-gateway": "./dist/gateway/cli.js"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -14,14 +15,20 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "pnpm clean && tsc -p tsconfig.build.json",
+    "build:release": "pnpm build && node scripts/embed-release-config.mjs",
+    "verify:release": "node scripts/verify-release-artifact.mjs",
+    "sbom": "node scripts/generate-sbom.mjs",
+    "gateway:secret": "node scripts/generate-gateway-secret.mjs",
     "dev": "tsx src/cli.ts",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:gpt": "pnpm build && node scripts/smoke-gpt.mjs",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "eval": "tsx evals/run.ts",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "pnpm build:release && pnpm verify:release"
   },
   "dependencies": {
     "@clack/prompts": "^0.9.1",

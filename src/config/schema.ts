@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { resolveManagedAiGateway } from "../auth/publisher-client.js";
 
 /** Triage/classification: one cheap call per unresolved message, every run. */
 export const DEFAULT_MODEL = "gpt-5.4-mini";
@@ -12,15 +13,6 @@ export const DEFAULT_MODEL = "gpt-5.4-mini";
  * is why the two are configured separately rather than sharing one model.
  */
 export const DEFAULT_COMPOSE_MODEL = "gpt-5.6-luna";
-
-/**
- * Local no-key inference (see `ai/ollama-classifier.ts`). One model serves
- * both purposes here: a local runtime usually has one general instruct
- * model pulled, and the classify/compose cost asymmetry that justifies two
- * hosted models does not exist when inference is free and local.
- */
-export const DEFAULT_LOCAL_MODEL = "llama3.2";
-export const DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434";
 
 /**
  * In-flight Gmail reads. The shared limiter (see `core/api-retry.ts`) caps
@@ -37,41 +29,62 @@ export const DEFAULT_GMAIL_READ_CONCURRENCY = 8;
  *
  * - "openai": the standard OpenAI API, with a user-supplied key. Kept as the
  *   advanced path; it is explicitly not the required normal path.
+ * - "managed": the publisher-operated gateway included in a production
+ *   release. It authenticates with a short-lived Google ID token and keeps
+ *   the publisher's OpenAI key on the server, never in the desktop package.
  * - "openai-compatible": any endpoint implementing the same Responses API +
  *   Structured Outputs shape, via `aiBaseUrl`. Still key-authenticated.
- * - "ollama": a local Ollama runtime on this machine, which needs no API key
- *   at all (https://docs.ollama.com/api/authentication). This is the no-key
- *   path: inference is local, so no mail leaves the computer and there is
- *   nothing to bill, at the cost of local hardware and model quality. It is
- *   a real adapter (`ai/ollama.ts`), not just a base-URL override — Ollama
- *   does not implement the Responses API this app uses for OpenAI.
  */
-export const AI_PROVIDERS = ["openai", "openai-compatible", "ollama"] as const;
+export const AI_PROVIDERS = ["managed", "openai", "openai-compatible"] as const;
 export type AiProvider = (typeof AI_PROVIDERS)[number];
 
 /**
  * `1` predates `aiEnabled` being an effective switch: every v1 file on disk
  * was written with `aiEnabled: false` while a usable API key still activated
  * AI, so the flag cannot be read literally from those files. `loadConfig`
- * migrates v1 -> v2 by recording what those installs were actually doing
+ * migrates v1 by recording what those installs were actually doing
  * (`aiEnabled: true`), after which the field means exactly what it says.
  */
-export const CURRENT_CONFIG_SCHEMA_VERSION = 2;
+export const CURRENT_CONFIG_SCHEMA_VERSION = 3;
+
+const LEGACY_LOCAL_PROVIDER = "ollama";
+
+/**
+ * Schema v2 briefly offered a local-model path. Production now provides AI
+ * through the authenticated publisher gateway instead, so old local configs
+ * are upgraded to Included GPT and their incompatible model/base URL values
+ * are discarded before validation.
+ */
+function replaceLegacyLocalProvider(raw: unknown): unknown {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const value = raw as Record<string, unknown>;
+  if (value["schemaVersion"] !== 2 || value["aiProvider"] !== LEGACY_LOCAL_PROVIDER) return raw;
+  const upgraded = { ...value };
+  delete upgraded["aiBaseUrl"];
+  return {
+    ...upgraded,
+    aiProvider: "managed",
+    model: DEFAULT_MODEL,
+    composeModel: DEFAULT_COMPOSE_MODEL
+  };
+}
 
 /** Config on disk is non-secret. Secrets always live in the credential store. */
-export const ConfigSchema = z
-  .object({
-    schemaVersion: z.union([z.literal(1), z.literal(2)]),
+export const ConfigSchema = z.preprocess(
+  replaceLegacyLocalProvider,
+  z
+    .object({
+    schemaVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]),
     timezone: z.string().min(1),
     automationEnabled: z.boolean().default(false),
     /**
      * A real off switch as of schema v2: when false, no classification or
-     * drafting call is made even if a usable API key or local runtime is
-     * present. Set from the explicit AI-access choice during setup.
+     * drafting call is made even if a usable provider is configured. Set
+     * from the explicit AI-access choice during setup.
      */
     aiEnabled: z.boolean().default(false),
     aiProvider: z.enum(AI_PROVIDERS).default("openai"),
-    /** Required when aiProvider is "openai-compatible"; defaulted for "ollama"; ignored otherwise. */
+    /** Required when aiProvider is "openai-compatible"; ignored otherwise. */
     aiBaseUrl: z.string().url().optional(),
     model: z.string().min(1).default(DEFAULT_MODEL),
     composeModel: z.string().min(1).default(DEFAULT_COMPOSE_MODEL),
@@ -96,11 +109,12 @@ export const ConfigSchema = z
       .optional(),
     telemetryEnabled: z.boolean().default(false)
   })
-  .strict()
-  .refine((config) => config.aiProvider !== "openai-compatible" || config.aiBaseUrl !== undefined, {
-    message: "aiBaseUrl is required when aiProvider is \"openai-compatible\"",
-    path: ["aiBaseUrl"]
-  });
+    .strict()
+    .refine((config) => config.aiProvider !== "openai-compatible" || config.aiBaseUrl !== undefined, {
+      message: "aiBaseUrl is required when aiProvider is \"openai-compatible\"",
+      path: ["aiBaseUrl"]
+    })
+);
 
 export type Config = z.infer<typeof ConfigSchema>;
 
@@ -116,11 +130,17 @@ export function migrateConfig(config: Config): Config | null {
   if (config.schemaVersion === CURRENT_CONFIG_SCHEMA_VERSION) {
     return null;
   }
-  return { ...config, schemaVersion: CURRENT_CONFIG_SCHEMA_VERSION, aiEnabled: true };
+  return {
+    ...config,
+    schemaVersion: CURRENT_CONFIG_SCHEMA_VERSION,
+    aiEnabled: config.schemaVersion === 1 ? true : config.aiEnabled
+  };
 }
 
 export function defaultConfig(timezone: string): Config {
-  const aiProvider = (process.env["GMAIL_AGENT_AI_PROVIDER"] as AiProvider | undefined) ?? "openai";
+  const aiProvider =
+    (process.env["GMAIL_AGENT_AI_PROVIDER"] as AiProvider | undefined) ??
+    (resolveManagedAiGateway() ? "managed" : "openai");
   const aiBaseUrl = process.env["GMAIL_AGENT_AI_BASE_URL"];
   // A fresh config must not silently disable AI for the documented
   // headless/automation path, where the operator configures the provider

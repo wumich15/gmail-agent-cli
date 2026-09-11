@@ -1,0 +1,84 @@
+# Protected release build.
+#
+# This is the only job permitted to read the publisher OAuth client and gateway
+# URL. It refuses to produce an artifact that is unconfigured (an unreplaced
+# release marker) or contaminated (a credential, `.env`, local database, or
+# diagnostic log inside the package), and it records the SBOM, provenance, and
+# checksums that the release record keeps.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to npm after verification
+        type: boolean
+        default: false
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    name: Build signed release artifact
+    runs-on: ubuntu-latest
+    # A protected environment keeps the publisher credentials behind a
+    # least-privilege, multi-factor release approval.
+    environment: production-release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile
+
+      - name: Re-run the full verification suite
+        run: |
+          pnpm lint
+          pnpm typecheck
+          pnpm test
+
+      - name: Build the consumer artifact with publisher configuration
+        env:
+          GMAIL_AGENT_PUBLISHER_OAUTH_CLIENT_ID: ${{ secrets.GMAIL_AGENT_PUBLISHER_OAUTH_CLIENT_ID }}
+          GMAIL_AGENT_PUBLISHER_OAUTH_CLIENT_SECRET: ${{ secrets.GMAIL_AGENT_PUBLISHER_OAUTH_CLIENT_SECRET }}
+          GMAIL_AGENT_PUBLISHER_AI_GATEWAY_URL: ${{ secrets.GMAIL_AGENT_PUBLISHER_AI_GATEWAY_URL }}
+        run: pnpm build:release
+
+      - name: Verify the artifact is configured and free of secrets
+        run: pnpm verify:release
+
+      - name: Software bill of materials
+        run: pnpm sbom
+
+      - name: Pack and checksum
+        run: |
+          npm pack --pack-destination dist-artifacts --ignore-scripts
+          cd dist-artifacts && shasum -a 256 ./*.tgz | tee SHA256SUMS.txt
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist-artifacts/*.tgz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifact
+          path: |
+            dist-artifacts/*.tgz
+            dist-artifacts/SHA256SUMS.txt
+            sbom.cdx.json
+
+      # Publishing is a separate, explicitly requested step so a verified build
+      # can be inspected before it becomes installable.
+      - name: Publish to npm
+        if: inputs.publish == true
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --ignore-scripts dist-artifacts/*.tgz

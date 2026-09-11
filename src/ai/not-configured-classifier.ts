@@ -14,7 +14,7 @@ export class NotConfiguredClassifier implements Classifier {
       ok: false,
       unavailable: {
         reason: "not_configured",
-        detail: "AI classification is not implemented in this build."
+        detail: "AI classification is not ready; the message was left to deterministic rules."
       }
     };
   }

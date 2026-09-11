@@ -1,0 +1,50 @@
+# Contract tests for the managed AI gateway against a staging deployment.
+#
+# These run only with synthetic content: the plan forbids exercising a real
+# mailbox here, and a staging OpenAI project keeps production spend and
+# production user quotas out of CI.
+name: Gateway staging contract
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: Staging gateway contract
+    runs-on: ubuntu-latest
+    environment: gateway-staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Gateway health
+        env:
+          GATEWAY_URL: ${{ secrets.GMAIL_AGENT_STAGING_GATEWAY_URL }}
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' "$GATEWAY_URL/health")
+          test "$status" = "200" || { echo "Staging gateway is unhealthy (HTTP $status)."; exit 1; }
+
+      - name: Unauthenticated requests are rejected
+        env:
+          GATEWAY_URL: ${{ secrets.GMAIL_AGENT_STAGING_GATEWAY_URL }}
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$GATEWAY_URL/v1/responses" \
+            -H 'content-type: application/json' --data '{"model":"gpt-5.4-mini","input":"hi","store":false}')
+          test "$status" = "401" || { echo "Gateway accepted an unauthenticated request (HTTP $status)."; exit 1; }
+
+      # Both gateway workloads with synthetic content only: structured
+      # classification, and user-reviewed writing/style generation.
+      - name: Classification and writing workloads
+        env:
+          OPENAI_API_KEY: ${{ secrets.GMAIL_AGENT_STAGING_OPENAI_API_KEY }}
+        run: pnpm test:gpt

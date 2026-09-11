@@ -132,11 +132,6 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, path: string
     sendJson(res, 200, await session.status());
     return;
   }
-  if (req.method === "GET" && path === "/api/local-runtime") {
-    sendJson(res, 200, await session.localRuntime());
-    return;
-  }
-
   if (req.method !== "POST") {
     sendJson(res, 405, { error: "Method not allowed." });
     return;
@@ -162,7 +157,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, path: string
     }
     case "/api/ai": {
       const choice = body["choice"];
-      if (choice !== "local" && choice !== "api-key" && choice !== "off") {
+      if (choice !== "managed" && choice !== "api-key" && choice !== "off") {
         throw new UiError("Unknown AI option.", 400);
       }
       const apiKey = typeof body["apiKey"] === "string" && body["apiKey"].trim() ? body["apiKey"].trim() : null;

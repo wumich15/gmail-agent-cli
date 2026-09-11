@@ -26,7 +26,7 @@ export async function authLogin(): Promise<number> {
       "If you choose a hosted AI provider, selected email text (never attachments) is sent to it to\n" +
       "help decide what is spam or important and to draft replies you review. That provider's\n" +
       "standard abuse-monitoring retention may still apply even with storage disabled on the call.\n" +
-      "Choosing the local-model option instead keeps every message on this computer."
+      "You can instead choose rules-only mode, which makes no AI call."
   );
 
   const proceed = await p.confirm({ message: "Continue and sign in with Google in your browser?" });

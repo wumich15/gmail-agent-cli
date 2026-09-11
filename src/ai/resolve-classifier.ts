@@ -1,23 +1,26 @@
 import { CREDENTIAL_KEYS, type CredentialStore } from "../auth/credential-store.js";
 import {
   DEFAULT_COMPOSE_MODEL,
-  DEFAULT_LOCAL_MODEL,
   DEFAULT_MODEL,
-  DEFAULT_OLLAMA_BASE_URL,
   type AiProvider,
   type Config
 } from "../config/schema.js";
 import { NotConfiguredClassifier } from "./not-configured-classifier.js";
 import { OpenAiClassifier } from "./openai-classifier.js";
-import { OllamaClassifier } from "./ollama-classifier.js";
 import { SCHEMA_VERSION } from "./assessment-mapping.js";
 import { PROMPT_VERSION } from "./prompt.js";
+import { googleIdTokenFromRefreshToken, resolveOAuthClientCredentials } from "../auth/google-oauth.js";
+import { resolveManagedAiGateway } from "../auth/publisher-client.js";
 import type { Classifier } from "./classifier.js";
 
 export interface ResolveClassifierInput {
   accountHash: string;
   credentialStore: CredentialStore;
   config: Config | null;
+  /** Test seam for the short-lived Google identity used by managed AI. */
+  managedIdentityToken?: (() => Promise<string>) | undefined;
+  /** Test seam; production resolves the URL embedded in the release. */
+  managedGatewayBaseURL?: string | undefined;
 }
 
 export interface ResolvedClassifier {
@@ -42,10 +45,34 @@ export interface ResolvedClassifier {
 
 export interface ResolvedAiCredentials {
   provider: AiProvider;
-  /** Null only for a local runtime, which needs no key at all. */
-  apiKey: string | null;
+  /** Google ID token for managed AI, otherwise the user's provider key. */
+  apiKey: string;
   model: string;
   baseURL: string | null;
+}
+
+const managedTokenCache = new Map<string, { token: string; expiresAt: number }>();
+
+function jwtExpiry(token: string): number {
+  try {
+    const payload = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8")) as { exp?: unknown };
+    return typeof payload.exp === "number" ? payload.exp * 1000 : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function resolveManagedIdentityToken(input: ResolveClassifierInput): Promise<string | null> {
+  if (input.managedIdentityToken) return input.managedIdentityToken();
+
+  const cached = managedTokenCache.get(input.accountHash);
+  if (cached && cached.expiresAt > Date.now() + 5 * 60_000) return cached.token;
+
+  const refreshToken = await input.credentialStore.getSecret(CREDENTIAL_KEYS.oauthRefreshToken(input.accountHash));
+  if (!refreshToken) return null;
+  const token = await googleIdTokenFromRefreshToken(resolveOAuthClientCredentials(), refreshToken);
+  managedTokenCache.set(input.accountHash, { token, expiresAt: jwtExpiry(token) });
+  return token;
 }
 
 /** @deprecated Kept for older call sites; the resolution is no longer OpenAI-specific. */
@@ -56,7 +83,7 @@ export type ResolvedOpenAiCredentials = ResolvedAiCredentials;
  * different models on a hosted provider: `classify` runs a cheap call on
  * every unresolved message, while `compose` drafts prose the user will
  * read, edit, and send under their own name. See `config/schema.ts` for
- * the two defaults — and for why a local runtime uses one model for both.
+ * the two defaults.
  */
 export type ModelPurpose = "classify" | "compose";
 
@@ -69,24 +96,6 @@ function resolveModel(input: ResolveClassifierInput, purpose: ModelPurpose, fall
   const override = purpose === "compose" ? process.env["GMAIL_AGENT_COMPOSE_MODEL"] : process.env["GMAIL_AGENT_MODEL"];
   const configured = purpose === "compose" ? input.config?.composeModel : input.config?.model;
   return override || configured || fallback;
-}
-
-/**
- * A config written before the user switched to a local runtime still
- * carries a hosted default model name, which a local runtime has certainly
- * never pulled — so a *persisted* hosted default is treated as "unset"
- * rather than sending a confusing `model "gpt-5.4-mini" not found` at the
- * user. An explicit environment override is never second-guessed this way:
- * someone who names a model on purpose gets that model.
- */
-function resolveLocalModel(input: ResolveClassifierInput, purpose: ModelPurpose): string {
-  const override = purpose === "compose" ? process.env["GMAIL_AGENT_COMPOSE_MODEL"] : process.env["GMAIL_AGENT_MODEL"];
-  if (override) return override;
-  const configured = purpose === "compose" ? input.config?.composeModel : input.config?.model;
-  if (!configured || configured === DEFAULT_MODEL || configured === DEFAULT_COMPOSE_MODEL) {
-    return DEFAULT_LOCAL_MODEL;
-  }
-  return configured;
 }
 
 /**
@@ -114,12 +123,18 @@ export async function resolveAiCredentials(
 
   const provider: AiProvider = input.config?.aiProvider ?? "openai";
 
-  if (provider === "ollama") {
+  if (provider === "managed") {
+    const gateway = input.managedGatewayBaseURL
+      ? { baseURL: input.managedGatewayBaseURL }
+      : resolveManagedAiGateway();
+    if (!gateway) return null;
+    const identityToken = await resolveManagedIdentityToken(input);
+    if (!identityToken) return null;
     return {
       provider,
-      apiKey: null,
-      model: resolveLocalModel(input, purpose),
-      baseURL: input.config?.aiBaseUrl ?? DEFAULT_OLLAMA_BASE_URL
+      apiKey: identityToken,
+      model: resolveModel(input, purpose, purpose === "compose" ? DEFAULT_COMPOSE_MODEL : DEFAULT_MODEL),
+      baseURL: gateway.baseURL
     };
   }
 
@@ -156,32 +171,25 @@ export async function resolveClassifier(input: ResolveClassifierInput): Promise<
       classifier: new NotConfiguredClassifier(),
       description: off
         ? "AI classification is turned off — using rules-only mode."
-        : "AI classification is not configured (no API key or local model found) — using rules-only mode.",
+        : "AI classification is not configured (no usable hosted provider found) — using rules-only mode.",
       classifierVersion: "not-configured",
       promptVersion: "not-configured",
       schemaVersion: "not-configured"
     };
   }
 
-  if (credentials.provider === "ollama") {
-    const baseUrl = credentials.baseURL ?? DEFAULT_OLLAMA_BASE_URL;
-    return {
-      classifier: new OllamaClassifier({ baseUrl, model: credentials.model }),
-      description: `Using local AI classification via Ollama at ${baseUrl} (model: ${credentials.model}). No mail leaves this computer.`,
-      classifierVersion: `ollama:${credentials.model}`,
-      promptVersion: PROMPT_VERSION,
-      schemaVersion: SCHEMA_VERSION
-    };
-  }
-
   return {
     classifier: new OpenAiClassifier({
-      ...(credentials.apiKey !== null ? { apiKey: credentials.apiKey } : {}),
+      apiKey: credentials.apiKey,
       model: credentials.model,
-      ...(credentials.baseURL !== null ? { baseURL: credentials.baseURL } : {})
+      ...(credentials.baseURL !== null ? { baseURL: credentials.baseURL } : {}),
+      assessmentProvider: credentials.provider === "managed" ? "managed" : "openai"
     }),
-    description: `Using AI classification via ${credentials.baseURL ?? "the OpenAI API"} (model: ${credentials.model}).`,
-    classifierVersion: `openai:${credentials.model}`,
+    description:
+      credentials.provider === "managed"
+        ? `Using included GPT classification (model: ${credentials.model}); no API key is required from you.`
+        : `Using AI classification via ${credentials.baseURL ?? "the OpenAI API"} (model: ${credentials.model}).`,
+    classifierVersion: `${credentials.provider === "managed" ? "managed" : "openai"}:${credentials.model}`,
     promptVersion: PROMPT_VERSION,
     schemaVersion: SCHEMA_VERSION
   };

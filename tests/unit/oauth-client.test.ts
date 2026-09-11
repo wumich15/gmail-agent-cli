@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { isInvalidGrantError, resolveOAuthClientCredentials } from "../../src/auth/google-oauth.js";
 import { publisherOAuthClientConfigured } from "../../src/auth/publisher-client.js";
+import { resolveManagedAiGateway } from "../../src/auth/publisher-client.js";
 import { InvalidConfigError } from "../../src/core/errors.js";
 
 describe("resolveOAuthClientCredentials", () => {
@@ -40,5 +41,19 @@ describe("isInvalidGrantError", () => {
     expect(isInvalidGrantError(new Error("getaddrinfo ENOTFOUND oauth2.googleapis.com"))).toBe(false);
     expect(isInvalidGrantError({ response: { data: { error: "rateLimitExceeded" } } })).toBe(false);
     expect(isInvalidGrantError(null)).toBe(false);
+  });
+});
+
+describe("resolveManagedAiGateway", () => {
+  it("normalizes the Responses API base path and permits loopback HTTP only for development", () => {
+    expect(
+      resolveManagedAiGateway({ GMAIL_AGENT_AI_GATEWAY_URL: "https://ai.example.test/" } as NodeJS.ProcessEnv)
+    ).toEqual({ baseURL: "https://ai.example.test/v1", source: "environment" });
+    expect(
+      resolveManagedAiGateway({ GMAIL_AGENT_AI_GATEWAY_URL: "http://127.0.0.1:8787/v1" } as NodeJS.ProcessEnv)
+    ).toEqual({ baseURL: "http://127.0.0.1:8787/v1", source: "environment" });
+    expect(() =>
+      resolveManagedAiGateway({ GMAIL_AGENT_AI_GATEWAY_URL: "http://ai.example.test" } as NodeJS.ProcessEnv)
+    ).toThrow(/HTTPS/);
   });
 });

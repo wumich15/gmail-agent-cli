@@ -146,7 +146,7 @@ export async function handleCompose(
       "compose"
     );
     if (!credentials) {
-      console.log(pc.yellow("AI is not configured (no API key found); compose manually instead."));
+      console.log(pc.yellow("AI is not ready; check `gmail setup`, or compose manually instead."));
       return false;
     }
     const spinner = p.spinner();

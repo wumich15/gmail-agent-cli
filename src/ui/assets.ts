@@ -37,7 +37,7 @@ export const APP_HTML = `<!doctype html>
     <footer>
       <p>
         This page is served by the <code>gmail ui</code> command running on this computer, and closes when
-        that command stops. Your Google sign-in and any AI key stay on this machine.
+        that command stops. Google tokens and stored AI credentials are never returned to this page.
       </p>
     </footer>
     <script src="/app.js"></script>
@@ -317,7 +317,7 @@ function setupView() {
     ]);
     fieldset.appendChild(row);
   });
-  var keyLabel = el("label", { for: "ai-key", text: "OpenAI API key (only needed for the API-key option)" });
+  var keyLabel = el("label", { for: "ai-key", text: "OpenAI API key (only needed for the advanced API-key option)" });
   var keyInput = el("input", { type: "password", id: "ai-key", autocomplete: "off", spellcheck: "false" });
   fieldset.appendChild(keyLabel);
   fieldset.appendChild(keyInput);
@@ -331,6 +331,11 @@ function setupView() {
       onclick: function () {
         var selected = document.querySelector('input[name="ai"]:checked');
         if (!selected) return;
+        var option = status.ai.options.find(function (candidate) { return candidate.id === selected.value; });
+        if (option && option.sendsMailOffDevice) {
+          var destination = selected.value === "managed" ? "the publisher service and OpenAI" : "the selected hosted AI provider";
+          if (!confirm("Send selected message text (never attachments) to " + destination + "?")) return;
+        }
         act("ai", "/api/ai", { choice: selected.value, apiKey: keyInput.value }, "Saved.");
       }
     })
