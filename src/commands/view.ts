@@ -333,7 +333,9 @@ export async function runView(options: ViewOptions): Promise<number> {
       continue;
     }
     if (cmd === "c" || cmd === "a" || cmd === ";c") {
-      await handleCompose(gmailClient, account.accountHash, cmd !== "c", ctx, getStyleProfile);
+      // "c" asks how to write it, exactly as `gmail send` does; "a"/";c"
+      // are the shortcut straight to an AI draft.
+      await handleCompose(gmailClient, account.accountHash, cmd === "c" ? undefined : true, ctx, getStyleProfile);
       // Hold the send confirmation on screen; the list redraw would wipe it.
       console.log(pc.dim("\nPress any key to return to the list."));
       await waitForKeypress();

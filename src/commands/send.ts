@@ -1,4 +1,3 @@
-import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { bootstrap } from "../core/bootstrap.js";
 import { resolveAccountSigningInIfNeeded } from "./shared.js";
@@ -43,19 +42,6 @@ export async function runSend(options: SendOptions): Promise<number> {
   const ctx = bootstrap();
   const { account, gmailClient } = await resolveAccountSigningInIfNeeded(ctx);
 
-  let useAi = options.ai;
-  if (!useAi) {
-    const choice = await p.select({
-      message: "Compose manually or with AI (using your saved writing style)?",
-      options: [
-        { value: "manual", label: "Manually" },
-        { value: "ai", label: "With AI" }
-      ]
-    });
-    if (p.isCancel(choice)) return EXIT_CODES.ok;
-    useAi = choice === "ai";
-  }
-
   const getStyleProfile = (
     credentials: ResolvedOpenAiCredentials,
     forceRefresh = false
@@ -72,7 +58,9 @@ export async function runSend(options: SendOptions): Promise<number> {
       forceRefresh
     );
 
-  await handleCompose(gmailClient, account.accountHash, useAi, ctx, getStyleProfile, {
+  // `--ai` goes straight to drafting; without it the shared flow asks, and
+  // only offers AI when this account can actually run it.
+  await handleCompose(gmailClient, account.accountHash, options.ai ? true : undefined, ctx, getStyleProfile, {
     ...(options.to !== undefined ? { to: options.to } : {}),
     ...(options.subject !== undefined ? { subject: options.subject } : {})
   });

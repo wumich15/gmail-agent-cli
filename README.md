@@ -20,7 +20,7 @@ Everything runs on your own computer. There is no server, no hosted account, and
 - Archives everything you have already read — only when you ask, with `gmail --archive`.
 - Leaves anything uncertain alone, and lists it under Review.
 - Creates persistent spam/important rules you name (`gmail add`) and applies them before any AI runs.
-- `gmail view` is also a terminal mail client: read, search, delete, compose and reply, with AI drafts you edit before they go anywhere.
+- `gmail view` is also a terminal mail client: read, search, delete, compose and reply. Composing asks whether to write it yourself or have AI draft it, and you edit and confirm the exact message either way.
 - `gmail ui` serves the same setup, command reference, and status as three plain pages on `127.0.0.1`, for as long as that command runs.
 
 ## What it never does

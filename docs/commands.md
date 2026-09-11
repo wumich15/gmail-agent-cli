@@ -203,8 +203,8 @@ Type commands and press **Enter**, except for arrow keys and Escape, which act i
 | `f` (alias `t`) | Choose labels. Matching any selected label is sufficient; selecting none shows all cached Inbox/Spam mail. |
 | `s <text>` | Search cached subjects and sender display text, case-insensitively. This is not Gmail query syntax or body search. |
 | `s` | Clear the search. |
-| `c` | Compose a new message manually. |
-| `a` (alias `;c`) | Compose a new message with AI. |
+| `c` | Compose a new message; asks whether to write it yourself or have AI draft it, the same choice `gmail send` offers. AI is only offered when this account can actually run it. |
+| `a` (alias `;c`) | Compose a new message, going straight to an AI draft. |
 | `;s` | Refresh the saved writing-style description using recent Sent mail and AI. |
 | `;u` | Restore the last message moved to Trash during this session. One undo slot, cleared after restoring. |
 | `u` | Refresh from Gmail and return to page one, keeping search/filter choices. |

@@ -102,22 +102,75 @@ export interface ComposePrefill {
 }
 
 /**
+ * How the body gets written: `true` goes straight to an AI draft, `false`
+ * straight to typing it, and `undefined` asks — which is what a user who
+ * just wants to write an email should get, rather than having to know in
+ * advance which key or flag commits them to which mode.
+ */
+export type ComposeMode = boolean | undefined;
+
+/**
+ * Asks how to write the body, offering AI only when it can actually run.
+ * Shared by `gmail send` and `gmail view`'s compose so the two cannot drift
+ * on what the choice looks like or when AI is offered at all.
+ */
+export async function chooseComposeMode(aiAvailable: boolean): Promise<boolean | null> {
+  if (!aiAvailable) {
+    // Listing an option that would immediately fail is worse than not
+    // listing it: the user picks it, answers the prompts, and only then
+    // finds out.
+    p.log.info("AI drafting is not set up on this account (`gmail setup`), so this will be written by hand.");
+    return false;
+  }
+  const choice = await p.select({
+    message: "Compose manually or with AI (using your saved writing style)?",
+    options: [
+      { value: "manual", label: "Manually" },
+      { value: "ai", label: "With AI" }
+    ]
+  });
+  if (p.isCancel(choice)) return null;
+  return choice === "ai";
+}
+
+/**
  * Composes and (on confirmation) sends one new message. Recipient and
  * subject are always either a value the user typed/passed on the command
  * line or a value read back from `p.text` — never AI-derived, matching
- * every other outbound path in this app. `useAi` picks manual body entry
- * vs. an AI draft that imitates the account's saved writing style (see
+ * every other outbound path in this app. The body is either typed or an AI
+ * draft that imitates the account's saved writing style (see
  * `gmail/writing-style.ts`); either way the user reviews the exact body
  * before `confirmAndSend` shows the final preview and asks to send.
  */
 export async function handleCompose(
   gmailClient: GmailClient,
   accountHash: string,
-  useAi: boolean,
+  useAi: ComposeMode,
   ctx: CliContext,
   getStyleProfile: (credentials: ResolvedOpenAiCredentials, forceRefresh?: boolean) => Promise<string | null>,
   prefill: ComposePrefill = {}
 ): Promise<boolean> {
+  // Resolved once, before anything is typed: it decides whether AI is even
+  // offered, and saves asking for a purpose that could not be drafted.
+  const credentials = await resolveOpenAiCredentials(
+    { accountHash, credentialStore: ctx.credentialStore, config: ctx.config },
+    "compose"
+  );
+  let mode: boolean;
+  if (useAi === undefined) {
+    const chosen = await chooseComposeMode(credentials !== null);
+    if (chosen === null) return false;
+    mode = chosen;
+  } else if (useAi && credentials === null) {
+    // They asked for AI and it cannot run. Offer the obvious alternative
+    // rather than discarding the message they were about to write.
+    p.log.warn("AI is not ready on this account — check `gmail setup`.");
+    const manual = await p.confirm({ message: "Write this one by hand instead?", initialValue: true });
+    if (p.isCancel(manual) || !manual) return false;
+    mode = false;
+  } else {
+    mode = useAi;
+  }
   let to = prefill.to;
   if (to === undefined) {
     const input = await p.text({ message: "To" });
@@ -136,19 +189,11 @@ export async function handleCompose(
     return false;
   }
   let body: string | null;
-  if (!useAi) {
+  if (!mode || credentials === null) {
     body = await promptBody("Message body");
   } else {
     const purpose = await p.text({ message: "What should this email say?" });
     if (p.isCancel(purpose) || !purpose.trim()) return false;
-    const credentials = await resolveOpenAiCredentials(
-      { accountHash, credentialStore: ctx.credentialStore, config: ctx.config },
-      "compose"
-    );
-    if (!credentials) {
-      console.log(pc.yellow("AI is not ready; check `gmail setup`, or compose manually instead."));
-      return false;
-    }
     const spinner = p.spinner();
     spinner.start("Drafting");
     // Reuses the persisted writing-style profile (computed once from a
