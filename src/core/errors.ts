@@ -35,12 +35,6 @@ export class SafetyPreconditionError extends GmailAgentError {
   }
 }
 
-export class OperationalError extends GmailAgentError {
-  constructor(message: string) {
-    super(message, EXIT_CODES.operationalFailure);
-  }
-}
-
 export class RuleConflictError extends GmailAgentError {
   constructor(message: string) {
     super(message, EXIT_CODES.safetyBlocked);

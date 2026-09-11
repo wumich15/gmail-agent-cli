@@ -12,7 +12,6 @@ import { z } from "zod";
  * output-shape/cost change, not a policy change.
  */
 export const EMAIL_TAGS = ["spam", "suspicious", "important", "routine"] as const;
-export type EmailTag = (typeof EMAIL_TAGS)[number];
 
 /**
  * Minimal, cheap wire schema: a single classification tag instead of

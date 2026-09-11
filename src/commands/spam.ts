@@ -10,6 +10,7 @@ import { EXIT_CODES, RuleConflictError } from "../core/errors.js";
 import { trashMessage } from "../gmail/executor.js";
 import { isOneClickPost, parseListUnsubscribeHeader } from "../unsubscribe/headers.js";
 import { redactUrlForLogging } from "../unsubscribe/safe-http.js";
+import { buildComposeTarget, sendReply } from "../gmail/reply.js";
 import { ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 import { listAllMessageIds } from "../gmail/scanner.js";
@@ -24,6 +25,37 @@ export interface SpamOptions {
   retryUnsubscribe: boolean;
   /** Explicit `gmail add spam` is allowed to override an existing important rule. */
   overrideImportant?: boolean;
+}
+
+interface MailtoUnsubscribe {
+  address: string;
+  subject: string | null;
+  body: string | null;
+}
+
+/**
+ * Shows the exact outbound unsubscribe message and asks. Defaults to "no",
+ * like every other send confirmation in this app, and refuses outright when
+ * there is no terminal to ask — an unattended run must never be the thing
+ * that sends mail on the user's behalf.
+ */
+async function confirmUnsubscribeSend(
+  displayLabel: string,
+  mailto: MailtoUnsubscribe,
+  nonInteractive: boolean
+): Promise<boolean> {
+  if (nonInteractive || !process.stdin.isTTY) {
+    console.log(
+      `  ${displayLabel}: an unsubscribe email to ${mailto.address} needs your confirmation; run this without --yes in a terminal.`
+    );
+    return false;
+  }
+  console.log(pc.bold(`\n  Unsubscribe email for ${displayLabel}`));
+  console.log(`    To:      ${mailto.address}`);
+  console.log(`    Subject: ${mailto.subject ?? "Unsubscribe"}`);
+  console.log(`    Body:    ${mailto.body ? mailto.body : "(empty)"}`);
+  const confirmed = await p.confirm({ message: "Send exactly this email?", initialValue: false });
+  return !p.isCancel(confirmed) && confirmed;
 }
 
 /** Bounds how many search hits get fetched/considered per invocation; --limit-style safety cap, not a design limit. */
@@ -195,12 +227,24 @@ async function runSpamLocked(
   // identity and must not be trashed just for appearing in the search.
   const resolvedMessageIds = new Set(identities.flatMap((identity) => identity.sampleMessageIds));
   let trashedCount = 0;
+  let trashFailures = 0;
   for (const message of candidates) {
     if (!resolvedMessageIds.has(message.gmailMessageId)) continue;
-    await trashMessage(gmailClient, message.gmailMessageId);
-    trashedCount += 1;
+    try {
+      await trashMessage(gmailClient, message.gmailMessageId);
+      trashedCount += 1;
+    } catch {
+      // One rejected message must not abandon the rest of the batch, nor the
+      // unsubscribe reporting below: the rule is already saved, so aborting
+      // here would leave the user with a half-applied command and no summary
+      // of what actually happened.
+      trashFailures += 1;
+    }
   }
-  console.log(`Trashed ${trashedCount} current matching message(s).`);
+  console.log(
+    `Trashed ${trashedCount} current matching message(s).` +
+      (trashFailures > 0 ? ` ${trashFailures} could not be trashed and will be retried by a later run.` : "")
+  );
 
   let unsubHandled = 0;
   let unsubManual = 0;
@@ -226,20 +270,39 @@ async function runSpamLocked(
       // re-encoding just the address/subject into a new URI and
       // reparsing, which silently dropped the original body.
       const mailto = parsed.mailto;
-      await withGoogleApiRetry(
-        () =>
-          gmailClient.users.messages.send({
-            userId: "me",
-            requestBody: {
-              raw: Buffer.from(
-                `To: ${mailto.address}\r\nSubject: ${mailto.subject ?? "Unsubscribe"}\r\n\r\n${mailto.body ?? ""}`
-              ).toString("base64url")
-            }
-          }),
-        {},
-        5 // messages.send = 100 quota units
-      );
-      unsubHandled += 1;
+
+      // This app has exactly one rule about outbound mail: nothing is ever
+      // sent without the user first seeing that exact message and agreeing
+      // to it. An unsubscribe is not an exception — it is a real email, to
+      // an address chosen by a header the sender controls. A flag on the
+      // command authorizes *considering* the method; it is not consent to
+      // send this specific message, so the confirmation happens here, at
+      // the send site, where it cannot be bypassed by a future caller.
+      // Built and sent through the same hardened path as every other
+      // outbound message (gmail/reply.ts): one validated recipient, header
+      // values sanitized and RFC 2047-encoded, one narrow call site for
+      // messages.send. Hand-assembling a second raw message here duplicated
+      // that logic without its protections.
+      const target = buildComposeTarget(mailto.address, mailto.subject ?? "Unsubscribe");
+      if (!target) {
+        console.log(`  ${identity.displayLabel}: the unsubscribe address in that header is not usable; handle it manually.`);
+        unsubManual += 1;
+        continue;
+      }
+      const confirmed = await confirmUnsubscribeSend(identity.displayLabel, mailto, options.yes);
+      if (!confirmed) {
+        unsubManual += 1;
+        continue;
+      }
+      try {
+        await sendReply(gmailClient, target, mailto.body ?? "");
+        unsubHandled += 1;
+      } catch (error) {
+        console.log(
+          `  ${identity.displayLabel}: the unsubscribe email could not be sent (${error instanceof Error ? error.message : String(error)}).`
+        );
+        unsubManual += 1;
+      }
       continue;
     }
 

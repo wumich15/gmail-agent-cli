@@ -21,28 +21,11 @@ const GMAIL_QUOTA_WEIGHT = {
   thread: 2
 } as const;
 
-export const REQUIRED_METADATA_HEADERS = [
-  "From",
-  "Reply-To",
-  "To",
-  "Subject",
-  "Date",
-  "Message-ID",
-  "Authentication-Results",
-  "DKIM-Signature",
-  "List-ID",
-  "List-Unsubscribe",
-  "List-Unsubscribe-Post",
-  "Auto-Submitted",
-  "Precedence"
-] as const;
-
 // Keep the complete recursive MIME subtree. A fixed-depth fields selector
 // silently dropped deeply nested content, changing hashes and AI evidence.
 // Inline bodies come with messages.get; attachment endpoints are never read.
 export const PROFILE_FIELDS = "emailAddress,historyId";
 export const MESSAGE_LIST_FIELDS = "messages(id,threadId),nextPageToken,resultSizeEstimate";
-export const MESSAGE_METADATA_FIELDS = "id,threadId,historyId,internalDate,labelIds,snippet,payload/headers";
 export const MESSAGE_FULL_FIELDS =
   "id,threadId,historyId,internalDate,labelIds,snippet,payload(headers,mimeType,body/data,parts)";
 export const INBOX_LABEL_FIELDS = "messagesTotal";
@@ -163,28 +146,6 @@ export async function listAllMessageIds(
   } while (pageToken);
 
   return { messages, truncated, estimatedTotal };
-}
-
-export async function fetchMessageMetadata(
-  client: GmailClient,
-  messageId: string
-): Promise<gmail_v1.Schema$Message> {
-  const { data } = await withGoogleApiRetry(
-    () =>
-      client.users.messages.get(
-        {
-          userId: "me",
-          id: messageId,
-          format: "metadata",
-          metadataHeaders: [...REQUIRED_METADATA_HEADERS],
-          fields: MESSAGE_METADATA_FIELDS
-        },
-        GMAIL_READ_REQUEST_OPTIONS
-      ),
-    GMAIL_READ_RETRY_OPTIONS,
-    GMAIL_QUOTA_WEIGHT.message, "gmail.messages.get.metadata"
-  );
-  return data;
 }
 
 /**

@@ -91,3 +91,22 @@ describe("unsubscribe header parsing and safe-http validation", () => {
     ]);
   });
 });
+
+describe("mailto unsubscribe safety", () => {
+  it("rejects a percent-encoded CR/LF that would splice extra headers into the outbound message", () => {
+    // The raw URI has no literal CR/LF, so the check has to survive decoding.
+    const spliced = parseMailtoUri("mailto:unsub@example.com?subject=Stop%0D%0ABcc:victim@example.com");
+    expect(spliced).toBeNull();
+    expect(parseMailtoUri("mailto:unsub%0D%0Aevil@example.com")).toBeNull();
+  });
+
+  it("accepts one plain destination with a bounded subject", () => {
+    expect(parseMailtoUri("mailto:unsub@example.com?subject=Unsubscribe%20me")).toEqual({
+      address: "unsub@example.com",
+      subject: "Unsubscribe me",
+      body: null
+    });
+    // More than one recipient is never an unsubscribe address this app will use.
+    expect(parseMailtoUri("mailto:a@example.com,b@example.com")).toBeNull();
+  });
+});

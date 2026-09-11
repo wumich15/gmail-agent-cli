@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { appDataDir } from "../config/paths.js";
@@ -84,10 +84,6 @@ export function writeStoredOAuthClient(
   writeFileSync(path, `${JSON.stringify(validated, null, 2)}\n`, { mode: 0o600 });
   if ((platform ?? process.platform) !== "win32") chmodSync(path, 0o600);
   return path;
-}
-
-export function deleteStoredOAuthClient(env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform): void {
-  rmSync(oauthClientFilePath(env, platform), { force: true });
 }
 
 /** Shape check used by setup prompts before anything is written or sent to Google. */

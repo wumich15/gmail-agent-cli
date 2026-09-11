@@ -1,7 +1,7 @@
 import * as p from "@clack/prompts";
 import pc from "picocolors";
-import { spawn } from "node:child_process";
 import { bootstrap } from "../core/bootstrap.js";
+import { openUrlInBrowser as openUrlInSystemBrowser } from "../core/open-browser.js";
 import { resolveAccountSigningInIfNeeded } from "./shared.js";
 import { runCache } from "./cache.js";
 import { latestCacheRefreshAt } from "./work.js";
@@ -894,34 +894,11 @@ export function shortenLinksForDisplay(text: string): { text: string; links: Dis
  * launcher — defense-in-depth alongside `shortenLinksForDisplay` only ever
  * capturing http(s) URLs from the body in the first place.
  */
+/** Thin wrapper so the view keeps its own wording for a failed launch. */
 export function openUrlInBrowser(url: string): void {
-  if (!/^https?:\/\//i.test(url)) return;
-  let command: string;
-  let args: string[];
-  if (process.platform === "darwin") {
-    command = "open";
-    args = [url];
-  } else if (process.platform === "win32") {
-    command = "cmd";
-    args = ["/c", "start", "", url];
-  } else {
-    command = "xdg-open";
-    args = [url];
-  }
-  const fallback = (): void => {
-    console.error(pc.yellow(`Could not launch a browser automatically. Open this URL manually: ${url}`));
-  };
-  try {
-    const child = spawn(command, args, { stdio: "ignore", detached: true });
-    // A missing launcher (no xdg-open on a minimal Linux box) surfaces as an
-    // asynchronous "error" event, never as a throw — and an unhandled one
-    // takes the whole CLI down. The catch below only covers synchronous
-    // spawn failures, so both paths need handling.
-    child.on("error", fallback);
-    child.unref();
-  } catch {
-    fallback();
-  }
+  openUrlInSystemBrowser(url, (target) => {
+    console.error(pc.yellow(`Could not launch a browser automatically. Open this URL manually: ${target}`));
+  });
 }
 
 function renderMessage(message: NormalizedMessage, labelIds: readonly string[]): readonly DisplayLink[] {

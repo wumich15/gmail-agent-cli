@@ -47,10 +47,10 @@ export function evaluateMatcher(matcher: RuleMatcher, message: NormalizedMessage
       break;
     }
     case "subject_prefix":
-      structuralMatch = message.subject
-        .trim()
-        .toLowerCase()
-        .startsWith(matcher.normalizedValue);
+      // Both sides go through the same normalizer: a stored prefix and an
+      // incoming subject must agree on what "normalized" means, or a rule
+      // silently stops matching the day one of the two is changed.
+      structuralMatch = normalizeSubjectPrefix(message.subject).startsWith(matcher.normalizedValue);
       break;
   }
 

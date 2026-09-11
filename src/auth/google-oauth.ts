@@ -1,9 +1,9 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { randomBytes, createHash } from "node:crypto";
-import { exec } from "node:child_process";
 import { CodeChallengeMethod, OAuth2Client } from "google-auth-library";
 import { AuthRequiredError, InvalidConfigError } from "../core/errors.js";
+import { openUrlInBrowser } from "../core/open-browser.js";
 import { oauthClientFilePath, readStoredOAuthClient } from "./oauth-client-file.js";
 
 /**
@@ -112,15 +112,6 @@ function generatePkcePair(): { verifier: string; challenge: string } {
   return { verifier, challenge };
 }
 
-function openInBrowser(url: string): void {
-  const platform = process.platform;
-  const command =
-    platform === "darwin" ? `open "${url}"` : platform === "win32" ? `start "" "${url}"` : `xdg-open "${url}"`;
-  exec(command, () => {
-    // Best-effort only; the URL is also printed to the terminal.
-  });
-}
-
 export interface LoginResult {
   refreshToken: string;
   accessToken: string;
@@ -204,7 +195,8 @@ export async function runInstalledAppLogin(
           prompt: "consent"
         });
         onAuthorizeUrl(authorizeUrl);
-        openInBrowser(authorizeUrl);
+        // Best effort: the URL is also handed to the caller, which prints it.
+        openUrlInBrowser(authorizeUrl);
       });
     }
   );

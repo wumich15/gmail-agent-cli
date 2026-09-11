@@ -1,4 +1,3 @@
-import { execFile } from "node:child_process";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { bootstrap, reloadConfig } from "../core/bootstrap.js";
@@ -9,6 +8,7 @@ import { promptForGoogleClient } from "./setup-google-client.js";
 import { runWork } from "./work.js";
 import { EXIT_CODES } from "../core/errors.js";
 import { appDataDir } from "../config/paths.js";
+import { openUrlInBrowser as openInBrowser } from "../core/open-browser.js";
 
 /**
  * The guided first-run wizard.
@@ -35,15 +35,6 @@ const CONSOLE_URLS = {
   credentials: "https://console.cloud.google.com/apis/credentials"
 } as const;
 
-function openInBrowser(url: string): void {
-  const command =
-    process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-  const args = process.platform === "win32" ? ["", url] : [url];
-  execFile(command, args, () => {
-    // Best effort. The URL is always printed too, so a failure here costs
-    // the user a copy and paste, not the step.
-  });
-}
 
 /** Prints a URL and, unless the user declines, opens it. Returns false if they cancelled out. */
 async function offerToOpen(label: string, url: string): Promise<boolean> {

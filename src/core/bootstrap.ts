@@ -48,8 +48,3 @@ export function reloadConfig(ctx: CliContext = bootstrap()): Config | null {
   ctx.config = loadConfig();
   return ctx.config;
 }
-
-/** Test seam: drops the process-wide singletons so the next bootstrap() rebuilds them. */
-export function resetBootstrapForTesting(): void {
-  cached = null;
-}
