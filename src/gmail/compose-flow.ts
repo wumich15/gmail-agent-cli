@@ -2,13 +2,15 @@ import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { createInterface } from "node:readline/promises";
 import type { CliContext } from "../core/bootstrap.js";
-import { buildComposeTarget, sendReply, type ReplyTarget } from "./reply.js";
+import { buildComposeTarget, sendReply, SendFailedError, type ReplyTarget } from "./reply.js";
 import { draftNewEmail } from "../ai/draft-reply.js";
 import { resolveOpenAiCredentials } from "../ai/resolve-classifier.js";
 import type { ResolvedOpenAiCredentials } from "../ai/resolve-classifier.js";
-import { ProcessLock } from "../core/lock.js";
+import { DEFAULT_LOCK_WAIT_MS, ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 import type { GmailClient } from "./client.js";
+
+export type ComposeExclusiveRunner = <T>(operation: () => Promise<T>) => Promise<T>;
 
 /**
  * The compose/send flow shared by `gmail view`'s "c"/"a"/";c" commands and
@@ -66,7 +68,8 @@ export async function confirmAndSend(
   gmailClient: GmailClient,
   accountHash: string,
   target: ReplyTarget,
-  body: string
+  body: string,
+  runExclusive?: ComposeExclusiveRunner
 ): Promise<boolean> {
   console.log("");
   console.log(pc.bold(target.threadId ? "Reply preview" : "Message preview"));
@@ -80,17 +83,34 @@ export async function confirmAndSend(
     console.log(pc.dim("Not sent."));
     return false;
   }
-  const lock = new ProcessLock(lockFilePath(accountHash));
-  lock.acquire();
   try {
-    await sendReply(gmailClient, target, body);
+    if (runExclusive) {
+      await runExclusive(() => sendReply(gmailClient, target, body));
+    } else {
+      const lock = new ProcessLock(lockFilePath(accountHash));
+      lock.acquire({ waitMs: DEFAULT_LOCK_WAIT_MS });
+      try {
+        await sendReply(gmailClient, target, body);
+      } finally {
+        lock.release();
+      }
+    }
     console.log(pc.green("Sent."));
     return true;
   } catch (error) {
-    console.error(pc.red(`Failed to send: ${error instanceof Error ? error.message : String(error)}`));
+    const detail = error instanceof Error ? error.message : String(error);
+    if (error instanceof SendFailedError && error.ambiguous) {
+      // Gmail may have accepted this message before the connection failed.
+      // Saying a flat "not sent" would invite the user to send a second
+      // copy of a mail that already landed, so say what is actually known.
+      console.error(pc.yellow(`Gmail did not confirm this message: ${detail}`));
+      console.error(
+        pc.yellow("It may or may not have been sent. Check your Sent mail before sending it again.")
+      );
+      return false;
+    }
+    console.error(pc.red(`Failed to send (nothing was sent): ${detail}`));
     return false;
-  } finally {
-    lock.release();
   }
 }
 
@@ -148,7 +168,8 @@ export async function handleCompose(
   useAi: ComposeMode,
   ctx: CliContext,
   getStyleProfile: (credentials: ResolvedOpenAiCredentials, forceRefresh?: boolean) => Promise<string | null>,
-  prefill: ComposePrefill = {}
+  prefill: ComposePrefill = {},
+  runExclusive?: ComposeExclusiveRunner
 ): Promise<boolean> {
   // Resolved once, before anything is typed: it decides whether AI is even
   // offered, and saves asking for a purpose that could not be drafted.
@@ -208,5 +229,5 @@ export async function handleCompose(
     console.log(pc.dim("Cancelled."));
     return false;
   }
-  return confirmAndSend(gmailClient, accountHash, target, body);
+  return confirmAndSend(gmailClient, accountHash, target, body, runExclusive);
 }

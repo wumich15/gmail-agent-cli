@@ -34,8 +34,8 @@ const VIEW_HELP_TEXT = renderViewControlsHelp();
 // (create a Gmail label directly, on demand), `gmail cache` (read-only
 // full-inbox snapshot that seeds incremental scanning), `gmail uncache`
 // (clears that local scan cache/history marker, no Gmail/Calendar changes),
-// `gmail view` (terminal inbox with automatic cache refresh, reading,
-// composing, replies, and Sent-style-aware AI drafts), `gmail send` (the
+// `gmail view` (four-folder terminal mail view with progressive cache refresh,
+// reading, composing, replies, and Sent-style-aware AI drafts), `gmail send` (the
 // same compose/AI-draft/confirm flow as gmail view's "c"/"a", reachable
 // directly from the command line), `gmail setup` (connect/reconnect and
 // choose how AI works, touching no mail), and `gmail ui` (the same setup,
@@ -153,8 +153,8 @@ program
 program
   .command("uncache")
   .description(
-    "Clear this account's local scan cache and history marker (no Gmail/Calendar changes) — the inverse of " +
-      "gmail cache. The next gmail/gmail work/gmail cache run afterward does a full snapshot again."
+    "Clear this account's local scan cache and history markers (no Gmail/Calendar changes) — cleanup/cache " +
+      "will take a full snapshot next, and gmail view will progressively reload its folders."
   )
   .option("--yes", "skip the confirmation prompt", false)
   .action((opts: { yes: boolean }) => {
@@ -164,10 +164,10 @@ program
 program
   .command("view")
   .description(
-    "Browse and refresh Gmail in the terminal: search/filter, read, compose, reply, and create Sent-style-aware AI drafts"
+    "Browse Inbox, Archive, Trash, and Spam in the terminal; read, move, compose, and reply"
   )
   .option("--limit <n>", "messages per page (default: 20)", parsePositiveInt)
-  .option("--previous", "open the existing Gmail cache without refreshing it first", false)
+  .option("--previous", "open the existing Gmail cache without automatic fetching", false)
   .addHelpText("after", VIEW_HELP_TEXT)
   .action((opts: { limit?: number; previous: boolean }) => {
     withExitHandling(() =>

@@ -6,7 +6,7 @@ import { RunsRepository, ActionsRepository } from "../state/repositories/runs.js
 import { EXIT_CODES } from "../core/errors.js";
 import { GMAIL_LABELS } from "../gmail/labels.js";
 import { withGoogleApiRetry } from "../core/api-retry.js";
-import { ProcessLock } from "../core/lock.js";
+import { DEFAULT_LOCK_WAIT_MS, ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 
 export async function runUndo(runId: string, options: { yes: boolean }): Promise<number> {
@@ -18,7 +18,7 @@ export async function runUndo(runId: string, options: { yes: boolean }): Promise
   // and the local ledger, and must not race a concurrent gmail/gmail work
   // run touching the same messages.
   const lock = new ProcessLock(lockFilePath(account.accountHash));
-  lock.acquire();
+  lock.acquire({ waitMs: DEFAULT_LOCK_WAIT_MS });
   try {
     return await runUndoLocked(runId, options, ctx, gmailClient);
   } finally {

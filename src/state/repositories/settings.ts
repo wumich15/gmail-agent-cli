@@ -23,11 +23,19 @@ export class SettingsRepository {
       )
       .run(accountHash, key, value, updatedAt);
   }
+
+  delete(accountHash: string, key: string): boolean {
+    return this.db.prepare("DELETE FROM settings WHERE account_hash = ? AND key = ?").run(accountHash, key).changes > 0;
+  }
 }
 
 export const SETTING_KEYS = {
   cacheLastRunAt: "gmail_cache_last_run_at",
   viewLastRefreshAt: "gmail_view_last_refresh_at",
+  /** History fence earned by a complete Inbox/Archive/Trash/Spam view snapshot. */
+  viewHistoryMarker: "gmail_view_history_marker",
+  /** Presence means every top-level gmail view folder has completed one full snapshot. */
+  viewFullCacheAt: "gmail_view_full_cache_at",
   /**
    * Newest SENT message ID recorded by the reply-protection thread index
    * (see `gmail/sent-index.ts`). Its presence is what lets a later run

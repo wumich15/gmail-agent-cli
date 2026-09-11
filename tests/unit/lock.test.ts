@@ -2,6 +2,7 @@ import { describe, expect, it, afterEach } from "vitest";
 import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 import { ProcessLock } from "../../src/core/lock.js";
 import { SafetyPreconditionError } from "../../src/core/errors.js";
 
@@ -10,6 +11,11 @@ let dir: string;
 afterEach(() => {
   if (dir) rmSync(dir, { recursive: true, force: true });
 });
+
+/** Blocks the test thread, matching how acquire() itself waits. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
 
 function freshLockPath(): string {
   dir = mkdtempSync(join(tmpdir(), "gmail-agent-lock-test-"));
@@ -44,6 +50,50 @@ describe("ProcessLock", () => {
     lock.acquire();
     expect(readFileSync(path, "utf-8").trim()).toBe(String(process.pid));
     lock.release();
+  });
+
+  it("waits for a live holder that releases within the wait budget instead of failing immediately", () => {
+    // Regression: acquire() made exactly one attempt, so any command run
+    // alongside a `gmail view` session — whose background cache loader
+    // takes and releases this lock once per page — almost always landed
+    // mid-chunk and died with "another gmail process is already running",
+    // even though the lock was free again milliseconds later.
+    //
+    // The holder has to be a real other process: the wait is synchronous
+    // (acquire() runs at command startup, before anything is in flight),
+    // so a same-thread timer could never run to release it.
+    const path = freshLockPath();
+    const child = spawn(
+      process.execPath,
+      [
+        "-e",
+        `const fs=require("fs");fs.writeFileSync(${JSON.stringify(path)},String(process.pid),{flag:"wx"});` +
+          `setTimeout(()=>fs.unlinkSync(${JSON.stringify(path)}),400);setTimeout(()=>{},1500);`
+      ],
+      { stdio: "ignore" }
+    );
+    try {
+      while (!existsSync(path)) sleepSync(5);
+
+      const startedAt = Date.now();
+      const waiting = new ProcessLock(path);
+      waiting.acquire({ waitMs: 5_000 });
+
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(100);
+      expect(readFileSync(path, "utf-8").trim()).toBe(String(process.pid));
+      waiting.release();
+    } finally {
+      child.kill();
+    }
+  });
+
+  it("still gives up once the wait budget is spent", () => {
+    const path = freshLockPath();
+    writeFileSync(path, String(process.pid), { mode: 0o600 });
+    const lock = new ProcessLock(path);
+    const startedAt = Date.now();
+    expect(() => lock.acquire({ waitMs: 200 })).toThrow(SafetyPreconditionError);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(150);
   });
 
   it("release removes the lock file only when this instance actually acquired it", () => {

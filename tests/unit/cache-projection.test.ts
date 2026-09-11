@@ -63,6 +63,21 @@ describe("cache message projection", () => {
     expect(projectHydratedCacheMessage("account", "me@example.com", "later", stub, { ...raw, labelIds: ["TRASH"] }, existing)).toBeNull();
   });
 
+  it("retains Archive and Trash for view scope without broadening the default working scope", () => {
+    const archive = { ...raw, labelIds: ["UNREAD", "STARRED"] };
+    const trash = { ...raw, labelIds: ["TRASH"] };
+
+    expect(projectHydratedCacheMessage("account", "me@example.com", "now", stub, archive, null)).toBeNull();
+    expect(projectHydratedCacheMessage("account", "me@example.com", "now", stub, trash, null)).toBeNull();
+
+    expect(
+      projectHydratedCacheMessage("account", "me@example.com", "now", stub, archive, null, "view")?.labelSnapshot
+    ).toEqual(["UNREAD", "STARRED"]);
+    expect(
+      projectHydratedCacheMessage("account", "me@example.com", "now", stub, trash, null, "view")?.labelSnapshot
+    ).toEqual(["TRASH"]);
+  });
+
   it("rejects a response for a different message", () => {
     expect(() => projectHydratedCacheMessage("account", "me@example.com", "now", stub, { ...raw, id: "wrong" }, null)).toThrow("different message ID");
   });

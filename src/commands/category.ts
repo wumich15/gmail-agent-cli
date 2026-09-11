@@ -3,7 +3,7 @@ import { bootstrap } from "../core/bootstrap.js";
 import { resolveAccount } from "./shared.js";
 import { getOrCreateLabelId, listUserLabels } from "../gmail/custom-labels.js";
 import { AuthRequiredError, EXIT_CODES } from "../core/errors.js";
-import { ProcessLock } from "../core/lock.js";
+import { DEFAULT_LOCK_WAIT_MS, ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 
 /**
@@ -39,7 +39,7 @@ export async function runCategory(names: string[]): Promise<number> {
   const { account, gmailClient } = resolved;
 
   const lock = new ProcessLock(lockFilePath(account.accountHash));
-  lock.acquire();
+  lock.acquire({ waitMs: DEFAULT_LOCK_WAIT_MS });
   try {
     const existing = await listUserLabels(gmailClient);
     const known = new Map(existing.map((l) => [l.name.trim().toLowerCase(), l.id]));

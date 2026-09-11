@@ -20,7 +20,7 @@ Everything runs on your own computer. There is no server, no hosted account, and
 - Archives everything you have already read — only when you ask, with `gmail --archive`.
 - Leaves anything uncertain alone, and lists it under Review.
 - Creates persistent spam/important rules you name (`gmail add`) and applies them before any AI runs.
-- `gmail view` is also a terminal mail client: read, search, delete, compose and reply. Composing asks whether to write it yourself or have AI draft it, and you edit and confirm the exact message either way.
+- `gmail view` is also a terminal mail client: switch a top bar between Inbox, Archive, Trash, and Spam; read, manage, compose, and reply. Subject/sender search remains Inbox-only. Composing asks whether to write it yourself or have AI draft it, and you edit and confirm the exact message either way.
 - `gmail ui` serves the same setup, command reference, and status as three plain pages on `127.0.0.1`, for as long as that command runs.
 
 ## What it never does
@@ -29,7 +29,7 @@ Everything runs on your own computer. There is no server, no hosted account, and
 - **Never sends an email without showing you the exact message and asking.** Every outbound path — manual, AI-drafted, reply, unsubscribe — ends at the same confirmation, which defaults to *no*. There is no flag or keystroke that skips it.
 - **Never follows instructions found inside an email.** Message text is evidence, never a command; the model gets no tools, no network and no credentials.
 - **Never uploads attachments** — it does not even download them.
-- **Never runs in the background** or keeps a copy of your mailbox on a server. Work happens only when you run a command.
+- **Never leaves a background service running** or keeps a copy of your mailbox on a server. While `gmail view` is open it may finish filling the local folder cache as you browse; that work stops when the command exits.
 
 **Bare `gmail` makes mailbox changes.** Start with `gmail --dry-run` to preview cleanup. Opening mail in `gmail view` marks it read.
 
@@ -117,7 +117,7 @@ gmail cache --limit 25
 gmail view --previous
 ```
 
-`cache` reads Gmail and saves local state without AI or mailbox changes. `--previous` skips the view's initial refresh; it is not an offline mode. Opening a message fetches content and marks it read. A capped cache may be incomplete.
+`cache` reads Gmail and saves local state without AI or mailbox changes. `--previous` skips the view's automatic startup and background fetching; it is not an offline mode, because opening or changing a message still contacts Gmail. Without `--previous`, a cold viewer loads up to three Inbox pages, opens, and fills Inbox, Archive, Trash, and Spam in the background while you browse. A capped cache may be incomplete.
 
 ### 4. Choose how AI works
 
@@ -155,8 +155,8 @@ Review the result before increasing the limit. `gmail` without a limit has no ex
 | `gmail add important "Category"` | Create an important rule and act on current matches after confirmation. |
 | `gmail category "Shopping" "Travel"` | Create Gmail labels immediately. |
 | `gmail cache [--limit N]` | Cache Inbox and Spam without AI or mailbox changes. |
-| `gmail uncache [--yes]` | Clear local scan cache and sync marker. |
-| `gmail view [--limit N] [--previous]` | Browse, read, compose, and reply. |
+| `gmail uncache [--yes]` | Clear local scan cache and cleanup/view sync markers. |
+| `gmail view [--limit N] [--previous]` | Browse Inbox, Archive, Trash, and Spam; read, move, compose, and reply. |
 | `gmail send [to] [--subject TEXT] [--ai]` | Compose one email and confirm before sending. |
 | `gmail install` | Guided first-time setup: your own Google app, sign-in, AI choice, and a preview. Touches no mail. |
 | `gmail setup` | Connect, reconnect, disconnect, or change how AI works. Touches no mail. |

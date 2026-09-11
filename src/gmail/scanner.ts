@@ -39,10 +39,19 @@ export interface MailboxProfile {
   historyId: string;
 }
 
-export async function fetchProfile(client: GmailClient): Promise<MailboxProfile> {
+export async function fetchProfile(client: GmailClient, signal?: AbortSignal): Promise<MailboxProfile> {
   const { data } = await withGoogleApiRetry(
-    () => client.users.getProfile({ userId: "me", fields: PROFILE_FIELDS }, GMAIL_READ_REQUEST_OPTIONS),
-    GMAIL_READ_RETRY_OPTIONS,
+    () => {
+      signal?.throwIfAborted();
+      return client.users.getProfile(
+        { userId: "me", fields: PROFILE_FIELDS },
+        {
+          ...GMAIL_READ_REQUEST_OPTIONS,
+          ...(signal !== undefined ? { signal } : {})
+        }
+      );
+    },
+    { ...GMAIL_READ_RETRY_OPTIONS, ...(signal !== undefined ? { signal } : {}) },
     GMAIL_QUOTA_WEIGHT.label, "gmail.profile"
   );
   if (!data.emailAddress || !data.historyId) {
@@ -56,11 +65,81 @@ export interface MessageStub {
   threadId: string;
 }
 
-export interface ListMessagesParams {
+export interface MessageListFilters {
   labelIds?: string[];
   /** A Gmail search query, usable together with or instead of labelIds (e.g. `gmail add`'s category search). */
   q?: string;
   includeSpamTrash: boolean;
+}
+
+export interface ListMessagePageParams extends MessageListFilters {
+  /** Resume from a token returned by the preceding page. */
+  pageToken?: string;
+  /** Gmail accepts between 1 and 500 message stubs per page. Defaults to 500. */
+  maxResults?: number;
+  /** Cancel the in-flight Gmail request when a caller no longer needs this page. */
+  signal?: AbortSignal;
+}
+
+export interface ListMessagePageResult {
+  messages: MessageStub[];
+  nextPageToken: string | null;
+  estimatedTotal: number | null;
+}
+
+/**
+ * Fetches exactly one resumable users.messages.list page. Gmail responses
+ * are treated as untrusted at this boundary: incomplete stubs are ignored
+ * and a malformed page that repeats an ID yields that message only once.
+ */
+export async function listMessagePage(
+  client: GmailClient,
+  params: ListMessagePageParams
+): Promise<ListMessagePageResult> {
+  const maxResults = params.maxResults ?? 500;
+  if (!Number.isInteger(maxResults) || maxResults < 1 || maxResults > 500) {
+    throw new RangeError("Gmail message-list maxResults must be an integer between 1 and 500.");
+  }
+
+  const { data } = await withGoogleApiRetry(
+    () => {
+      params.signal?.throwIfAborted();
+      return client.users.messages.list(
+        {
+          userId: "me",
+          ...(params.labelIds !== undefined ? { labelIds: params.labelIds } : {}),
+          ...(params.q !== undefined ? { q: params.q } : {}),
+          includeSpamTrash: params.includeSpamTrash,
+          maxResults,
+          fields: MESSAGE_LIST_FIELDS,
+          ...(params.pageToken !== undefined ? { pageToken: params.pageToken } : {})
+        },
+        {
+          ...GMAIL_READ_REQUEST_OPTIONS,
+          ...(params.signal !== undefined ? { signal: params.signal } : {})
+        }
+      );
+    },
+    { ...GMAIL_READ_RETRY_OPTIONS, ...(params.signal !== undefined ? { signal: params.signal } : {}) },
+    GMAIL_QUOTA_WEIGHT.list, "gmail.messages.list"
+  );
+
+  const seenIds = new Set<string>();
+  const messages: MessageStub[] = [];
+  for (const message of data.messages ?? []) {
+    if (!message.id || !message.threadId || seenIds.has(message.id)) continue;
+    seenIds.add(message.id);
+    messages.push({ id: message.id, threadId: message.threadId });
+  }
+
+  return {
+    messages,
+    nextPageToken: data.nextPageToken ?? null,
+    estimatedTotal: typeof data.resultSizeEstimate === "number" ? data.resultSizeEstimate : null
+  };
+}
+
+export interface ListMessagesParams extends MessageListFilters {
   /** Stop paginating after this many results and report truncation, rather than looping forever. */
   safetyCapCount?: number;
   /**
@@ -100,28 +179,18 @@ export async function listAllMessageIds(
   let estimatedTotal: number | null = null;
 
   do {
-    const { data } = await withGoogleApiRetry(
-      () =>
-        client.users.messages.list(
-          {
-            userId: "me",
-            ...(params.labelIds !== undefined ? { labelIds: params.labelIds } : {}),
-            ...(params.q !== undefined ? { q: params.q } : {}),
-            includeSpamTrash: params.includeSpamTrash,
-            maxResults: 500,
-            fields: MESSAGE_LIST_FIELDS,
-            ...(pageToken !== undefined ? { pageToken } : {})
-          },
-          GMAIL_READ_REQUEST_OPTIONS
-        ),
-      GMAIL_READ_RETRY_OPTIONS,
-      GMAIL_QUOTA_WEIGHT.list, "gmail.messages.list"
-    );
-    if (estimatedTotal === null && typeof data.resultSizeEstimate === "number") {
-      estimatedTotal = data.resultSizeEstimate;
+    const page = await listMessagePage(client, {
+      ...(params.labelIds !== undefined ? { labelIds: params.labelIds } : {}),
+      ...(params.q !== undefined ? { q: params.q } : {}),
+      includeSpamTrash: params.includeSpamTrash,
+      maxResults: 500,
+      ...(pageToken !== undefined ? { pageToken } : {})
+    });
+    if (estimatedTotal === null && page.estimatedTotal !== null) {
+      estimatedTotal = page.estimatedTotal;
     }
     let reachedStopId = false;
-    for (const m of data.messages ?? []) {
+    for (const m of page.messages) {
       if (params.stopAtMessageId !== undefined && m.id === params.stopAtMessageId) {
         reachedStopId = true;
         break;
@@ -131,7 +200,7 @@ export async function listAllMessageIds(
         messages.push({ id: m.id, threadId: m.threadId });
       }
     }
-    pageToken = reachedStopId ? undefined : data.nextPageToken ?? undefined;
+    pageToken = reachedStopId ? undefined : page.nextPageToken ?? undefined;
 
     params.onProgress?.(Math.min(messages.length, params.safetyCapCount ?? Infinity));
     if (pageToken) {
@@ -180,20 +249,26 @@ export async function listSentThreadIds(client: GmailClient, onProgress?: (disco
 
 export async function fetchMessageFull(
   client: GmailClient,
-  messageId: string
+  messageId: string,
+  signal?: AbortSignal
 ): Promise<gmail_v1.Schema$Message> {
   const { data } = await withGoogleApiRetry(
-    () =>
-      client.users.messages.get(
+    () => {
+      signal?.throwIfAborted();
+      return client.users.messages.get(
         {
           userId: "me",
           id: messageId,
           format: "full",
           fields: MESSAGE_FULL_FIELDS
         },
-        GMAIL_READ_REQUEST_OPTIONS
-      ),
-    GMAIL_READ_RETRY_OPTIONS,
+        {
+          ...GMAIL_READ_REQUEST_OPTIONS,
+          ...(signal !== undefined ? { signal } : {})
+        }
+      );
+    },
+    { ...GMAIL_READ_RETRY_OPTIONS, ...(signal !== undefined ? { signal } : {}) },
     GMAIL_QUOTA_WEIGHT.message, "gmail.messages.get.full"
   );
   return data;

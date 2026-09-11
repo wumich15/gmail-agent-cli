@@ -3,7 +3,7 @@ import pc from "picocolors";
 import type { gmail_v1 } from "googleapis";
 import { bootstrap } from "../core/bootstrap.js";
 import { resolveAccountSigningInIfNeeded } from "./shared.js";
-import { ProcessLock } from "../core/lock.js";
+import { DEFAULT_LOCK_WAIT_MS, ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 import { EXIT_CODES } from "../core/errors.js";
 import { AccountsRepository } from "../state/repositories/accounts.js";
@@ -89,12 +89,25 @@ export interface CacheOptions {
   limit?: number;
 }
 
+/** A full gmail cache pass is authoritative only for its Inbox/Spam scope. */
+export function selectStaleWorkingCacheIds(
+  existingRows: readonly CachedMessageRecord[],
+  activeIds: ReadonlySet<string>
+): string[] {
+  return existingRows
+    .filter(
+      (row) => row.labelSnapshot.includes(GMAIL_LABELS.inbox) || row.labelSnapshot.includes(GMAIL_LABELS.spam)
+    )
+    .filter((row) => !activeIds.has(row.gmailMessageId))
+    .map((row) => row.gmailMessageId);
+}
+
 export async function runCache(options: CacheOptions = {}): Promise<number> {
   const ctx = bootstrap();
   const { account, gmailClient } = await resolveAccountSigningInIfNeeded(ctx);
 
   const lock = new ProcessLock(lockFilePath(account.accountHash));
-  lock.acquire();
+  lock.acquire({ waitMs: DEFAULT_LOCK_WAIT_MS });
   const diagnosticsLog = startRunDiagnostics(ctx.logger, "cache", options.limit);
   const progress = createCacheProgress();
   const unsubscribeQuotaWait = googleApiRateLimiter.subscribeQuotaWait((waitMs) => progress.read.onQuotaWait(waitMs));
@@ -228,7 +241,10 @@ export async function runCache(options: CacheOptions = {}): Promise<number> {
       if (snapshotComplete) {
         // A complete full snapshot is authoritative about older cached
         // rows omitted from both current Inbox and Spam listings.
-        const staleIds = existingRows.filter((row) => !activeIds.has(row.gmailMessageId)).map((row) => row.gmailMessageId);
+        // This command is authoritative only for Inbox/Spam. Preserve rows
+        // cached by gmail view for Archive/Trash; deleting those here would
+        // make a successful cleanup snapshot silently erase other tabs.
+        const staleIds = selectStaleWorkingCacheIds(existingRows, activeIds);
         messagesRepo.applyCacheBatch(account.accountHash, [], staleIds);
       }
       // Advance only on a complete snapshot; an incomplete one keeps whatever

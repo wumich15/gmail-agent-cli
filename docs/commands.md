@@ -13,11 +13,11 @@ This reference describes the commands currently registered in `src/cli.ts`. For 
 | `gmail category "name"` | Create or reuse a Gmail label immediately. |
 | `gmail cache` | Read Inbox and Spam into the local listing/scan cache. |
 | `gmail uncache` | Clear the local scan cache after confirmation. |
-| `gmail view` | Browse messages, read, compose, reply, and move messages to Trash in the terminal. |
+| `gmail view` | Browse Inbox, Archive, Trash, and Spam; read, compose, reply, and move mail in the terminal. |
 | `gmail send` | Interactively compose and confirm one new email. |
 | `gmail setup` | Connect or reconnect Gmail, choose how AI works, or disconnect. Touches no mail. |
 | `gmail ui` | Open the same setup, command reference, and status in a local browser page. |
-| `gmail help` | Show command help and inbox controls. |
+| `gmail help` | Show command help and terminal-view controls. |
 | `gmail help <command>` | Show help for one command. |
 | `gmail --version` | Print the installed CLI version. |
 
@@ -44,7 +44,7 @@ gmail
 | `--archive` | Off | Also remove `INBOX` from read, non-trashed messages. Left off, read mail stays in the Inbox. |
 | `--limit <n>` | No cap | Limit messages selected for processing. Must be a positive whole number. |
 
-On a full snapshot, `--limit 100` selects up to 100 Inbox messages **and** 100 native Spam messages. On an incremental scan, it caps the combined queue to 100 messages. It is not a maximum number of API calls. Auxiliary reads, retries, AI calls, and writes can add work. A truncated scan clears its history checkpoint so a later uncapped run can recover omitted mail.
+On a full snapshot, `--limit 100` selects up to 100 Inbox messages **and** 100 native Spam messages. On an incremental scan, it caps the combined queue to 100 messages. Either way it selects the *most recent* messages: if the local cache is too stale to know which those are, the run asks Gmail for the newest ones first. It is not a maximum number of API calls. Auxiliary reads, retries, AI calls, and writes can add work. A truncated scan clears its history checkpoint so a later uncapped run can recover omitted mail.
 
 Cleanup can:
 
@@ -142,7 +142,7 @@ gmail cache --limit 100
 | --- | --- | --- |
 | `--limit <n>` | No cap | Cache up to the latest `n` Inbox messages and `n` native Spam messages. Must be a positive whole number. |
 
-Always requests a full snapshot of the selected Inbox and Spam scope. It reads Gmail and writes local cache state, with no AI calls or Gmail/Calendar mutations. Archived mail, Trash, and Sent are outside this listing cache.
+Always requests a full snapshot of the selected Inbox and Spam scope. It reads Gmail and writes local cache state, with no AI calls or Gmail/Calendar mutations. Archived mail, Trash, and Sent are outside the `gmail cache` snapshot; `gmail view` separately fills its Archive and Trash listings and preserves those rows.
 
 The cache stores message identifiers, subjects, sender display values, dates, labels, content hashes, and assessment metadata when available. It does not persist full message bodies or attachments. Reading a message in `gmail view` fetches its content from Gmail.
 
@@ -159,9 +159,9 @@ gmail uncache --yes
 | --- | --- | --- |
 | `--yes` | Off | Skip the confirmation prompt. |
 
-Clears this account's cached message projections, pending topical-label votes/counts, and Gmail history checkpoint. The next cleanup or snapshot must rebuild from Gmail. This does not change Gmail or Calendar, remove saved rules, sign out, or clear the saved writing-style profile.
+Clears this account's cached message projections, pending topical-label votes/counts, and both cleanup/view Gmail history checkpoints. The next cleanup/cache run must rebuild from Gmail, and the next normal `gmail view` progressively reloads its four folders. This does not change Gmail or Calendar, remove saved rules, sign out, or clear the saved writing-style profile.
 
-## Terminal inbox: `gmail view`
+## Terminal mail: `gmail view`
 
 ```sh
 gmail view
@@ -172,11 +172,11 @@ gmail view --previous
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--limit <n>` | `20` | Messages per page. This does **not** cap synchronization or API reads. Must be a positive whole number. |
-| `--previous` | Off | Open the existing cache without a startup refresh. |
+| `--previous` | Off | Open the existing cache and skip all automatic startup/background fetching. |
 
-Requires an interactive terminal. Startup normally refreshes via Gmail history and falls back to a full `gmail cache` snapshot if no usable checkpoint exists. Inbox is the initial filter when any Inbox messages are cached. If the cache is empty, the command exits rather than opening a compose-only view; use `gmail send` to compose.
+Requires an interactive terminal. The viewer opens on Inbox and shows a top bar for **Inbox**, **Archive**, **Trash**, and **Spam**. With a usable view checkpoint, startup refreshes changes through Gmail history. With no usable view checkpoint, existing cached Inbox rows count toward the initial display; it fetches only enough additional mail to show up to the first three Inbox pages, opens the viewer, and continues filling the rest of all four folders in the background while the viewer remains open. Visiting another folder or a later page loads enough mail for that destination first instead of waiting for the complete cache.
 
-`--previous` skips the initial refresh; it is not an offline email reader. Opening messages, refreshing, sending, and deleting still use Gmail. Custom labels may appear as IDs until refreshed.
+`--previous` skips the initial refresh and the progressive background fill; it is not an offline email reader. Opening messages, pressing `u`, sending, deleting, and moving mail to Inbox still use Gmail. Custom labels may appear as IDs until refreshed.
 
 Opening an unread message marks it read in Gmail. The quick reply shortcuts also fetch and mark the original message read. A later `gmail --archive` run would then take that message out of the Inbox; a plain `gmail` run leaves it there.
 
@@ -191,18 +191,20 @@ Type commands and press **Enter**, except for arrow keys and Escape, which act i
 | `<n>` | Open message `n`, for example `2`. |
 | `<n> r` | Start a manual reply to message `n`. |
 | `<n> ;r` | Start an AI reply to message `n`. |
-| `<n> d` | Confirm moving message `n` to Trash without fetching its body. |
-| `d` | Confirm moving the highlighted message to Trash. |
-| `dd` | Move the highlighted message to Trash **with no confirmation**, and stay in the list. The cursor keeps its row number, so it lands on the next message and repeating `dd` deletes down the list. |
-| Left / Right | Previous / next page. |
+| `<n> d` | Confirm moving message `n` to Trash without fetching its body. Disabled in Trash. |
+| `<n> i` | Move message `n` to Inbox, including unarchiving or restoring it from Trash/Spam. |
+| `d` | Confirm moving the highlighted message to Trash. Disabled in Trash. |
+| `dd` | Move the highlighted message to Trash **with no confirmation**, and stay in the list. Disabled in Trash. The cursor keeps its row number, so it lands on the next message and repeating `dd` deletes down the list. |
+| `i` | Move the highlighted message to Inbox, including unarchiving or restoring it from Trash/Spam. |
+| Left / Right | Switch the top bar between Inbox, Archive, Trash, and Spam, wrapping at either end. Switching folders clears search and label filters. |
 | `p` / `n` | Previous / next page. |
-| `[` / `]` | Back / forward through previous page, size, search, and filter views. |
-| Escape | Return to the first page and default Inbox filter, clearing search. Keeps the page size and never quits. |
+| `[` / `]` | Back / forward through previous folder, page, size, search, and filter views. |
+| Escape | Return to Inbox's first page, clearing search and label filters. Keeps the page size and never quits. |
 | `+` / `-` | Increase / decrease page size using 5, 10, 20, 50, and 100. Above 100, `+` doubles up to 500; below 5, `-` goes to 1. |
 | `l <n>` | Set an exact page size, for example `l 30`; this can exceed the `+` shortcut's 500-message ceiling. |
-| `f` (alias `t`) | Choose labels. Matching any selected label is sufficient; selecting none shows all cached Inbox/Spam mail. |
-| `s <text>` | Search cached subjects and sender display text, case-insensitively. This is not Gmail query syntax or body search. |
-| `s` | Clear the search. |
+| `f` (alias `t`) | Filter the current folder by Gmail label. Matching any selected label is sufficient; selecting none shows the whole current folder. |
+| `s <text>` | Search cached Inbox subjects and sender display text, case-insensitively. Search is currently Inbox-only; using it elsewhere explains that limitation. This is not Gmail query syntax or body search. |
+| `s` | Clear the Inbox search. |
 | `c` | Compose a new message; asks whether to write it yourself or have AI draft it, the same choice `gmail send` offers. AI is only offered when this account can actually run it. |
 | `a` (alias `;c`) | Compose a new message, going straight to an AI draft. |
 | `;s` | Refresh the saved writing-style description using recent Sent mail and AI. |
@@ -222,16 +224,19 @@ These keys act without Enter.
 | Right / `n` | Next message in the current filtered result set. |
 | `r` | Compose a manual reply. |
 | `;` followed by `r` within one second | Draft an AI reply. |
-| `d` | Confirm moving this message to Trash and return to the list. |
+| `d` | Confirm moving this message to Trash and return to the list. Disabled while reading Trash. |
+| `i` | Move this message to Inbox and return to the list, including unarchiving or restoring it from Trash/Spam. |
 | `l` | List full URLs found in the message. |
 | `o` | Choose a message link to open in the system browser. |
 | Ctrl+C | Exit immediately. |
 
 Links are shortened for display and are clickable in terminals that support hyperlinks. Reading uses plain text extracted from the message, not a full HTML mail renderer.
 
-**Delete means move to Gmail Trash, and its confirmation defaults to Yes.** A successful delete removes the row from the local list immediately. Use `;u` from the list to undo the most recent session delete, or restore messages through Gmail's Trash. The session undo does not reverse cleanup runs or earlier sessions.
+**Delete means move to Gmail Trash, and its confirmation defaults to Yes.** A successful delete moves the row into the viewer's Trash folder immediately. Delete controls are disabled in Trash because permanent deletion is not supported. Use `;u` from the list to undo the most recent session delete, `i` in Trash to restore any listed message to Inbox, or restore messages through Gmail itself. The session undo does not reverse cleanup runs or earlier sessions.
 
 `dd` performs the same Trash move with no question asked. It exists because deleting is reversible twice over — from Gmail's own Trash, and from `;u` for the most recent one this session — which is exactly what a send confirmation is not, and why no equivalent shortcut exists for sending. `;u` holds one message, so `dd` twice in a row leaves only the second recoverable in-session; both remain in Gmail's Trash.
+
+The `i` shortcut always means “move to Inbox.” From Archive it unarchives the message; from Spam it removes Spam and adds Inbox; from Trash it restores the message and adds Inbox. It is available as `i`, `<n> i`, and while reading. It does not permanently delete anything.
 
 ## New email: `gmail send`
 
@@ -329,7 +334,7 @@ gmail --version
 | `1` | Operational failure or a parser-rejected option/argument. |
 | `2` | Application-level invalid input, missing authentication, or configuration error. |
 | `3` | Safety precondition, rule conflict, declined rule/cache-clear confirmation, or missing terminal for `view`/`send`. |
-| `130` | Ctrl+C in the terminal inbox. |
+| `130` | Ctrl+C in the terminal mail view. |
 
 `gmail send` currently returns `0` even when a compose flow is cancelled or a send failure is caught and displayed. Check its `Sent.` / `Not sent.` / error message; exit zero alone does not prove delivery. Interactive inbox actions also display individual errors without necessarily making the eventual session exit fail.
 

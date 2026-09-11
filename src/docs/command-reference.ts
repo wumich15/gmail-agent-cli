@@ -102,10 +102,10 @@ export const COMMANDS: readonly CommandDoc[] = [
   {
     name: "gmail uncache",
     synopsis: "gmail uncache [--yes]",
-    summary: "Clear the local scan cache and history marker.",
+    summary: "Clear the local scan cache and cleanup/view history markers.",
     details:
-      "The inverse of gmail cache, and entirely local: it makes the next run do a full snapshot again. Useful " +
-      "when you want to force a clean re-evaluation.",
+      "The inverse of gmail cache, and entirely local: cleanup/cache takes a full snapshot next, while gmail " +
+      "view progressively reloads its four folders. Useful when you want to force a clean re-evaluation.",
     options: [{ flag: "--yes", description: "Skip the confirmation prompt." }],
     examples: ["gmail uncache"],
     sideEffects: "Nothing in Gmail or Calendar. Deletes local cache rows only.",
@@ -114,20 +114,23 @@ export const COMMANDS: readonly CommandDoc[] = [
   {
     name: "gmail view",
     synopsis: "gmail view [--limit N] [--previous]",
-    summary: "Browse, read, search, reply, compose, and delete mail in the terminal.",
+    summary: "Browse Inbox, Archive, Trash, and Spam; read, reply, compose, and manage mail in the terminal.",
     details:
-      "Refreshes from Gmail, then lists cached mail newest-first. Opening a message fetches it live (bodies " +
-      "are never stored) and marks it read. Replies and new messages can be typed or AI-drafted in your own " +
-      "saved writing style; either way the exact message is shown before anything sends.",
+      "Opens Inbox first, with a top bar for Inbox, Archive, Trash, and Spam. With no usable view cache, it " +
+      "uses existing cached rows and loads only enough to show up to the first three Inbox pages before opening, " +
+      "then fills the remaining folders in the background " +
+      "while the view stays open; visiting a folder or later page gives that mail priority. Subject/sender search " +
+      "is currently Inbox-only. Opening a message fetches it live (bodies are never stored) and marks it read. " +
+      "Replies and new messages can be typed or AI-drafted, and the exact message is shown before anything sends.",
     options: [
       { flag: "--limit N", description: "Messages per page (default: 20)." },
-      { flag: "--previous", description: "Open the existing cache immediately without refreshing first." }
+      { flag: "--previous", description: "Open the existing cache immediately and skip automatic fetching." }
     ],
     examples: ["gmail view", "gmail view --limit 40"],
     sideEffects:
-      "Marks opened messages read, can move a message to Trash, and can send a reply or a new message that you confirm.",
+      "Marks opened messages read, can move a message to Trash or Inbox (including unarchiving/restoring it), and can send a reply or new message that you confirm.",
     confirmation:
-      "Every outbound message stops at a preview of the exact recipient, subject, and body and defaults to no. Deleting asks too, and is undoable in-session with ;u."
+      "Every outbound message stops at a preview of the exact recipient, subject, and body and defaults to no. The d delete asks too; dd skips that reversible Trash confirmation, and ;u restores the latest session delete."
   },
   {
     name: "gmail send",
@@ -193,7 +196,7 @@ export const COMMANDS: readonly CommandDoc[] = [
   {
     name: "gmail help",
     synopsis: "gmail help [command]",
-    summary: "Show every command and the full inbox keyboard reference.",
+    summary: "Show every command and the full terminal-mail keyboard reference.",
     details: "With no argument, lists all commands and the gmail view controls. With a command name, shows just that command.",
     options: [],
     examples: ["gmail help", "gmail help view"],
@@ -208,17 +211,19 @@ export const VIEW_CONTROLS: readonly ViewControlDoc[] = [
   { keys: "number", description: "type email number to open", context: "list" },
   { keys: "<n> r", description: "reply to message n immediately, without opening it first", context: "list" },
   { keys: "<n> ;r", description: 'AI-draft a reply to message n immediately (e.g. "2 ;r")', context: "list" },
-  { keys: "<n> d", description: "delete (Trash) message n immediately, without opening it", context: "list" },
-  { keys: "d", description: "delete (Trash) the highlighted row, without opening it", context: "list" },
-  { keys: "dd", description: "delete (Trash) the highlighted row with no confirmation at all", context: "list" },
-  { keys: "left / right", description: "previous or next page in the list (no Enter needed)", context: "list" },
+  { keys: "<n> d", description: "confirm moving message n to Trash without opening it (disabled in Trash)", context: "list" },
+  { keys: "<n> i", description: "move message n to Inbox, including from Archive, Trash, or Spam", context: "list" },
+  { keys: "d", description: "confirm moving the highlighted row to Trash without opening it (disabled in Trash)", context: "list" },
+  { keys: "dd", description: "move the highlighted row to Trash without confirmation (disabled in Trash)", context: "list" },
+  { keys: "i", description: "move the highlighted row to Inbox, including unarchiving/restoring it", context: "list" },
+  { keys: "left / right", description: "switch the top bar between Inbox, Archive, Trash, and Spam", context: "list" },
   { keys: "n / p", description: "next or previous page", context: "list" },
   { keys: "[ / ]", description: "back or forward through prior list views", context: "list" },
-  { keys: "esc", description: "go home: clear search/filters, first page (never quits)", context: "list" },
+  { keys: "esc", description: "go home to Inbox: clear search/filters, first page (never quits)", context: "list" },
   { keys: "+ / -", description: "increase or decrease page size", context: "list" },
   { keys: "l <number>", description: "set an exact page size", context: "list" },
-  { keys: "f", description: "filter by Gmail label", context: "list" },
-  { keys: "s <text>", description: "search subjects and senders (s alone clears)", context: "list" },
+  { keys: "f", description: "filter the current folder by Gmail label", context: "list" },
+  { keys: "s <text>", description: "search Inbox subjects/senders (s clears; switching folders clears it)", context: "list" },
   { keys: "c", description: "compose a new message (asks whether to write it or have AI draft it)", context: "list" },
   { keys: "a", description: "compose a new message, going straight to an AI draft", context: "list" },
   { keys: ";s", description: "refresh your saved writing style from recent Sent mail", context: "list" },
@@ -227,7 +232,8 @@ export const VIEW_CONTROLS: readonly ViewControlDoc[] = [
   { keys: "q", description: "quit", context: "list" },
   { keys: "left / right", description: "previous or next message while reading one", context: "read" },
   { keys: "r / ;r", description: "reply manually or with AI while reading", context: "read" },
-  { keys: "d", description: "delete (move to Trash) while reading — default answer is yes", context: "read" },
+  { keys: "d", description: "move to Trash while reading — default answer is yes (disabled in Trash)", context: "read" },
+  { keys: "i", description: "move to Inbox while reading, including unarchiving/restoring it", context: "read" },
   {
     keys: "l",
     description: "show this message's link URLs (links are shown shortened and clickable in a terminal that supports it)",
@@ -240,9 +246,10 @@ export const VIEW_CONTROLS: readonly ViewControlDoc[] = [
 export const VIEW_CONTROLS_NOTE =
   'The "<n> r"/"<n> ;r" shortcuts only jump straight to composing — the same\n' +
   "exact-message confirmation screen still appears before anything sends;\n" +
-  'there is no way to skip it. "Delete" always means Gmail\'s Trash (reversible\n' +
-  'from Gmail itself, or instantly via ";u" for the last one this session),\n' +
-  "never permanent deletion — deleting always updates the list immediately.\n" +
+  'there is no way to skip it. "Delete" always means Gmail\'s Trash and is\n' +
+  'disabled inside Trash — permanent deletion is not supported. It is reversible\n' +
+  'from Gmail itself, via ";u" for the last one this session, or with "i" in Trash.\n' +
+  'The same "i" shortcut unarchives Archive mail and restores Spam to Inbox.\n' +
   'That reversibility is why "dd" may skip the question entirely while a send\n' +
   "confirmation never can: a wrong \"dd\" costs one \";u\", and repeating it walks\n" +
   "down the list deleting as it goes.";

@@ -1,6 +1,7 @@
+import { setTimeout as delay } from "node:timers/promises";
 import type { NormalizedMessage } from "../core/models.js";
 import type { GmailClient } from "./client.js";
-import { withGoogleApiRetry } from "../core/api-retry.js";
+import { apiErrorStatus, isGoogleQuotaError, isRetryableNetworkError, withGoogleApiRetry } from "../core/api-retry.js";
 
 export interface ReplyTarget {
   to: string;
@@ -96,23 +97,93 @@ function buildRawMessage(target: ReplyTarget, body: string): string {
 }
 
 /**
+ * A send that did not report success, and whether the message might
+ * nevertheless have gone out.
+ *
+ * `ambiguous` is the whole point: a 5xx or a dropped connection can arrive
+ * *after* Gmail already accepted and delivered the message, so the only
+ * honest thing to tell the user is that it may have been sent. Anything
+ * else risks them sending a second copy of a mail that already landed.
+ */
+export class SendFailedError extends Error {
+  constructor(
+    message: string,
+    readonly ambiguous: boolean,
+    override readonly cause: unknown
+  ) {
+    super(message);
+    this.name = "SendFailedError";
+  }
+}
+
+/**
+ * True only when Gmail demonstrably rejected the request without queuing
+ * anything — a 4xx. The message was not sent, so trying again cannot
+ * duplicate it. A 5xx, a timeout, or a dropped connection proves nothing
+ * either way and must never be retried automatically.
+ */
+function provablyNotSent(error: unknown): boolean {
+  const status = apiErrorStatus(error);
+  return status !== undefined && status >= 400 && status < 500;
+}
+
+/** Only a transient rejection is worth another attempt; a bad address never fixes itself. */
+function worthRetrying(error: unknown): boolean {
+  return provablyNotSent(error) && isGoogleQuotaError(error);
+}
+
+function describeSendError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+const MAX_SEND_ATTEMPTS = 5;
+const SEND_RETRY_BASE_DELAY_MS = 1_000;
+const SEND_RETRY_MAX_DELAY_MS = 30_000;
+
+/**
  * Sends a reply. The caller is responsible for having already shown the
  * user the exact `target`/`body` and obtained explicit confirmation —
  * this function itself has no confirmation gate, by design (it's the
  * single, narrow point that actually calls `messages.send`, kept as small
  * and auditable as possible; see CLAUDE.md's "Interactive reply").
+ *
+ * `messages.send` is not idempotent and Gmail offers no idempotency key,
+ * so this deliberately does NOT use the shared retry policy every other
+ * call in this app uses. That policy retries 5xx and network failures,
+ * which for a send means a message Gmail already accepted gets sent again
+ * — one confirmation producing two or three identical emails under the
+ * user's own name, which is exactly what this app's "never send without
+ * explicit per-message confirmation" rule exists to prevent. Only a
+ * request Gmail provably rejected (a 4xx, and then only a transient
+ * quota-shaped one) is retried; every other failure is surfaced, marked
+ * ambiguous, for the user to decide about — the same doctrine the
+ * unsubscribe subsystem already applies to its one-click POST.
  */
 export async function sendReply(client: GmailClient, target: ReplyTarget, body: string): Promise<void> {
-  await withGoogleApiRetry(
-    () =>
-      client.users.messages.send({
-        userId: "me",
-        requestBody: {
-          raw: buildRawMessage(target, body),
-          ...(target.threadId ? { threadId: target.threadId } : {})
-        }
-      }),
-    {},
-    5 // messages.send = 100 quota units
-  );
+  const raw = buildRawMessage(target, body);
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await withGoogleApiRetry(
+        () =>
+          client.users.messages.send({
+            userId: "me",
+            requestBody: {
+              raw,
+              ...(target.threadId ? { threadId: target.threadId } : {})
+            }
+          }),
+        { maxAttempts: 1 },
+        5, // messages.send = 100 quota units
+        "gmail.messages.send"
+      );
+      return;
+    } catch (error) {
+      if (worthRetrying(error) && attempt < MAX_SEND_ATTEMPTS) {
+        await delay(Math.min(SEND_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1), SEND_RETRY_MAX_DELAY_MS));
+        continue;
+      }
+      const ambiguous = !provablyNotSent(error) || isRetryableNetworkError(error);
+      throw new SendFailedError(describeSendError(error), ambiguous, error);
+    }
+  }
 }

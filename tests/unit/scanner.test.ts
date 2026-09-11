@@ -6,6 +6,7 @@ import {
   fetchProfile,
   historyIdGreaterThan,
   listAllMessageIds,
+  listMessagePage,
   listHistorySince,
   listSentThreadIds,
   headersFromMessage,
@@ -87,6 +88,93 @@ function normalizeOf(raw: gmail_v1.Schema$Message) {
 }
 
 describe("gmail/scanner.ts", () => {
+  it("fetches one resumable message page with the requested filters and bounds", async () => {
+    let capturedParams: unknown;
+    let capturedOptions: unknown;
+    const client = {
+      users: {
+        messages: {
+          list: async (params: unknown, options: unknown) => {
+            capturedParams = params;
+            capturedOptions = options;
+            return {
+              data: {
+                messages: [stub("a")],
+                nextPageToken: "next-page",
+                resultSizeEstimate: 42
+              }
+            };
+          }
+        }
+      }
+    } as unknown as GmailClient;
+    const controller = new AbortController();
+
+    const result = await listMessagePage(client, {
+      labelIds: ["TRASH"],
+      q: "from:example.com",
+      includeSpamTrash: true,
+      pageToken: "current-page",
+      maxResults: 3,
+      signal: controller.signal
+    });
+
+    expect(capturedParams).toEqual({
+      userId: "me",
+      labelIds: ["TRASH"],
+      q: "from:example.com",
+      includeSpamTrash: true,
+      pageToken: "current-page",
+      maxResults: 3,
+      fields: MESSAGE_LIST_FIELDS
+    });
+    expect(capturedOptions).toMatchObject({ timeout: 20_000, signal: controller.signal });
+    expect(result).toEqual({
+      messages: [stub("a")],
+      nextPageToken: "next-page",
+      estimatedTotal: 42
+    });
+  });
+
+  it("normalizes an incomplete final page and deduplicates repeated IDs", async () => {
+    const client = {
+      users: {
+        messages: {
+          list: async () => ({
+            data: {
+              messages: [
+                stub("a"),
+                stub("a"),
+                { id: "a", threadId: "conflicting-thread" },
+                { id: "missing-thread" },
+                { threadId: "missing-id" },
+                stub("b")
+              ]
+            }
+          })
+        }
+      }
+    } as unknown as GmailClient;
+
+    await expect(listMessagePage(client, { includeSpamTrash: false })).resolves.toEqual({
+      messages: [stub("a"), stub("b")],
+      nextPageToken: null,
+      estimatedTotal: null
+    });
+  });
+
+  it.each([0, 501, 1.5, Number.NaN])("rejects invalid page size %s before calling Gmail", async (maxResults) => {
+    let calls = 0;
+    const client = {
+      users: { messages: { list: async () => { calls += 1; return { data: {} }; } } }
+    } as unknown as GmailClient;
+
+    await expect(listMessagePage(client, { includeSpamTrash: false, maxResults })).rejects.toThrow(
+      "maxResults must be an integer between 1 and 500"
+    );
+    expect(calls).toBe(0);
+  });
+
   it("preserves all 16 scenarios", async () => {
     await runScenarios([
       { name: "historyIdGreaterThan compares numerically, not lexicographically", run: () => {

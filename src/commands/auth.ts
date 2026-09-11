@@ -7,7 +7,7 @@ import { connectGoogleAccount } from "../core/connect.js";
 import { chooseAiAccessInteractively } from "./setup-ai.js";
 import { disconnectAccount } from "../core/onboarding.js";
 import { EXIT_CODES } from "../core/errors.js";
-import { ProcessLock } from "../core/lock.js";
+import { DEFAULT_LOCK_WAIT_MS, ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 
 export async function authLogin(): Promise<number> {
@@ -132,7 +132,7 @@ export async function authLogout(): Promise<number> {
     // CLAUDE.md requires the lock for, and must not race a concurrent
     // gmail/gmail work run against this same account.
     const lock = new ProcessLock(lockFilePath(accountHash));
-    lock.acquire();
+    lock.acquire({ waitMs: DEFAULT_LOCK_WAIT_MS });
     try {
       await logoutOneAccount(ctx, accountsRepo, accountHash);
     } finally {

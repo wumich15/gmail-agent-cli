@@ -6,6 +6,7 @@ export const GMAIL_LABELS = {
   starred: "STARRED",
   important: "IMPORTANT",
   sent: "SENT",
+  draft: "DRAFT",
   categoryPromotions: "CATEGORY_PROMOTIONS",
   categorySocial: "CATEGORY_SOCIAL",
   categoryUpdates: "CATEGORY_UPDATES",

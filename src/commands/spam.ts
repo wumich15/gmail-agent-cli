@@ -10,8 +10,8 @@ import { EXIT_CODES, RuleConflictError } from "../core/errors.js";
 import { trashMessage } from "../gmail/executor.js";
 import { isOneClickPost, parseListUnsubscribeHeader } from "../unsubscribe/headers.js";
 import { redactUrlForLogging } from "../unsubscribe/safe-http.js";
-import { buildComposeTarget, sendReply } from "../gmail/reply.js";
-import { ProcessLock } from "../core/lock.js";
+import { buildComposeTarget, sendReply, SendFailedError } from "../gmail/reply.js";
+import { DEFAULT_LOCK_WAIT_MS, ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 import { listAllMessageIds } from "../gmail/scanner.js";
 import { withGoogleApiRetry } from "../core/api-retry.js";
@@ -134,7 +134,7 @@ export async function runSpam(category: string | undefined, options: SpamOptions
   const ctx = bootstrap();
   const { account, gmailClient } = await resolveAccount(ctx);
   const lock = new ProcessLock(lockFilePath(account.accountHash));
-  lock.acquire();
+  lock.acquire({ waitMs: DEFAULT_LOCK_WAIT_MS });
 
   try {
     return await runSpamLocked(category, options, ctx, account, gmailClient);
@@ -298,10 +298,20 @@ async function runSpamLocked(
         await sendReply(gmailClient, target, mailto.body ?? "");
         unsubHandled += 1;
       } catch (error) {
-        console.log(
-          `  ${identity.displayLabel}: the unsubscribe email could not be sent (${error instanceof Error ? error.message : String(error)}).`
-        );
-        unsubManual += 1;
+        const detail = error instanceof Error ? error.message : String(error);
+        if (error instanceof SendFailedError && error.ambiguous) {
+          // The same "never retry an ambiguous outbound request" rule this
+          // subsystem applies to its one-click POST: Gmail may already have
+          // delivered this unsubscribe, so do not present it as something
+          // still to be done.
+          console.log(
+            `  ${identity.displayLabel}: Gmail did not confirm the unsubscribe email (${detail}); ` +
+              "it may already have been sent. Check your Sent mail before retrying."
+          );
+        } else {
+          console.log(`  ${identity.displayLabel}: the unsubscribe email could not be sent (${detail}).`);
+          unsubManual += 1;
+        }
       }
       continue;
     }

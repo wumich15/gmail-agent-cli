@@ -11,7 +11,8 @@ const {
   shortenLinksForDisplay,
   terminalHyperlink,
   openUrlInBrowser,
-  trashCached
+  trashCached,
+  moveCachedToInbox
 } = await import("../../src/commands/view.js");
 
 function row(id: string, labels: string[], subject: string, sender: string): CachedMessageRecord {
@@ -59,6 +60,10 @@ describe("gmail view quick-action shorthand", () => {
 
   it("parses '<n> d' as an immediate delete", () => {
     expect(parseQuickActionCommand("1 d")).toEqual({ index: 1, action: "delete" });
+  });
+
+  it("parses '<n> i' as an immediate move to Inbox", () => {
+    expect(parseQuickActionCommand("4 i")).toEqual({ index: 4, action: "move_to_inbox" });
   });
 
   it("tolerates no space between the number and the action", () => {
@@ -160,31 +165,57 @@ describe("gmail view page sizing", () => {
 describe("unprompted delete (\"dd\")", () => {
   function harness(trashImpl: () => Promise<unknown> = () => Promise.resolve({})) {
     const trash = vi.fn(trashImpl);
-    const client = { users: { messages: { trash } } };
-    const repo = { delete: vi.fn() };
-    return { client, repo, trash };
-  }
-
-  it("moves the message to Trash and evicts the local row, returning the record that makes \";u\" work", async () => {
-    const { client, repo, trash } = harness();
-    const message = row("m1", ["INBOX"], "Junk", "Store");
-
-    // No prompt module is involved at all: this path asks nothing.
-    const result = await trashCached(client as never, repo as never, message);
-
-    expect(result).toEqual({ ok: true, record: message });
-    expect(trash).toHaveBeenCalledWith({ userId: "me", id: "m1" }, expect.anything());
-    expect(repo.delete).toHaveBeenCalledWith("account", "m1");
-  });
-
-  it("never reaches a permanent-delete endpoint", async () => {
-    const trash = vi.fn().mockResolvedValue({});
     const del = vi.fn();
     const batchDelete = vi.fn();
     const client = { users: { messages: { trash, delete: del, batchDelete } } };
-    await trashCached(client as never, { delete: vi.fn() } as never, row("m1", ["INBOX"], "Junk", "Store"));
-    expect(del).not.toHaveBeenCalled();
-    expect(batchDelete).not.toHaveBeenCalled();
+    const repo = { upsert: vi.fn(), delete: vi.fn() };
+    return { client, repo, trash };
+  }
+
+  it("moves the cached projection to Trash and returns the prior record that makes \";u\" work", async () => {
+    const { client, repo, trash } = harness();
+    const message = { ...assessedRow("m1", ["INBOX", "STARRED"]), processedAt: "before" };
+
+    // No prompt module is involved at all: this path asks nothing.
+    const result = await trashCached(client as never, repo as never, message, "after");
+
+    expect(result).toEqual({ ok: true, record: message });
+    expect(trash).toHaveBeenCalledWith({ userId: "me", id: "m1" }, expect.anything());
+    expect(repo.delete).not.toHaveBeenCalled();
+    expect(repo.upsert).toHaveBeenCalledOnce();
+    expect(repo.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      gmailMessageId: "m1",
+      labelSnapshot: ["STARRED", "TRASH"],
+      classifierVersion: null,
+      assessmentKind: null,
+      category: null,
+      assessmentHadEvent: null,
+      processedAt: "after"
+    }));
+  });
+
+  it("never reaches a permanent-delete endpoint", async () => {
+    const { client, repo } = harness();
+    await trashCached(client as never, repo as never, row("m1", ["INBOX"], "Junk", "Store"));
+    expect(client.users.messages.delete).not.toHaveBeenCalled();
+    expect(client.users.messages.batchDelete).not.toHaveBeenCalled();
+  });
+
+  it("does nothing when the message is already in Trash", async () => {
+    const { client, repo, trash } = harness();
+
+    const result = await trashCached(
+      client as never,
+      repo as never,
+      row("m1", ["TRASH", "INBOX"], "Junk", "Store")
+    );
+
+    expect(result).toEqual({ ok: false, message: "Already in Trash; permanent deletion is never supported." });
+    expect(trash).not.toHaveBeenCalled();
+    expect(client.users.messages.delete).not.toHaveBeenCalled();
+    expect(client.users.messages.batchDelete).not.toHaveBeenCalled();
+    expect(repo.upsert).not.toHaveBeenCalled();
+    expect(repo.delete).not.toHaveBeenCalled();
   });
 
   it("records no undo and keeps the cached row when Gmail rejects the delete", async () => {
@@ -194,11 +225,151 @@ describe("unprompted delete (\"dd\")", () => {
     const result = await trashCached(client as never, repo as never, row("m1", ["INBOX"], "Junk", "Store"));
 
     expect(result.ok).toBe(false);
+    expect(repo.upsert).not.toHaveBeenCalled();
     expect(repo.delete).not.toHaveBeenCalled();
     // The failure is returned, not printed: "dd" clears the screen on its
     // next render, so a printed error would vanish and the message would
     // look deleted when it is still in the mailbox.
     expect(errors).not.toHaveBeenCalled();
     expect(result.ok ? "" : result.message).toContain("permission denied");
+  });
+});
+
+function assessedRow(id: string, labels: string[]): CachedMessageRecord {
+  return {
+    ...row(id, labels, "Important message", "Sender"),
+    classifierVersion: "classifier-v1",
+    promptVersion: "prompt-v1",
+    schemaVersion: "schema-v1",
+    policyVersion: "policy-v1",
+    assessmentKind: "personal_important",
+    assessmentConfidence: 0.91,
+    importanceScore: 87,
+    importanceConfidence: 0.88,
+    reasonCodes: ["direct_request"],
+    category: "Work",
+    assessmentHadEvent: true,
+    processedAt: "before"
+  };
+}
+
+function expectInvalidated(record: CachedMessageRecord, labelSnapshot: readonly string[]): void {
+  expect(record).toEqual(expect.objectContaining({
+    labelSnapshot,
+    classifierVersion: null,
+    promptVersion: null,
+    schemaVersion: null,
+    policyVersion: null,
+    assessmentKind: null,
+    assessmentConfidence: null,
+    importanceScore: null,
+    importanceConfidence: null,
+    reasonCodes: null,
+    category: null,
+    assessmentHadEvent: null,
+    processedAt: "after"
+  }));
+}
+
+describe("move cached message to Inbox", () => {
+  function harness(overrides: {
+    modify?: (() => Promise<unknown>) | undefined;
+    untrash?: (() => Promise<unknown>) | undefined;
+  } = {}) {
+    const modify = vi.fn(overrides.modify ?? (() => Promise.resolve({})));
+    const untrash = vi.fn(overrides.untrash ?? (() => Promise.resolve({})));
+    const client = { users: { messages: { modify, untrash } } };
+    const repo = { upsert: vi.fn() };
+    return { client, repo, modify, untrash };
+  }
+
+  it("adds Inbox to archived mail and invalidates its cached assessment", async () => {
+    const { client, repo, modify, untrash } = harness();
+    const cached = assessedRow("archive", ["UNREAD", "STARRED"]);
+
+    const outcome = await moveCachedToInbox(client as never, repo as never, cached, "after");
+
+    if (!outcome.ok) throw new Error(outcome.message);
+    expect(modify).toHaveBeenCalledWith({
+      userId: "me",
+      id: "archive",
+      requestBody: { addLabelIds: ["INBOX"] }
+    }, expect.anything());
+    expect(untrash).not.toHaveBeenCalled();
+    expectInvalidated(outcome.record, ["UNREAD", "STARRED", "INBOX"]);
+    expect(repo.upsert).toHaveBeenCalledWith(outcome.record);
+  });
+
+  it("moves Spam to Inbox while explicitly removing the Spam label", async () => {
+    const { client, repo, modify, untrash } = harness();
+    const cached = assessedRow("spam", ["SPAM", "UNREAD", "Label_1"]);
+
+    const outcome = await moveCachedToInbox(client as never, repo as never, cached, "after");
+
+    if (!outcome.ok) throw new Error(outcome.message);
+    expect(modify).toHaveBeenCalledWith({
+      userId: "me",
+      id: "spam",
+      requestBody: { addLabelIds: ["INBOX"], removeLabelIds: ["SPAM"] }
+    }, expect.anything());
+    expect(untrash).not.toHaveBeenCalled();
+    expectInvalidated(outcome.record, ["UNREAD", "Label_1", "INBOX"]);
+    expect(repo.upsert).toHaveBeenCalledWith(outcome.record);
+  });
+
+  it("untrashes Trash mail before adding Inbox and never re-adds Trash", async () => {
+    const { client, repo, modify, untrash } = harness();
+    const cached = assessedRow("trash", ["TRASH", "UNREAD", "Label_1"]);
+
+    const outcome = await moveCachedToInbox(client as never, repo as never, cached, "after");
+
+    if (!outcome.ok) throw new Error(outcome.message);
+    expect(untrash).toHaveBeenCalledWith({ userId: "me", id: "trash" }, expect.anything());
+    expect(modify).toHaveBeenCalledWith({
+      userId: "me",
+      id: "trash",
+      requestBody: { addLabelIds: ["INBOX"] }
+    }, expect.anything());
+    expect(modify.mock.calls.flat()).not.toContainEqual(expect.objectContaining({ addLabelIds: expect.arrayContaining(["TRASH"]) }));
+    expectInvalidated(outcome.record, ["UNREAD", "Label_1", "INBOX"]);
+    expect(outcome.record.labelSnapshot).not.toContain("TRASH");
+    expect(repo.upsert).toHaveBeenCalledWith(outcome.record);
+  });
+
+  it("keeps the cache out of Trash when untrash succeeds but adding Inbox fails", async () => {
+    const { client, repo, modify, untrash } = harness({
+      modify: () => Promise.reject(new Error("modify failed"))
+    });
+    const cached = assessedRow("partial", ["TRASH", "UNREAD", "Label_1"]);
+
+    const outcome = await moveCachedToInbox(client as never, repo as never, cached, "after");
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok ? "" : outcome.message).toContain("Restored from Trash");
+    expect(untrash).toHaveBeenCalledOnce();
+    expect(modify).toHaveBeenCalledOnce();
+    expect(repo.upsert).toHaveBeenCalledOnce();
+    expectInvalidated(repo.upsert.mock.calls[0]![0] as CachedMessageRecord, ["UNREAD", "Label_1"]);
+  });
+
+  it.each([
+    { name: "Archive", labels: ["UNREAD"] },
+    { name: "Spam", labels: ["SPAM", "UNREAD"] },
+    { name: "Trash", labels: ["TRASH", "UNREAD"] }
+  ])("leaves the $name cache projection untouched when Gmail rejects the move", async ({ labels }) => {
+    const rejection = () => Promise.reject(new Error("permission denied"));
+    const { client, repo } = harness({
+      modify: labels.includes("TRASH") ? undefined : rejection,
+      untrash: labels.includes("TRASH") ? rejection : undefined
+    });
+    const cached = assessedRow("failed", labels);
+    const before = structuredClone(cached);
+
+    const outcome = await moveCachedToInbox(client as never, repo as never, cached, "after");
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.ok ? "" : outcome.message).toContain("permission denied");
+    expect(repo.upsert).not.toHaveBeenCalled();
+    expect(cached).toEqual(before);
   });
 });

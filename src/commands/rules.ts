@@ -3,7 +3,7 @@ import { bootstrap } from "../core/bootstrap.js";
 import { resolveAccount } from "./shared.js";
 import { RuleGroupsRepository } from "../state/repositories/rule-groups.js";
 import { EXIT_CODES } from "../core/errors.js";
-import { ProcessLock } from "../core/lock.js";
+import { DEFAULT_LOCK_WAIT_MS, ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 
 export async function rulesList(options: { json: boolean }): Promise<number> {
@@ -38,7 +38,7 @@ export async function rulesRemove(ruleGroupId: string): Promise<number> {
   // every other mutating command (CLAUDE.md explicitly names "mutating
   // rules" in its lock list).
   const lock = new ProcessLock(lockFilePath(account.accountHash));
-  lock.acquire();
+  lock.acquire({ waitMs: DEFAULT_LOCK_WAIT_MS });
   try {
     // Scoped to this account so `gmail rules remove <id>` can never
     // delete a rule group belonging to a different account.

@@ -7,7 +7,7 @@ import { mapWithConcurrency } from "../core/concurrency.js";
 import { apiErrorStatus } from "../core/api-retry.js";
 import type { GmailClient } from "./client.js";
 import { projectHydratedCacheMessage } from "./cache-projection.js";
-import { fetchMessageFull, fetchProfile, listHistorySince } from "./scanner.js";
+import { fetchMessageFull, fetchProfile, historyIdGreaterThan, listHistorySince } from "./scanner.js";
 
 const VIEW_REFRESH_CONCURRENCY = 8;
 
@@ -20,9 +20,9 @@ export interface ViewCacheRefreshResult {
 }
 
 /**
- * Reconciles only Gmail history changes since the cache/work history fence.
- * A missing or expired fence deliberately requests a full `gmail cache`
- * fallback; history is an optimization, never a correctness boundary.
+ * Reconciles only Gmail history changes since the last complete four-folder
+ * view snapshot. The cleanup cache's Inbox/Spam marker cannot certify that
+ * Archive or Trash was ever loaded, so the viewer maintains its own fence.
  */
 export async function refreshViewCache(
   db: GmailAgentDatabase,
@@ -30,12 +30,18 @@ export async function refreshViewCache(
   account: AccountRecord,
   nowIso: string
 ): Promise<ViewCacheRefreshResult> {
-  if (!account.historyMarker) {
+  const settings = new SettingsRepository(db);
+  const viewMarker = settings.get(account.accountHash, SETTING_KEYS.viewHistoryMarker);
+  if (!viewMarker) {
     return { kind: "full_required", added: 0, updated: 0, removed: 0, failed: 0 };
   }
 
-  const history = await listHistorySince(client, account.historyMarker);
+  const history = await listHistorySince(client, viewMarker);
   if (history.expiredMarker) {
+    db.transaction(() => {
+      settings.delete(account.accountHash, SETTING_KEYS.viewHistoryMarker);
+      settings.delete(account.accountHash, SETTING_KEYS.viewFullCacheAt);
+    })();
     return { kind: "full_required", added: 0, updated: 0, removed: 0, failed: 0 };
   }
 
@@ -58,7 +64,8 @@ export async function refreshViewCache(
         nowIso,
         stub,
         await fetchMessageFull(client, stub.id),
-        existingById.get(stub.id) ?? null
+        existingById.get(stub.id) ?? null,
+        "view"
       );
       if (projection === null) {
         if (existingById.has(stub.id)) removedIds.add(stub.id);
@@ -81,12 +88,15 @@ export async function refreshViewCache(
 
   db.transaction(() => {
     messages.applyCacheBatch(account.accountHash, projections, [...removedIds]);
-    new AccountsRepository(db).updateHistoryMarker(
-      account.accountHash,
-      failed === 0 ? history.endHistoryId : account.historyMarker,
-      nowIso
-    );
-    new SettingsRepository(db).set(account.accountHash, SETTING_KEYS.viewLastRefreshAt, nowIso, nowIso);
+    if (failed === 0) {
+      settings.set(account.accountHash, SETTING_KEYS.viewHistoryMarker, history.endHistoryId, nowIso);
+      const accounts = new AccountsRepository(db);
+      const latestAccount = accounts.get(account.accountHash);
+      if (!latestAccount?.historyMarker || historyIdGreaterThan(history.endHistoryId, latestAccount.historyMarker)) {
+        accounts.updateHistoryMarker(account.accountHash, history.endHistoryId, nowIso);
+      }
+    }
+    settings.set(account.accountHash, SETTING_KEYS.viewLastRefreshAt, nowIso, nowIso);
   })();
 
   return {

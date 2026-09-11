@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { buildComposeTarget, buildReplyTarget, sendReply } from "../../src/gmail/reply.js";
+import { describe, expect, it, vi } from "vitest";
+import { buildComposeTarget, buildReplyTarget, sendReply, SendFailedError } from "../../src/gmail/reply.js";
 import { buildNormalizedMessage, headerMapFromList } from "../../src/gmail/normalize.js";
 import type { GmailClient } from "../../src/gmail/client.js";
 
@@ -187,5 +187,56 @@ describe("buildComposeTarget", () => {
     expect(buildComposeTarget("not-an-email", "Hello")).toBeNull();
     expect(buildComposeTarget("alice@example.com\r\nBcc: victim@example.com", "Hello")).toBeNull();
     expect(buildComposeTarget("alice@example.com", "Hello\r\nBcc: victim@example.com")).toBeNull();
+  });
+});
+
+describe("sendReply retry safety", () => {
+  function clientThatFails(error: unknown, failTimes = Number.POSITIVE_INFINITY) {
+    let calls = 0;
+    const send = vi.fn(async () => {
+      calls += 1;
+      if (calls <= failTimes) throw error;
+      return { data: { id: "sent" } };
+    });
+    return { client: { users: { messages: { send } } } as unknown as GmailClient, send, calls: () => calls };
+  }
+
+  const target = { to: "a@example.com", subject: "Hi", threadId: null, inReplyTo: null, references: null };
+
+  it("never re-sends after a 5xx, which Gmail may have already accepted", async () => {
+    // Regression: sendReply used the shared retry policy, which treats 5xx
+    // as transient. messages.send is not idempotent and Gmail has no
+    // idempotency key, so a 503 arriving after Gmail accepted the message
+    // turned one confirmed send into three delivered emails.
+    const { client, calls } = clientThatFails(Object.assign(new Error("backend error"), { status: 503 }), 2);
+
+    await expect(sendReply(client, target, "body")).rejects.toBeInstanceOf(SendFailedError);
+    expect(calls()).toBe(1);
+    await expect(sendReply(client, target, "body")).rejects.toMatchObject({ ambiguous: true });
+  });
+
+  it("never re-sends after a dropped connection", async () => {
+    const { client, calls } = clientThatFails(Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }));
+
+    await expect(sendReply(client, target, "body")).rejects.toMatchObject({ ambiguous: true });
+    expect(calls()).toBe(1);
+  });
+
+  it("reports a plain rejection as definitely not sent, without retrying", async () => {
+    const { client, calls } = clientThatFails(Object.assign(new Error("invalid to header"), { status: 400 }));
+
+    await expect(sendReply(client, target, "body")).rejects.toMatchObject({ ambiguous: false });
+    expect(calls()).toBe(1);
+  });
+
+  it("still retries a quota rejection, which provably queued nothing", async () => {
+    const quotaError = Object.assign(new Error("rate limit"), {
+      status: 429,
+      response: { data: { error: { errors: [{ reason: "rateLimitExceeded" }] } } }
+    });
+    const { client, calls } = clientThatFails(quotaError, 1);
+
+    await expect(sendReply(client, target, "body")).resolves.toBeUndefined();
+    expect(calls()).toBe(2);
   });
 });

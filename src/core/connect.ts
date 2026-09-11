@@ -10,7 +10,7 @@ import { createGmailClient } from "../gmail/client.js";
 import { fetchProfile } from "../gmail/scanner.js";
 import { accountHashFromEmail } from "./ids.js";
 import { loadOrCreateDefaultConfig, saveConfig } from "../config/load.js";
-import { ProcessLock } from "./lock.js";
+import { DEFAULT_LOCK_WAIT_MS, ProcessLock } from "./lock.js";
 import { lockFilePath } from "../config/paths.js";
 import { reloadConfig, type CliContext } from "./bootstrap.js";
 
@@ -57,7 +57,7 @@ export async function connectGoogleAccount(ctx: CliContext, options: ConnectOpti
   // mutates the credential store and durable account state, which
   // CLAUDE.md requires the per-account lock for.
   const lock = new ProcessLock(lockFilePath(accountHash));
-  lock.acquire();
+  lock.acquire({ waitMs: DEFAULT_LOCK_WAIT_MS });
   try {
     await ctx.credentialStore.setSecret(CREDENTIAL_KEYS.oauthRefreshToken(accountHash), result.refreshToken);
 

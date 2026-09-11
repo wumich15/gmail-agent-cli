@@ -95,14 +95,30 @@ export function isRetryableStatus(status: number | undefined): boolean {
   return status === 429 || (status !== undefined && status >= 500 && status < 600);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const finish = (): void => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    const abort = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abort);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+  });
 }
 
 export interface RetryOptions {
   maxAttempts?: number;
   baseDelayMs?: number;
   maxDelayMs?: number;
+  /** Lets an interactive caller cancel limiter and retry-backoff waits. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -115,7 +131,7 @@ export interface RetryOptions {
  * transient per-minute quota exhaustion has a real chance of clearing
  * within one call's retry budget instead of failing the whole command.
  */
-const DEFAULT_OPTIONS: Required<RetryOptions> = {
+const DEFAULT_OPTIONS: Required<Omit<RetryOptions, "signal">> = {
   maxAttempts: 7,
   baseDelayMs: 1000,
   maxDelayMs: 30_000
@@ -135,9 +151,11 @@ const DEFAULT_OPTIONS: Required<RetryOptions> = {
  */
 export async function withApiRetry<T>(fn: () => Promise<T>, options: RetryOptions = {}): Promise<T> {
   const { maxAttempts, baseDelayMs, maxDelayMs } = { ...DEFAULT_OPTIONS, ...options };
+  const { signal } = options;
   let attempt = 0;
   for (;;) {
     try {
+      signal?.throwIfAborted();
       return await fn();
     } catch (error) {
       attempt += 1;
@@ -153,7 +171,10 @@ export async function withApiRetry<T>(fn: () => Promise<T>, options: RetryOption
       // the caller's latency bound. In particular, an erroneous HTTP date
       // hours in the future previously made an otherwise capped retry loop
       // look hung indefinitely.
-      await sleep(retryAfter === null ? Math.min(exponential + jitter, maxDelayMs) : Math.min(retryAfter, maxDelayMs));
+      await sleep(
+        retryAfter === null ? Math.min(exponential + jitter, maxDelayMs) : Math.min(retryAfter, maxDelayMs),
+        signal
+      );
     }
   }
 }
@@ -291,13 +312,15 @@ export class GoogleApiRateLimiter {
    * assumed, reaching the account's actual per-minute cap despite the
    * pacer reporting a seemingly-safe requests/second figure throughout.
    */
-  async acquire(weight = 1): Promise<void> {
+  async acquire(weight = 1, signal?: AbortSignal): Promise<void> {
     if (!Number.isFinite(weight) || weight <= 0 || weight > this.minuteBudget) throw new Error("Quota weight must be positive and finite.");
+    signal?.throwIfAborted();
     const startedAt = Date.now();
     // Serialize admission, not HTTP work. Queued workers recheck the shared
     // cooldown and current pace instead of retaining stale pre-error slots.
     const admission = this.queue.then(async () => {
       for (;;) {
+        signal?.throwIfAborted();
         const now = Date.now();
         while (this.recentAdmissions[0] && this.recentAdmissions[0].at <= now - 60_000) this.recentAdmissions.shift();
         let used = this.recentAdmissions.reduce((sum, entry) => sum + entry.weight, 0);
@@ -314,8 +337,9 @@ export class GoogleApiRateLimiter {
         const paceWait = this.tokens >= needed ? 0 : Math.ceil((needed - this.tokens) * this.intervalMs);
         const wait = Math.max(paceWait, this.cooldownUntil - now, budgetAvailableAt - now);
         if (wait <= 0) break;
-        await sleep(wait);
+        await sleep(wait, signal);
       }
+      signal?.throwIfAborted();
       if (Number.isFinite(this.minuteBudget)) this.recentAdmissions.push({ at: Date.now(), weight });
       this.tokens -= weight;
       this.waitMs += Date.now() - startedAt;
@@ -543,7 +567,7 @@ export async function withGoogleApiRetry<T>(fn: () => Promise<T>, options: Retry
     const queuedAt = performance.now();
     const base = { requestId, attempt: ++attempt, operation, quotaWeight: weight };
     emitAttempt({ ...base, stage: "queued", requestsPerSecond: googleApiRateLimiter.currentRequestsPerSecond });
-    await googleApiRateLimiter.acquire(weight);
+    await googleApiRateLimiter.acquire(weight, options.signal);
     const networkStartedAt = performance.now();
     const limiterWaitMs = Math.round(networkStartedAt - queuedAt);
     emitAttempt({ ...base, stage: "started", limiterWaitMs, requestsPerSecond: googleApiRateLimiter.currentRequestsPerSecond });

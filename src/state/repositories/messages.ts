@@ -130,7 +130,7 @@ export class MessagesRepository {
     return this.db.prepare("DELETE FROM messages WHERE account_hash = ?").run(accountHash).changes;
   }
 
-  /** Removes cache projections Gmail has proven deleted or outside the Inbox/Spam working set. */
+  /** Removes a cache projection Gmail has proven deleted or outside the caller's chosen cache scope. */
   delete(accountHash: string, gmailMessageId: string): boolean {
     return this.deleteStatement.run(accountHash, gmailMessageId).changes > 0;
   }

@@ -15,6 +15,32 @@ export interface LabelMutation {
   removeLabelIds: readonly string[];
 }
 
+/** Applies one bounded, retryable label mutation to one Gmail message. */
+export async function modifyMessageLabels(
+  client: GmailClient,
+  messageId: string,
+  mutation: LabelMutation,
+  operation = "gmail.messages.modify"
+): Promise<void> {
+  await withGoogleApiRetry(
+    () =>
+      client.users.messages.modify(
+        {
+          userId: "me",
+          id: messageId,
+          requestBody: {
+            ...(mutation.addLabelIds.length > 0 ? { addLabelIds: [...mutation.addLabelIds] } : {}),
+            ...(mutation.removeLabelIds.length > 0 ? { removeLabelIds: [...mutation.removeLabelIds] } : {})
+          }
+        },
+        GMAIL_MUTATION_REQUEST_OPTIONS
+      ),
+    GMAIL_MUTATION_RETRY_OPTIONS,
+    0.25,
+    operation
+  );
+}
+
 function mutationKey(mutation: LabelMutation): string {
   return JSON.stringify({
     add: [...mutation.addLabelIds].sort(),
@@ -103,16 +129,7 @@ export async function untrashMessage(
     0.25, "gmail.messages.untrash"
   );
   if (restoreLabelIds.length > 0) {
-    await withGoogleApiRetry(
-      () =>
-        client.users.messages.modify({
-          userId: "me",
-          id: messageId,
-          requestBody: { addLabelIds: [...restoreLabelIds] }
-        }, GMAIL_MUTATION_REQUEST_OPTIONS),
-      GMAIL_MUTATION_RETRY_OPTIONS,
-      0.25, "gmail.messages.modify"
-    );
+    await modifyMessageLabels(client, messageId, { addLabelIds: restoreLabelIds, removeLabelIds: [] });
   }
 }
 

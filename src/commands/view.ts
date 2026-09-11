@@ -3,7 +3,6 @@ import pc from "picocolors";
 import { bootstrap } from "../core/bootstrap.js";
 import { openUrlInBrowser as openUrlInSystemBrowser } from "../core/open-browser.js";
 import { resolveAccountSigningInIfNeeded } from "./shared.js";
-import { runCache } from "./cache.js";
 import { latestCacheRefreshAt } from "./work.js";
 import { MessagesRepository, type CachedMessageRecord } from "../state/repositories/messages.js";
 import { AccountsRepository } from "../state/repositories/accounts.js";
@@ -16,17 +15,29 @@ import { resolveOpenAiCredentials } from "../ai/resolve-classifier.js";
 import type { ResolvedOpenAiCredentials } from "../ai/resolve-classifier.js";
 import { promptBody, reviewAiDraft, confirmAndSend, handleCompose } from "../gmail/compose-flow.js";
 import { readCommandLine, waitForKeypress } from "../core/keypress.js";
-import { ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 import { EXIT_CODES } from "../core/errors.js";
-import { withGoogleApiRetry } from "../core/api-retry.js";
-import { trashMessage, untrashMessage } from "../gmail/executor.js";
+import { trashMessage, untrashMessage, modifyMessageLabels } from "../gmail/executor.js";
 import type { GmailClient } from "../gmail/client.js";
-import type { AccountRecord, NormalizedMessage } from "../core/models.js";
+import type { NormalizedMessage } from "../core/models.js";
 import { projectHydratedCacheMessage } from "../gmail/cache-projection.js";
 import { refreshViewCache } from "../gmail/view-sync.js";
 import { listUserLabels } from "../gmail/custom-labels.js";
 import { getWritingStyleProfile } from "../gmail/writing-style.js";
+import {
+  ProgressiveViewCache,
+  VIEW_INITIAL_PAGE_COUNT,
+  ViewOperationCoordinator,
+  type ViewExclusiveRunner
+} from "../gmail/view-cache.js";
+import {
+  VIEW_FOLDERS,
+  adjacentViewFolder,
+  folderForLabelSnapshot,
+  messageIsInViewFolder,
+  viewFolderSupportsSearch,
+  type ViewFolderId
+} from "../gmail/view-folders.js";
 
 export interface ViewOptions {
   limit?: number;
@@ -37,10 +48,31 @@ export interface ViewOptions {
 const DEFAULT_PAGE_SIZE = 20;
 const PAGE_SIZE_STEPS = [5, 10, 20, 50, 100] as const;
 
+/**
+ * How long startup waits for the first mail before opening the interface
+ * anyway. There is nothing to show yet, so it is worth waiting a little —
+ * but never indefinitely: a loader blocked behind another `gmail`
+ * process's account lock used to leave the terminal with no list, no
+ * prompt, and no error at all, which is indistinguishable from a crash.
+ */
+const VIEW_STARTUP_WAIT_MS = 10_000;
+
+/**
+ * How long a keystroke waits for mail that is not cached yet. Short on
+ * purpose: switching folders or turning a page must always redraw
+ * promptly, showing whatever is cached and letting the rest arrive in the
+ * background, rather than holding the whole UI until Gmail answers.
+ */
+const VIEW_NAVIGATION_WAIT_MS = 2_500;
+
+function viewFolderLabel(folder: ViewFolderId): string {
+  return VIEW_FOLDERS.find((candidate) => candidate.id === folder)!.label;
+}
+
 const LIST_CONTROLS =
   "↑/↓ select · enter open · type email number to open · d delete highlighted row · dd delete it without asking · " +
-  "<n> r/;r/d reply/AI-reply/delete without opening it · " +
-  "←/→ page · [ ] history · esc home · +/- size · l <n> · f filter · s search · c/a compose · " +
+  "i move highlighted row to Inbox · <n> r/;r/d/i reply/AI-reply/delete/Inbox · " +
+  "←/→ folders · n/p page · [ ] history · esc home · +/- size · l <n> · f filter · s Inbox search · c/a compose · " +
   ";s refresh writing style · ;u undo last delete · u refresh · q quit";
 
 /**
@@ -54,13 +86,14 @@ function clearScreen(): void {
 }
 
 interface ListViewSnapshot {
+  folder: ViewFolderId;
   page: number;
   pageSize: number;
   selectedTags: Set<string>;
   search: string;
 }
 
-/** `gmail view` — an interactive terminal inbox with live incremental refresh, reading, composing, and replies. */
+/** `gmail view` — an interactive four-folder terminal mail view with live incremental refresh. */
 export async function runView(options: ViewOptions): Promise<number> {
   if (!process.stdin.isTTY) {
     console.error(pc.red("gmail view is interactive and requires a terminal (stdin is not a TTY)."));
@@ -69,7 +102,56 @@ export async function runView(options: ViewOptions): Promise<number> {
 
   const ctx = bootstrap();
   let { account, gmailClient } = await resolveAccountSigningInIfNeeded(ctx);
-  const initialCachedCount = new MessagesRepository(ctx.db).countForAccount(account.accountHash);
+  const messagesRepo = new MessagesRepository(ctx.db);
+  const initialCachedCount = messagesRepo.countForAccount(account.accountHash);
+  let pageSize = options.limit ?? DEFAULT_PAGE_SIZE;
+  const operations = new ViewOperationCoordinator(lockFilePath(account.accountHash));
+  const progressiveCache: { current: ProgressiveViewCache | null } = { current: null };
+  const retainInProgressiveSnapshot = (messageId: string): void => {
+    progressiveCache.current?.retainId(messageId);
+  };
+  const beginProgressiveCache = async (folder: ViewFolderId): Promise<void> => {
+    if (progressiveCache.current) await progressiveCache.current.stop();
+    account = new AccountsRepository(ctx.db).get(account.accountHash) ?? account;
+    progressiveCache.current = new ProgressiveViewCache({
+      db: ctx.db,
+      gmailClient,
+      account,
+      nowIso: () => ctx.clock.nowIso(),
+      pageSize,
+      runExclusive: operations.runExclusive
+    });
+    const desired = pageSize * VIEW_INITIAL_PAGE_COUNT;
+    const alreadyCached = messagesRepo
+      .listForAccount(account.accountHash)
+      .filter((message) => messageIsInViewFolder(message.labelSnapshot, folder)).length;
+    console.error(
+      pc.dim(
+        alreadyCached >= desired
+          ? `Opening the cached ${viewFolderLabel(folder)}; refreshing all folders in the background.`
+          : `Loading up to the first ${VIEW_INITIAL_PAGE_COUNT} ${viewFolderLabel(folder)} page(s)...`
+      )
+    );
+    const status = await progressiveCache.current.ensureFolder(folder, desired, {
+      timeoutMs: VIEW_STARTUP_WAIT_MS
+    });
+    if (progressiveCache.current.waitingForAccountLock) {
+      console.error(
+        pc.yellow(
+          "Another gmail command is running, so loading is waiting for it to finish. " +
+            'Opening with the mail already cached; press "u" to retry once it is done.'
+        )
+      );
+    } else if (status.failed > 0 || progressiveCache.current.error) {
+      console.error(pc.yellow("Some mail could not be loaded; the cached rows that succeeded are still available."));
+    } else if (status.cached < desired && !status.complete) {
+      console.error(pc.dim("Opening now; the rest of this folder keeps loading in the background."));
+    }
+    // Do not await this: remaining pages and folders are deliberately filled
+    // while the user is already browsing the initial rows.
+    progressiveCache.current.startBackground();
+  };
+
   let refresh: Awaited<ReturnType<typeof refreshViewCache>> | null = null;
   if (options.previous) {
     console.error(pc.dim("Using the previous Gmail cache without refreshing it."));
@@ -85,47 +167,39 @@ export async function runView(options: ViewOptions): Promise<number> {
     const lastSyncAt = latestCacheRefreshAt(ctx.db, account.accountHash);
     console.error(pc.dim(lastSyncAt ? `Updating mail cached ${formatAge(lastSyncAt)}...` : "Updating cached mail..."));
 
-    refresh = await refreshViewCacheLocked(ctx, gmailClient, account);
+    refresh = await operations.runExclusive(() => refreshViewCache(ctx.db, gmailClient, account, ctx.clock.nowIso()));
     if (refresh.kind === "full_required") {
       console.error(
         pc.dim(
           (initialCachedCount > 0
-            ? `The cache contains ${initialCachedCount} message(s), but it has no usable history checkpoint; refreshing the Inbox once. `
-            : "There is no usable cache history checkpoint; refreshing the Inbox once. ") +
-            "Use --previous to open the existing cache immediately."
+            ? `The cache contains ${initialCachedCount} message(s), but the four-folder view has no usable history checkpoint. `
+            : "There is no four-folder view cache yet. ") +
+            `Loading only the first ${VIEW_INITIAL_PAGE_COUNT} Inbox pages before opening; the rest will continue in the background.`
         )
       );
-      const cacheCode = await runCache();
-      if (cacheCode !== EXIT_CODES.ok) {
-        console.error(pc.yellow("The refresh was incomplete; showing every message that was cached successfully."));
-      }
-      account = new AccountsRepository(ctx.db).get(account.accountHash) ?? account;
+      await beginProgressiveCache("inbox");
     } else if (refresh.added + refresh.updated + refresh.removed > 0 || refresh.failed > 0) {
       console.error(
         pc.dim(
-          `Inbox updated: ${refresh.added} new, ${refresh.updated} changed, ${refresh.removed} removed` +
+          `Mail updated: ${refresh.added} new, ${refresh.updated} changed, ${refresh.removed} removed` +
             (refresh.failed > 0 ? `, ${refresh.failed} will retry later` : "") + "."
         )
       );
     } else {
-      console.error(pc.dim("Inbox is up to date."));
+      console.error(pc.dim("Mail is up to date."));
     }
   }
 
-  const messagesRepo = new MessagesRepository(ctx.db);
   let all = messagesRepo.listForAccount(account.accountHash);
-  if (all.length === 0) {
-    console.log(pc.yellow("No Inbox or Spam messages are currently cached."));
+  if (options.previous && all.length === 0) {
+    console.log(pc.yellow("The previous cache is empty. Run `gmail view` without --previous to load mail."));
     return EXIT_CODES.ok;
   }
 
   let labelNames = options.previous ? systemLabelNames() : await loadLabelNames(gmailClient);
-  const homeTags = new Set<string>(
-    all.some((message) => message.labelSnapshot.includes(GMAIL_LABELS.inbox)) ? [GMAIL_LABELS.inbox] : []
-  );
-  let selectedTags = new Set<string>(homeTags);
+  let activeFolder: ViewFolderId = "inbox";
+  let selectedTags = new Set<string>();
   let search = "";
-  let pageSize = options.limit ?? DEFAULT_PAGE_SIZE;
   let page = 0;
   /** Highlighted row within the current page — moved by ↑/↓, opened by Enter on an empty command. */
   let selectedRow = 0;
@@ -133,8 +207,15 @@ export async function runView(options: ViewOptions): Promise<number> {
   let lastTrashed: CachedMessageRecord | null = null;
   const backStack: ListViewSnapshot[] = [];
   const forwardStack: ListViewSnapshot[] = [];
-  const snapshotView = (): ListViewSnapshot => ({ page, pageSize, selectedTags: new Set(selectedTags), search });
+  const snapshotView = (): ListViewSnapshot => ({
+    folder: activeFolder,
+    page,
+    pageSize,
+    selectedTags: new Set(selectedTags),
+    search
+  });
   const restoreView = (snapshot: ListViewSnapshot): void => {
+    activeFolder = snapshot.folder;
     page = snapshot.page;
     pageSize = snapshot.pageSize;
     selectedTags = new Set(snapshot.selectedTags);
@@ -163,8 +244,14 @@ export async function runView(options: ViewOptions): Promise<number> {
     );
 
   let notice: string | null = null;
-  for (;;) {
-    const visible = filterMessages(all, selectedTags, search);
+  try {
+    for (;;) {
+    // Background hydration never writes to the active prompt. Refreshing the
+    // local snapshot at each redraw makes its newly committed rows appear on
+    // the next user interaction without racing terminal output.
+    all = messagesRepo.listForAccount(account.accountHash);
+    const folderMessages = all.filter((message) => messageIsInViewFolder(message.labelSnapshot, activeFolder));
+    const visible = filterMessages(folderMessages, selectedTags, viewFolderSupportsSearch(activeFolder) ? search : "");
     const totalPages = Math.max(1, Math.ceil(visible.length / pageSize));
     page = Math.min(page, totalPages - 1);
     const pageItems = visible.slice(page * pageSize, (page + 1) * pageSize);
@@ -183,7 +270,9 @@ export async function runView(options: ViewOptions): Promise<number> {
           ctx,
           getStyleProfile,
           messageIndex > 0,
-          messageIndex < visible.length - 1
+          messageIndex < visible.length - 1,
+          operations.runExclusive,
+          retainInProgressiveSnapshot
         );
         openedNotice = opened.notice;
         if (opened.trashedRecord) lastTrashed = opened.trashedRecord;
@@ -195,19 +284,40 @@ export async function runView(options: ViewOptions): Promise<number> {
       return { notice: openedNotice };
     };
 
-    renderList(pageItems, { page, totalPages, pageSize, total: visible.length, selectedTags, search, labelNames, notice, selectedRow });
+    renderList(pageItems, {
+      folder: activeFolder,
+      folderCounts: countViewFolders(all),
+      folderLoad: progressiveCache.current?.status(activeFolder) ?? null,
+      backgroundError: progressiveCache.current?.error !== null && progressiveCache.current?.error !== undefined,
+      waitingForAccountLock: progressiveCache.current?.waitingForAccountLock ?? false,
+      page,
+      totalPages,
+      pageSize,
+      total: visible.length,
+      selectedTags,
+      search: viewFolderSupportsSearch(activeFolder) ? search : "",
+      labelNames,
+      notice,
+      selectedRow
+    });
     notice = null;
     const input = await readCommandLine("> ", ["left", "right", "up", "down"]);
     if (input.kind === "cancel") {
       // Esc always goes "home" (default Inbox filter, no search, first
       // page) instead of quitting — quitting is q/Ctrl-C only. Useful
       // after a search or a deep filter/page-history dive.
-      if (search || !sameSet(selectedTags, homeTags) || page !== 0) {
+      if (activeFolder !== "inbox" || search || selectedTags.size > 0 || page !== 0) {
         rememberView();
+        activeFolder = "inbox";
         search = "";
-        selectedTags = new Set(homeTags);
+        selectedTags = new Set();
         page = 0;
         selectedRow = 0;
+        if (progressiveCache.current) {
+          await progressiveCache.current.ensureFolder("inbox", pageSize, {
+            timeoutMs: VIEW_NAVIGATION_WAIT_MS
+          });
+        }
       }
       continue;
     }
@@ -221,11 +331,21 @@ export async function runView(options: ViewOptions): Promise<number> {
         }
         continue;
       }
-      const forward = input.name === "right";
-      if (forward ? page < totalPages - 1 : page > 0) {
-        rememberView();
-        page = forward ? page + 1 : page - 1;
-        selectedRow = 0;
+      if (input.name !== "left" && input.name !== "right") continue;
+      rememberView();
+      activeFolder = adjacentViewFolder(activeFolder, input.name);
+      page = 0;
+      selectedRow = 0;
+      selectedTags = new Set();
+      // Search is intentionally Inbox-only for now; changing folders clears
+      // it instead of pretending a partial local cache is a mailbox search.
+      search = "";
+      // One page is all a folder switch needs to draw; the rest of
+      // Archive/Trash/Spam keeps filling in behind the prompt.
+      if (progressiveCache.current) {
+        await progressiveCache.current.ensureFolder(activeFolder, pageSize, {
+          timeoutMs: VIEW_NAVIGATION_WAIT_MS
+        });
       }
       continue;
     }
@@ -241,8 +361,31 @@ export async function runView(options: ViewOptions): Promise<number> {
       continue;
     }
     if (cmd === "n") {
-      if (page < totalPages - 1) rememberView();
-      page = Math.min(page + 1, totalPages - 1);
+      if (progressiveCache.current) {
+        const status = progressiveCache.current.status(activeFolder);
+        const desired = search || selectedTags.size > 0
+          ? status.cached + pageSize
+          : (page + 2) * pageSize;
+        await progressiveCache.current.ensureFolder(activeFolder, desired, {
+          timeoutMs: VIEW_NAVIGATION_WAIT_MS
+        });
+        all = messagesRepo.listForAccount(account.accountHash);
+      }
+      const refreshedVisible = filterMessages(
+        all.filter((message) => messageIsInViewFolder(message.labelSnapshot, activeFolder)),
+        selectedTags,
+        viewFolderSupportsSearch(activeFolder) ? search : ""
+      );
+      const refreshedTotalPages = Math.max(1, Math.ceil(refreshedVisible.length / pageSize));
+      if (page < refreshedTotalPages - 1) {
+        rememberView();
+        page += 1;
+        selectedRow = 0;
+      } else {
+        notice = progressiveCache.current?.status(activeFolder).complete
+          ? "Already at the last page in this folder."
+          : "No additional cached messages are available yet.";
+      }
       continue;
     }
     if (cmd === "p") {
@@ -255,6 +398,11 @@ export async function runView(options: ViewOptions): Promise<number> {
       if (previous) {
         forwardStack.push(snapshotView());
         restoreView(previous);
+        if (progressiveCache.current) {
+          await progressiveCache.current.ensureFolder(activeFolder, (page + 1) * pageSize, {
+            timeoutMs: VIEW_NAVIGATION_WAIT_MS
+          });
+        }
       } else {
         notice = "No earlier view.";
       }
@@ -265,6 +413,11 @@ export async function runView(options: ViewOptions): Promise<number> {
       if (next) {
         backStack.push(snapshotView());
         restoreView(next);
+        if (progressiveCache.current) {
+          await progressiveCache.current.ensureFolder(activeFolder, (page + 1) * pageSize, {
+            timeoutMs: VIEW_NAVIGATION_WAIT_MS
+          });
+        }
       } else {
         notice = "No later view.";
       }
@@ -277,6 +430,11 @@ export async function runView(options: ViewOptions): Promise<number> {
         rememberView();
         pageSize = nextSize;
         page = Math.floor(firstVisibleIndex / pageSize);
+        if (progressiveCache.current) {
+          await progressiveCache.current.ensureFolder(activeFolder, (page + 1) * pageSize, {
+            timeoutMs: VIEW_NAVIGATION_WAIT_MS
+          });
+        }
       }
       continue;
     }
@@ -288,11 +446,16 @@ export async function runView(options: ViewOptions): Promise<number> {
         rememberView();
         pageSize = nextSize;
         page = Math.floor(firstVisibleIndex / pageSize);
+        if (progressiveCache.current) {
+          await progressiveCache.current.ensureFolder(activeFolder, (page + 1) * pageSize, {
+            timeoutMs: VIEW_NAVIGATION_WAIT_MS
+          });
+        }
       }
       continue;
     }
     if (cmd === "f" || cmd === "t") {
-      const nextTags = await chooseTags(collectDistinctTags(all), selectedTags, labelNames);
+      const nextTags = await chooseTags(collectDistinctTags(folderMessages), selectedTags, labelNames);
       if (!sameSet(nextTags, selectedTags)) {
         rememberView();
         selectedTags = nextTags;
@@ -301,6 +464,10 @@ export async function runView(options: ViewOptions): Promise<number> {
       continue;
     }
     if (cmd === "s") {
+      if (!viewFolderSupportsSearch(activeFolder)) {
+        notice = "Search is currently available only in Inbox.";
+        continue;
+      }
       if (search) {
         rememberView();
         search = "";
@@ -310,6 +477,10 @@ export async function runView(options: ViewOptions): Promise<number> {
     }
     const searchMatch = /^s\s+(.+)$/.exec(cmd);
     if (searchMatch) {
+      if (!viewFolderSupportsSearch(activeFolder)) {
+        notice = "Search is currently available only in Inbox.";
+        continue;
+      }
       const nextSearch = searchMatch[1]!.trim();
       if (nextSearch !== search) {
         rememberView();
@@ -319,9 +490,15 @@ export async function runView(options: ViewOptions): Promise<number> {
       continue;
     }
     if (cmd === "u") {
+      if (progressiveCache.current) {
+        await progressiveCache.current.stop();
+        progressiveCache.current = null;
+      }
       const latestAccount = new AccountsRepository(ctx.db).get(account.accountHash) ?? account;
-      refresh = await refreshViewCacheLocked(ctx, gmailClient, latestAccount);
-      if (refresh.kind === "full_required") await runCache();
+      refresh = await operations.runExclusive(() =>
+        refreshViewCache(ctx.db, gmailClient, latestAccount, ctx.clock.nowIso())
+      );
+      if (refresh.kind === "full_required") await beginProgressiveCache(activeFolder);
       account = new AccountsRepository(ctx.db).get(account.accountHash) ?? account;
       all = messagesRepo.listForAccount(account.accountHash);
       labelNames = await loadLabelNames(gmailClient);
@@ -329,13 +506,21 @@ export async function runView(options: ViewOptions): Promise<number> {
         rememberView();
         page = 0;
       }
-      notice = "Inbox updated.";
+      notice = "Mail updated.";
       continue;
     }
     if (cmd === "c" || cmd === "a" || cmd === ";c") {
       // "c" asks how to write it, exactly as `gmail send` does; "a"/";c"
       // are the shortcut straight to an AI draft.
-      await handleCompose(gmailClient, account.accountHash, cmd === "c" ? undefined : true, ctx, getStyleProfile);
+      await handleCompose(
+        gmailClient,
+        account.accountHash,
+        cmd === "c" ? undefined : true,
+        ctx,
+        getStyleProfile,
+        {},
+        operations.runExclusive
+      );
       // Hold the send confirmation on screen; the list redraw would wipe it.
       console.log(pc.dim("\nPress any key to return to the list."));
       await waitForKeypress();
@@ -352,7 +537,7 @@ export async function runView(options: ViewOptions): Promise<number> {
       }
       const spinner = p.spinner();
       spinner.start("Refreshing your writing style from recent Sent mail");
-      const profile = await getStyleProfile(credentials, true);
+      const profile = await operations.runExclusive(() => getStyleProfile(credentials, true));
       spinner.stop(profile ? "Writing style saved — future replies/drafts will reuse it." : "Could not derive a writing style from Sent mail.");
       console.log(pc.dim("\nPress any key to return to the list."));
       await waitForKeypress();
@@ -365,13 +550,32 @@ export async function runView(options: ViewOptions): Promise<number> {
       }
       const toRestore = lastTrashed;
       try {
-        await untrashMessage(gmailClient, toRestore.gmailMessageId, toRestore.labelSnapshot);
-        messagesRepo.upsert(toRestore);
+        await operations.runExclusive(async () => {
+          await untrashMessage(gmailClient, toRestore.gmailMessageId, toRestore.labelSnapshot);
+          // Refresh the projection timestamp so a concurrent progressive
+          // snapshot that began before this undo cannot prune the restored
+          // row after its folder cursors have already passed it.
+          messagesRepo.upsert({ ...toRestore, processedAt: ctx.clock.nowIso() });
+        });
+        retainInProgressiveSnapshot(toRestore.gmailMessageId);
         all = messagesRepo.listForAccount(account.accountHash);
         lastTrashed = null;
         notice = `Restored "${toRestore.subject || "(no subject)"}".`;
       } catch (error) {
         notice = `Could not undo: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      continue;
+    }
+    if (cmd === "i") {
+      if (pageItems.length > 0) {
+        const target = pageItems[selectedRow]!;
+        const outcome = await operations.runExclusive(() =>
+          moveCachedToInbox(gmailClient, messagesRepo, target, ctx.clock.nowIso())
+        );
+        if (outcome.record) retainInProgressiveSnapshot(outcome.record.gmailMessageId);
+        notice = outcome.ok
+          ? `Moved "${outcome.record.subject || "(no subject)"}" to Inbox.`
+          : outcome.message;
       }
       continue;
     }
@@ -389,8 +593,11 @@ export async function runView(options: ViewOptions): Promise<number> {
       // is the following message — so repeating "dd" walks down the list.
       if (pageItems.length > 0) {
         const target = pageItems[selectedRow]!;
-        const outcome = await trashCached(gmailClient, messagesRepo, target);
+        const outcome = await operations.runExclusive(() =>
+          trashCached(gmailClient, messagesRepo, target, ctx.clock.nowIso())
+        );
         if (outcome.ok) {
+          retainInProgressiveSnapshot(outcome.record.gmailMessageId);
           lastTrashed = outcome.record;
           notice = `Moved "${outcome.record.subject || "(no subject)"}" to Trash. ";u" undoes it.`;
           all = messagesRepo.listForAccount(account.accountHash);
@@ -404,17 +611,30 @@ export async function runView(options: ViewOptions): Promise<number> {
       // Bare "d" — the arrow-key highlight's counterpart to "<n> d": deletes
       // whichever row is currently highlighted, without needing to type its
       // number first. Same reversible Trash move, same defaulted-to-yes
-      // confirmation, same instant local-cache removal and ";u" undo.
+      // confirmation, same instant local folder move and ";u" undo.
       if (pageItems.length > 0) {
-        const trashed = await handleQuickDelete(gmailClient, messagesRepo, pageItems[selectedRow]!);
-        if (trashed) lastTrashed = trashed;
+        if (activeFolder === "trash") {
+          notice = "Already in Trash; permanent deletion is never supported.";
+          continue;
+        }
+        const trashed = await handleQuickDelete(
+          gmailClient,
+          messagesRepo,
+          pageItems[selectedRow]!,
+          operations.runExclusive,
+          ctx.clock.nowIso()
+        );
+        if (trashed) {
+          retainInProgressiveSnapshot(trashed.gmailMessageId);
+          lastTrashed = trashed;
+        }
         console.log(pc.dim("\nPress any key to return to the list."));
         await waitForKeypress();
         all = messagesRepo.listForAccount(account.accountHash);
       }
       continue;
     }
-    // "<n> r" / "<n> ;r" / "<n> d" — act on a message directly from the
+    // "<n> r" / "<n> ;r" / "<n> d" / "<n> i" — act directly from the
     // list without the separate open-then-press-key steps. Reply/AI-reply
     // still open the message first (real content is needed to draft
     // against) and still show the full, unedited confirmation screen
@@ -427,11 +647,32 @@ export async function runView(options: ViewOptions): Promise<number> {
         const messageIndex = page * pageSize + index - 1;
         const target = visible[messageIndex]!;
         if (action === "delete") {
-          const trashed = await handleQuickDelete(gmailClient, messagesRepo, target);
-          if (trashed) lastTrashed = trashed;
+          if (folderForLabelSnapshot(target.labelSnapshot) === "trash") {
+            notice = "Already in Trash; permanent deletion is never supported.";
+            continue;
+          }
+          const trashed = await handleQuickDelete(
+            gmailClient,
+            messagesRepo,
+            target,
+            operations.runExclusive,
+            ctx.clock.nowIso()
+          );
+          if (trashed) {
+            retainInProgressiveSnapshot(trashed.gmailMessageId);
+            lastTrashed = trashed;
+          }
           console.log(pc.dim("\nPress any key to return to the list."));
           await waitForKeypress();
           all = messagesRepo.listForAccount(account.accountHash);
+        } else if (action === "move_to_inbox") {
+          const outcome = await operations.runExclusive(() =>
+            moveCachedToInbox(gmailClient, messagesRepo, target, ctx.clock.nowIso())
+          );
+          if (outcome.record) retainInProgressiveSnapshot(outcome.record.gmailMessageId);
+          notice = outcome.ok
+            ? `Moved "${outcome.record.subject || "(no subject)"}" to Inbox.`
+            : outcome.message;
         } else {
           const opened = await openMessage(
             gmailClient,
@@ -442,6 +683,8 @@ export async function runView(options: ViewOptions): Promise<number> {
             getStyleProfile,
             false,
             false,
+            operations.runExclusive,
+            retainInProgressiveSnapshot,
             action
           );
           notice = opened.notice;
@@ -459,14 +702,17 @@ export async function runView(options: ViewOptions): Promise<number> {
     }
     notice = `Unrecognized command: "${cmd}"`;
   }
-
+  } finally {
+    await progressiveCache.current?.stop();
+    await operations.whenIdle();
+  }
   return EXIT_CODES.ok;
 }
 
 export interface QuickAction {
   /** 1-based, as shown in the list — the caller still validates it against the current page's item count. */
   index: number;
-  action: "reply" | "ai_reply" | "delete";
+  action: "reply" | "ai_reply" | "delete" | "move_to_inbox";
 }
 
 /**
@@ -478,11 +724,18 @@ export interface QuickAction {
  * "Interactive reply" — there is no path that skips that confirmation).
  */
 export function parseQuickActionCommand(cmd: string): QuickAction | null {
-  const match = /^(\d+)\s*(;r|r|d)$/.exec(cmd.trim());
+  const match = /^(\d+)\s*(;r|r|d|i)$/.exec(cmd.trim());
   if (!match) return null;
   const index = Number(match[1]);
   if (!Number.isInteger(index) || index < 1) return null;
-  const action = match[2] === ";r" ? "ai_reply" : match[2] === "r" ? "reply" : "delete";
+  const action =
+    match[2] === ";r"
+      ? "ai_reply"
+      : match[2] === "r"
+        ? "reply"
+        : match[2] === "i"
+          ? "move_to_inbox"
+          : "delete";
   return { index, action };
 }
 
@@ -496,20 +749,6 @@ export function adjustPageSize(current: number, direction: "larger" | "smaller")
 
 function sameSet(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
   return left.size === right.size && [...left].every((value) => right.has(value));
-}
-
-async function refreshViewCacheLocked(
-  ctx: ReturnType<typeof bootstrap>,
-  gmailClient: GmailClient,
-  account: AccountRecord
-): Promise<Awaited<ReturnType<typeof refreshViewCache>>> {
-  const lock = new ProcessLock(lockFilePath(account.accountHash));
-  lock.acquire();
-  try {
-    return await refreshViewCache(ctx.db, gmailClient, account, ctx.clock.nowIso());
-  } finally {
-    lock.release();
-  }
 }
 
 export function filterMessages(
@@ -551,6 +790,7 @@ function systemLabelNames(): Map<string, string> {
   return new Map<string, string>([
     [GMAIL_LABELS.inbox, "Inbox"],
     [GMAIL_LABELS.spam, "Spam"],
+    [GMAIL_LABELS.trash, "Trash"],
     [GMAIL_LABELS.unread, "Unread"],
     [GMAIL_LABELS.starred, "Starred"],
     [GMAIL_LABELS.important, "Important"],
@@ -565,7 +805,22 @@ function collectDistinctTags(messages: readonly CachedMessageRecord[]): string[]
   return [...new Set(messages.flatMap((message) => [...message.labelSnapshot]))].sort();
 }
 
+export function countViewFolders(messages: readonly CachedMessageRecord[]): Record<ViewFolderId, number> {
+  const counts: Record<ViewFolderId, number> = { inbox: 0, archive: 0, trash: 0, spam: 0 };
+  for (const message of messages) {
+    const folder = folderForLabelSnapshot(message.labelSnapshot);
+    if (folder) counts[folder] += 1;
+  }
+  return counts;
+}
+
 interface ListRenderState {
+  folder: ViewFolderId;
+  folderCounts: Readonly<Record<ViewFolderId, number>>;
+  folderLoad: ReturnType<ProgressiveViewCache["status"]> | null;
+  backgroundError: boolean;
+  /** Another gmail process owns the account lock, so loading is paused. */
+  waitingForAccountLock: boolean;
   page: number;
   totalPages: number;
   pageSize: number;
@@ -582,8 +837,28 @@ function renderList(items: readonly CachedMessageRecord[], state: ListRenderStat
   clearScreen();
   console.log("");
   console.log(
-    pc.bold(`Gmail — ${state.total} message(s), page ${state.page + 1}/${state.totalPages} (page size ${state.pageSize})`)
+    VIEW_FOLDERS.map((folder) => {
+      const label = ` ${folder.label} ${state.folderCounts[folder.id]} `;
+      return folder.id === state.folder ? pc.inverse(pc.bold(label)) : pc.dim(label);
+    }).join(" ")
   );
+  console.log("");
+  const stillLoading = state.folderLoad !== null && !state.folderLoad.complete && !state.backgroundError;
+  console.log(
+    pc.bold(
+      `Gmail ${viewFolderLabel(state.folder)} — ` +
+        `${state.total}${stillLoading ? "+" : ""} message(s), page ${state.page + 1}/${state.totalPages} ` +
+        `(page size ${state.pageSize})`
+    )
+  );
+  if (state.waitingForAccountLock) {
+    console.log(pc.yellow('Waiting for another gmail command to finish before loading more mail ("u" retries).'));
+  } else if (stillLoading) {
+    console.log(pc.dim("More mail is loading in the background."));
+  }
+  if (state.backgroundError || (state.folderLoad?.failed ?? 0) > 0) {
+    console.log(pc.yellow("Some mail could not be loaded; it will be retried in a later refresh."));
+  }
   const filters = [...state.selectedTags].map((tag) => state.labelNames.get(tag) ?? tag);
   if (filters.length > 0) console.log(pc.dim(`Labels: ${filters.join(", ")} (matching any)`));
   if (state.search) console.log(pc.dim(`Search: ${state.search}`));
@@ -624,56 +899,63 @@ async function openMessage(
   getStyleProfile: (credentials: ResolvedOpenAiCredentials, forceRefresh?: boolean) => Promise<string | null>,
   canGoPrevious: boolean,
   canGoNext: boolean,
+  runExclusive: ViewExclusiveRunner,
+  onCacheProjected: (messageId: string) => void,
   /** Dispatches this action immediately on open (the "<n> r"/"<n> ;r" list shortcut) instead of waiting for a keypress first. Still goes through the normal confirm-before-send flow — this only skips the separate open-then-press-key navigation step. */
   initialAction?: "reply" | "ai_reply"
 ): Promise<OpenedMessage> {
   const messagesRepo = new MessagesRepository(ctx.db);
   let raw;
-  const lock = new ProcessLock(lockFilePath(accountHash));
+  let activeCached = cached;
   try {
     // Keep the live read and its possible mark-read/cache projection in one
     // bounded critical section so a concurrent work run cannot archive or
     // trash the message between our fetch and local cache update.
-    lock.acquire();
-    raw = await fetchMessageFull(gmailClient, cached.gmailMessageId);
-    let currentLabelIds = raw.labelIds ?? [];
-    if (currentLabelIds.includes(GMAIL_LABELS.unread)) {
-      try {
-        await withGoogleApiRetry(
-          () =>
-            gmailClient.users.messages.modify({
-              userId: "me",
-              id: cached.gmailMessageId,
-              requestBody: { removeLabelIds: [GMAIL_LABELS.unread] }
-            }),
-          {},
-          0.25,
-          "gmail.messages.mark_read"
-        );
-        currentLabelIds = currentLabelIds.filter((label) => label !== GMAIL_LABELS.unread);
-        const projected = projectHydratedCacheMessage(
-          accountHash,
-          userEmail,
-          ctx.clock.nowIso(),
-          { id: cached.gmailMessageId, threadId: cached.gmailThreadId },
-          { ...raw, labelIds: currentLabelIds },
-          cached
-        );
-        if (projected) new MessagesRepository(ctx.db).upsert(projected);
-      } catch (error) {
-        console.error(
-          pc.yellow(`Message opened, but it could not be marked read: ${error instanceof Error ? error.message : String(error)}`)
-        );
+    raw = await runExclusive(async () => {
+      let fetched = await fetchMessageFull(gmailClient, cached.gmailMessageId);
+      let currentLabelIds = fetched.labelIds ?? [];
+      if (currentLabelIds.includes(GMAIL_LABELS.unread)) {
+        try {
+          await modifyMessageLabels(
+            gmailClient,
+            cached.gmailMessageId,
+            { addLabelIds: [], removeLabelIds: [GMAIL_LABELS.unread] },
+            "gmail.messages.mark_read"
+          );
+          currentLabelIds = currentLabelIds.filter((label) => label !== GMAIL_LABELS.unread);
+        } catch (error) {
+          console.error(
+            pc.yellow(`Message opened, but it could not be marked read: ${error instanceof Error ? error.message : String(error)}`)
+          );
+        }
       }
-    }
-    raw = { ...raw, labelIds: currentLabelIds };
+      // The live read is also authoritative about folder labels even when
+      // the message was already read. This keeps an externally archived,
+      // trashed, restored, or spammed row from lingering in the wrong tab.
+      const projected = projectHydratedCacheMessage(
+        accountHash,
+        userEmail,
+        ctx.clock.nowIso(),
+        { id: cached.gmailMessageId, threadId: cached.gmailThreadId },
+        { ...fetched, labelIds: currentLabelIds },
+        messagesRepo.get(accountHash, cached.gmailMessageId) ?? cached,
+        "view"
+      );
+      if (projected) {
+        messagesRepo.upsert(projected);
+        activeCached = projected;
+        onCacheProjected(projected.gmailMessageId);
+      } else {
+        messagesRepo.delete(accountHash, cached.gmailMessageId);
+      }
+      fetched = { ...fetched, labelIds: currentLabelIds };
+      return fetched;
+    });
   } catch (error) {
     return {
       navigation: "back",
       notice: `Could not open this message: ${error instanceof Error ? error.message : String(error)}`
     };
-  } finally {
-    lock.release();
   }
 
   const labelIds = raw.labelIds ?? [];
@@ -700,7 +982,9 @@ async function openMessage(
     if (edge) console.log(pc.yellow(edge));
     console.log(
       pc.dim(
-        "\n[esc] list   [←/p] previous   [→/n] next   [r] reply   [;][r] AI reply   [d] delete" +
+        "\n[esc] list   [←/p] previous   [→/n] next   [r] reply   [;][r] AI reply" +
+          (folderForLabelSnapshot(activeCached.labelSnapshot) !== "trash" ? "   [d] delete" : "") +
+          (folderForLabelSnapshot(activeCached.labelSnapshot) !== "inbox" ? "   [i] move to Inbox" : "") +
           (links.length > 0 ? "   [l] show link URLs   [o] open link in browser" : "")
       )
     );
@@ -720,8 +1004,8 @@ async function openMessage(
     // deliberately run below the message rather than over a cleared screen;
     // the next loop pass redraws once the exchange is finished.
     if (action === "reply" || action === "ai_reply") {
-      if (action === "reply") await handleManualReply(gmailClient, accountHash, message);
-      else await handleAiReply(gmailClient, accountHash, ctx, message, getStyleProfile);
+      if (action === "reply") await handleManualReply(gmailClient, accountHash, message, runExclusive);
+      else await handleAiReply(gmailClient, accountHash, ctx, message, getStyleProfile, runExclusive);
       // Hold the send confirmation on screen; the redraw above would wipe it.
       console.log(pc.dim("\nPress any key to return to the message."));
       await waitForKeypress();
@@ -738,10 +1022,36 @@ async function openMessage(
       await waitForKeypress();
     }
     if (action === "delete") {
-      const trashed = await confirmAndTrash(gmailClient, messagesRepo, cached);
+      if (folderForLabelSnapshot(activeCached.labelSnapshot) === "trash") {
+        edge = "Already in Trash; permanent deletion is never supported.";
+        continue;
+      }
+      const trashed = await confirmAndTrash(
+        gmailClient,
+        messagesRepo,
+        activeCached,
+        runExclusive,
+        ctx.clock.nowIso()
+      );
       console.log(pc.dim("\nPress any key to return to the list."));
       await waitForKeypress();
-      if (trashed) return { navigation: "back", notice: "Moved to Trash. \";u\" undoes it.", trashedRecord: trashed };
+      if (trashed) {
+        onCacheProjected(trashed.gmailMessageId);
+        return { navigation: "back", notice: "Moved to Trash. \";u\" undoes it.", trashedRecord: trashed };
+      }
+    }
+    if (action === "move_to_inbox") {
+      const outcome = await runExclusive(() =>
+        moveCachedToInbox(gmailClient, messagesRepo, activeCached, ctx.clock.nowIso())
+      );
+      if (outcome.record) {
+        activeCached = outcome.record;
+        onCacheProjected(outcome.record.gmailMessageId);
+      }
+      if (outcome.ok) {
+        return { navigation: "back", notice: `Moved "${outcome.record.subject || "(no subject)"}" to Inbox.` };
+      }
+      edge = outcome.message;
     }
     if (action === "open_link") {
       console.log("");
@@ -778,14 +1088,16 @@ async function openMessage(
  * confirm (unlike every send confirmation in this app, which defaults to
  * "no") because this action is reversible two ways: Gmail's own Trash and,
  * within this session, ";u" (see `runView`'s `lastTrashed`) — the returned
- * record is exactly what a caller needs to offer that quick undo. Removes
- * the row from the local cache immediately so the list reflects the
- * change without waiting for the next Gmail history sync.
+ * record is exactly what a caller needs to offer that quick undo. The local
+ * row moves to the Trash projection immediately, so it disappears from its
+ * old folder and appears in the Trash tab without another Gmail sync.
  */
 async function confirmAndTrash(
   gmailClient: GmailClient,
   messagesRepo: MessagesRepository,
-  cached: CachedMessageRecord
+  cached: CachedMessageRecord,
+  runExclusive: ViewExclusiveRunner,
+  nowIso: string
 ): Promise<CachedMessageRecord | null> {
   console.log("");
   const confirmed = await p.confirm({ message: `Move "${cached.subject || "(no subject)"}" to Trash?`, initialValue: true });
@@ -793,7 +1105,7 @@ async function confirmAndTrash(
     console.log(pc.dim("Not deleted."));
     return null;
   }
-  const outcome = await trashCached(gmailClient, messagesRepo, cached);
+  const outcome = await runExclusive(() => trashCached(gmailClient, messagesRepo, cached, nowIso));
   if (!outcome.ok) {
     console.error(pc.red(outcome.message));
     return null;
@@ -807,8 +1119,8 @@ async function confirmAndTrash(
  *
  * Separated from `confirmAndTrash` so the unprompted "dd" path and the
  * confirmed "d" path cannot diverge on what deleting actually does: the
- * same reversible `messages.trash`, the same immediate local-cache
- * eviction, and the same returned record that makes ";u" able to undo it.
+ * same reversible `messages.trash`, the same immediate local folder move,
+ * and the same returned record that makes ";u" able to undo it.
  * Only the question in front of it differs. Returns null on failure after
  * reporting it, so a caller never records an undo for a delete that did
  * not happen.
@@ -820,11 +1132,18 @@ export type TrashOutcome =
 export async function trashCached(
   gmailClient: GmailClient,
   messagesRepo: MessagesRepository,
-  cached: CachedMessageRecord
+  cached: CachedMessageRecord,
+  nowIso = cached.processedAt
 ): Promise<TrashOutcome> {
+  if (folderForLabelSnapshot(cached.labelSnapshot) === "trash") {
+    return { ok: false, message: "Already in Trash; permanent deletion is never supported." };
+  }
   try {
     await trashMessage(gmailClient, cached.gmailMessageId);
-    messagesRepo.delete(cached.accountHash, cached.gmailMessageId);
+    const labels = cached.labelSnapshot.filter(
+      (label) => label !== GMAIL_LABELS.inbox && label !== GMAIL_LABELS.spam && label !== GMAIL_LABELS.trash
+    );
+    messagesRepo.upsert(invalidateCachedAssessment(cached, [...labels, GMAIL_LABELS.trash], nowIso));
     return { ok: true, record: cached };
   } catch (error) {
     // Returned rather than printed: "dd" deliberately has no "press any key"
@@ -834,13 +1153,123 @@ export async function trashCached(
   }
 }
 
+export type MoveToInboxOutcome =
+  | { ok: true; record: CachedMessageRecord }
+  | { ok: false; message: string; record?: CachedMessageRecord };
+
+/**
+ * The single `i` action used by Archive, Trash, and Spam. Trash must first
+ * use Gmail's untrash endpoint; Spam is removed explicitly; Archive simply
+ * regains INBOX. The cached assessment is invalidated because restoring a
+ * message to Inbox changes cleanup policy inputs.
+ */
+export async function moveCachedToInbox(
+  gmailClient: GmailClient,
+  messagesRepo: MessagesRepository,
+  cached: CachedMessageRecord,
+  nowIso = cached.processedAt
+): Promise<MoveToInboxOutcome> {
+  const folder = folderForLabelSnapshot(cached.labelSnapshot);
+  if (folder === "inbox") return { ok: false, message: "This message is already in Inbox." };
+  if (folder === null) return { ok: false, message: "This message is not in a browsable Gmail folder." };
+
+  try {
+    if (folder === "trash") {
+      // Never pass the cached Trash snapshot here: doing so would re-add the
+      // TRASH label immediately after Gmail removed it.
+      await untrashMessage(gmailClient, cached.gmailMessageId);
+      try {
+        await modifyMessageLabels(
+          gmailClient,
+          cached.gmailMessageId,
+          {
+            addLabelIds: [GMAIL_LABELS.inbox],
+            removeLabelIds: cached.labelSnapshot.includes(GMAIL_LABELS.spam) ? [GMAIL_LABELS.spam] : []
+          },
+          "gmail.messages.move_from_trash_to_inbox"
+        );
+      } catch (error) {
+        // `untrash` and `modify` are two Gmail operations. If the first
+        // succeeds but the Inbox add fails, keeping a TRASH projection would
+        // be observably wrong. Preserve the successful partial remote state;
+        // the user can press i again from Archive/Spam to finish the move.
+        const partialRecord = invalidateCachedAssessment(
+          cached,
+          cached.labelSnapshot.filter((label) => label !== GMAIL_LABELS.trash),
+          nowIso
+        );
+        try {
+          messagesRepo.upsert(partialRecord);
+        } catch {
+          // Gmail is authoritative; a later refresh will reconcile a local
+          // write failure without pretending the Inbox step succeeded.
+        }
+        return {
+          ok: false,
+          message:
+            "Restored from Trash, but could not move to Inbox: " +
+            (error instanceof Error ? error.message : String(error)),
+          record: partialRecord
+        };
+      }
+    } else {
+      await modifyMessageLabels(
+        gmailClient,
+        cached.gmailMessageId,
+        {
+          addLabelIds: [GMAIL_LABELS.inbox],
+          removeLabelIds: folder === "spam" ? [GMAIL_LABELS.spam] : []
+        },
+        folder === "spam" ? "gmail.messages.not_spam" : "gmail.messages.unarchive"
+      );
+    }
+
+    const labels = cached.labelSnapshot.filter(
+      (label) => label !== GMAIL_LABELS.trash && label !== GMAIL_LABELS.spam && label !== GMAIL_LABELS.inbox
+    );
+    const record = invalidateCachedAssessment(cached, [...labels, GMAIL_LABELS.inbox], nowIso);
+    messagesRepo.upsert(record);
+    return { ok: true, record };
+  } catch (error) {
+    return {
+      ok: false,
+      message: `Could not move to Inbox: ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+}
+
+export function invalidateCachedAssessment(
+  cached: CachedMessageRecord,
+  labelSnapshot: readonly string[],
+  processedAt: string
+): CachedMessageRecord {
+  return {
+    ...cached,
+    labelSnapshot: [...new Set(labelSnapshot)],
+    classifierVersion: null,
+    promptVersion: null,
+    schemaVersion: null,
+    policyVersion: null,
+    assessmentKind: null,
+    assessmentConfidence: null,
+    importanceScore: null,
+    importanceConfidence: null,
+    reasonCodes: null,
+    category: null,
+    assessmentHadEvent: null,
+    processedAt
+  };
+}
+
 /** List-view fast path ("<n> d"): trashes by ID without a live full-message fetch first, since deleting needs nothing from the body. */
 async function handleQuickDelete(
   gmailClient: GmailClient,
   messagesRepo: MessagesRepository,
-  cached: CachedMessageRecord
+  cached: CachedMessageRecord,
+  runExclusive: ViewExclusiveRunner,
+  nowIso: string
 ): Promise<CachedMessageRecord | null> {
-  return confirmAndTrash(gmailClient, messagesRepo, cached);
+  return confirmAndTrash(gmailClient, messagesRepo, cached, runExclusive, nowIso);
 }
 
 export interface DisplayLink {
@@ -924,7 +1353,16 @@ function renderMessage(message: NormalizedMessage, labelIds: readonly string[]):
   return links;
 }
 
-type ViewerAction = "back" | "previous" | "next" | "reply" | "ai_reply" | "delete" | "links" | "open_link";
+type ViewerAction =
+  | "back"
+  | "previous"
+  | "next"
+  | "reply"
+  | "ai_reply"
+  | "delete"
+  | "move_to_inbox"
+  | "links"
+  | "open_link";
 
 interface OpenedMessage {
   navigation: "back" | "previous" | "next";
@@ -945,6 +1383,7 @@ async function waitForViewerAction(): Promise<ViewerAction> {
     if (key.name === "r" && lastName === ";" && Date.now() - lastAt < 1000) return "ai_reply";
     if (key.name === "r") return "reply";
     if (key.name === "d") return "delete";
+    if (key.name === "i") return "move_to_inbox";
     if (key.name === "l") return "links";
     if (key.name === "o") return "open_link";
     lastName = key.name;
@@ -952,7 +1391,12 @@ async function waitForViewerAction(): Promise<ViewerAction> {
   }
 }
 
-async function handleManualReply(gmailClient: GmailClient, accountHash: string, message: NormalizedMessage): Promise<void> {
+async function handleManualReply(
+  gmailClient: GmailClient,
+  accountHash: string,
+  message: NormalizedMessage,
+  runExclusive: ViewExclusiveRunner
+): Promise<void> {
   const target = buildReplyTarget(message);
   if (!target) {
     console.log(pc.red("This message has no usable address to reply to."));
@@ -963,7 +1407,7 @@ async function handleManualReply(gmailClient: GmailClient, accountHash: string, 
     console.log(pc.dim("Cancelled."));
     return;
   }
-  await confirmAndSend(gmailClient, accountHash, target, body);
+  await confirmAndSend(gmailClient, accountHash, target, body, runExclusive);
 }
 
 async function handleAiReply(
@@ -971,7 +1415,8 @@ async function handleAiReply(
   accountHash: string,
   ctx: ReturnType<typeof bootstrap>,
   message: NormalizedMessage,
-  getStyleProfile: (credentials: ResolvedOpenAiCredentials, forceRefresh?: boolean) => Promise<string | null>
+  getStyleProfile: (credentials: ResolvedOpenAiCredentials, forceRefresh?: boolean) => Promise<string | null>,
+  runExclusive: ViewExclusiveRunner
 ): Promise<void> {
   const target = buildReplyTarget(message);
   if (!target) {
@@ -990,7 +1435,7 @@ async function handleAiReply(
   if (p.isCancel(guidance)) return;
   const spinner = p.spinner();
   spinner.start("Drafting");
-  const styleProfile = await getStyleProfile(credentials);
+  const styleProfile = await runExclusive(() => getStyleProfile(credentials));
   const draft = await draftReply(message, credentials, { styleProfile, guidance });
   spinner.stop(draft ? "Draft ready." : "Could not draft a reply.");
   if (!draft) return;
@@ -999,5 +1444,5 @@ async function handleAiReply(
     console.log(pc.dim("Discarded."));
     return;
   }
-  await confirmAndSend(gmailClient, accountHash, target, edited);
+  await confirmAndSend(gmailClient, accountHash, target, edited, runExclusive);
 }

@@ -8,6 +8,7 @@ import {
   headersFromMessage,
   listAllMessageIds,
   listHistorySince,
+  listMessagePage,
   fetchMessageFull,
   type HistorySyncResult,
   type MailboxProfile,
@@ -147,6 +148,23 @@ export interface OrchestratorDeps {
   loadSentThreadIds?: () => Promise<ReadonlySet<string>>;
   /** True when the Sent index could not be built; Trash must be held for review. */
   sentThreadIndexUnavailable?: boolean;
+  /**
+   * Gmail's `internalDate` for every message this account has cached
+   * locally, keyed by message ID. Used only to rank a `--limit` run's
+   * queue newest-first: the queue is assembled from a Gmail history page
+   * and the local backlog, neither of which arrives in recency order, so
+   * without a real date to sort on a capped run picks an essentially
+   * arbitrary subset of the mailbox.
+   */
+  cachedInternalDates?: ReadonlyMap<string, string>;
+  /**
+   * Whether the local cache was refreshed recently enough to answer "which
+   * mail is newest" on its own. When false, a `--limit` run spends two
+   * cheap bounded `messages.list` calls (Inbox and native Spam, newest
+   * first) to find the most recent messages rather than trusting stale
+   * local dates. See `commands/work.ts`'s `latestCacheRefreshAt`.
+   */
+  cacheRecencyIsFresh?: boolean;
   /**
    * Work from what is already cached instead of asking Gmail what changed.
    *
@@ -734,6 +752,84 @@ async function runFullScan(
   };
 }
 
+/**
+ * Picks the `limit` most recent messages out of a capped run's queue.
+ *
+ * The queue is a union of the local backlog and one Gmail history page,
+ * and neither is in recency order — history pages are chronological
+ * *oldest*-first, and they are appended after the backlog. Slicing that
+ * insertion order therefore kept stale backlog rows and discarded exactly
+ * the newly-arrived mail the run most needed to look at, which is what
+ * made a capped run's "most recent unread" wrong.
+ *
+ * Ranking, newest first:
+ *   1. messages Gmail just told us are the newest in Inbox/native Spam
+ *      (listed newest-first, so list position *is* the ranking);
+ *   2. messages with a locally cached `internalDate`, most recent first;
+ *   3. anything still undated, in queue order.
+ *
+ * Step 1 is skipped when the local cache was refreshed recently enough to
+ * rank recency by itself (`cacheRecencyIsFresh`), so the common warm case
+ * still costs no extra Gmail calls.
+ */
+async function selectMostRecentStubs(
+  queued: readonly MessageStub[],
+  limit: number,
+  deps: OrchestratorDeps,
+  diagnostics: ScanDiagnostics
+): Promise<{ selected: MessageStub[]; consideredCount: number }> {
+  const byId = new Map(queued.map((stub) => [stub.id, stub] as const));
+  const listedRank = new Map<string, number>();
+
+  if (deps.cacheRecencyIsFresh !== true) {
+    const listingStartedAt = performance.now();
+    const pageSize = Math.max(1, Math.min(500, limit));
+    // Newest-first and bounded to the cap, so this costs two cheap list
+    // calls regardless of mailbox size. Any newest message missing from
+    // the queue is added: a capped run that cannot even see the most
+    // recent mail is the bug being fixed, not a saving.
+    const [inboxPage, spamPage] = await Promise.all([
+      listMessagePage(deps.gmailClient, {
+        labelIds: [GMAIL_LABELS.inbox],
+        includeSpamTrash: false,
+        maxResults: pageSize
+      }).catch(() => null),
+      listMessagePage(deps.gmailClient, {
+        labelIds: [GMAIL_LABELS.spam],
+        includeSpamTrash: true,
+        maxResults: pageSize
+      }).catch(() => null)
+    ]);
+    diagnostics.listingMs += performance.now() - listingStartedAt;
+    for (const page of [inboxPage, spamPage]) {
+      if (!page) continue;
+      page.messages.forEach((stub, index) => {
+        if (!byId.has(stub.id)) byId.set(stub.id, stub);
+        const existing = listedRank.get(stub.id);
+        if (existing === undefined || index < existing) listedRank.set(stub.id, index);
+      });
+    }
+  }
+
+  const candidates = [...byId.values()];
+  const dates = deps.cachedInternalDates;
+  const queueOrder = new Map(candidates.map((stub, index) => [stub.id, index] as const));
+  const rankOf = (stub: MessageStub): [number, number, number] => {
+    const listed = listedRank.get(stub.id);
+    if (listed !== undefined) return [0, listed, 0];
+    const internalDate = dates?.get(stub.id);
+    const parsed = internalDate !== undefined && /^\d+$/.test(internalDate) ? Number(internalDate) : null;
+    if (parsed !== null) return [1, -parsed, 0];
+    return [2, 0, queueOrder.get(stub.id) ?? 0];
+  };
+  const sorted = candidates
+    .map((stub) => ({ stub, rank: rankOf(stub) }))
+    .sort((a, b) => a.rank[0] - b.rank[0] || a.rank[1] - b.rank[1] || a.rank[2] - b.rank[2])
+    .map((entry) => entry.stub);
+
+  return { selected: sorted.slice(0, limit), consideredCount: candidates.length };
+}
+
 async function runIncrementalScan(
   deps: OrchestratorDeps,
   userEmail: string,
@@ -756,9 +852,14 @@ async function runIncrementalScan(
   diagnostics.cachedBacklogQueued = [...workById.keys()].filter((id) => !history.changedMessages.has(id)).length;
   let stubs = [...workById.values()];
   let truncationNote: string | null = null;
-  if (deps.limit !== undefined && stubs.length > deps.limit) {
-    truncationNote = `--limit applied: processing ${deps.limit} of ${stubs.length} queued message(s); the history baseline will be cleared so an uncapped later run can safely recover the rest.`;
-    stubs = stubs.slice(0, deps.limit);
+  if (deps.limit !== undefined) {
+    const selection = await selectMostRecentStubs([...workById.values()], deps.limit, deps, diagnostics);
+    if (selection.consideredCount > deps.limit) {
+      truncationNote =
+        `--limit applied: processing the ${deps.limit} most recent of ${selection.consideredCount} queued message(s); ` +
+        "the history baseline will be cleared so an uncapped later run can safely recover the rest.";
+    }
+    stubs = selection.selected;
   }
 
   const fetchStartedAt = performance.now();
@@ -855,15 +956,21 @@ function applyLabelBatchThreshold(
     for (const action of outcome.decision.actions) {
       if (action.type === "label" && action.reasonCode.startsWith("ai_category:")) {
         const key = action.labelName.trim().toLowerCase();
-        const alreadyVoted = priorVotedMessageIds.get(key)?.has(outcome.gmailMessageId) ?? false;
-        if (alreadyVoted) {
-          continue;
+        // The group is registered even for a message that already voted in
+        // an earlier run. Skipping the message entirely also removed its
+        // category from `groups`, and therefore from `eligibleKeys` — so a
+        // label that already exists in Gmail (which needs no threshold at
+        // all) was silently never applied whenever every message proposing
+        // it had voted before. Only the *count* dedupes; eligibility and
+        // display-name normalization still need to see the category.
+        let group = groups.get(key);
+        if (!group) {
+          group = { newMessageIds: new Set<string>(), displayName: action.labelName.trim() };
+          groups.set(key, group);
         }
-        const group = groups.get(key);
-        if (group) {
+        const alreadyVoted = priorVotedMessageIds.get(key)?.has(outcome.gmailMessageId) ?? false;
+        if (!alreadyVoted) {
           group.newMessageIds.add(outcome.gmailMessageId);
-        } else {
-          groups.set(key, { newMessageIds: new Set([outcome.gmailMessageId]), displayName: action.labelName.trim() });
         }
       }
     }

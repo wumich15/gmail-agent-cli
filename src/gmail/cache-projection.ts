@@ -3,6 +3,9 @@ import type { CachedMessageRecord } from "../state/repositories/messages.js";
 import { buildNormalizedMessage, extractBodyParts } from "./normalize.js";
 import { GMAIL_LABELS } from "./labels.js";
 import { headersFromMessage, type MessageStub } from "./scanner.js";
+import { isViewCacheMessage } from "./view-folders.js";
+
+export type CacheProjectionScope = "working_set" | "view";
 
 /** Builds only the offline projection; message bodies never leave this call. */
 export function projectHydratedCacheMessage(
@@ -11,13 +14,16 @@ export function projectHydratedCacheMessage(
   processedAt: string,
   stub: MessageStub,
   raw: gmail_v1.Schema$Message,
-  existing: CachedMessageRecord | null
+  existing: CachedMessageRecord | null,
+  scope: CacheProjectionScope = "working_set"
 ): CachedMessageRecord | null {
   if (raw.id && raw.id !== stub.id) throw new Error("Gmail returned a different message ID.");
   const labelIds = raw.labelIds ?? [];
-  // Mail can be archived or trashed between listing and hydration. A fresh
-  // response is authoritative; do not retain it in the Inbox/Spam cache.
-  if (!labelIds.includes(GMAIL_LABELS.inbox) && !labelIds.includes(GMAIL_LABELS.spam)) return null;
+  // Cleanup only works against Inbox/Spam, while gmail view deliberately
+  // retains its broader Inbox/Archive/Trash/Spam surface. Callers choose the
+  // scope explicitly so broadening the viewer never broadens automation.
+  const inWorkingSet = labelIds.includes(GMAIL_LABELS.inbox) || labelIds.includes(GMAIL_LABELS.spam);
+  if (scope === "working_set" ? !inWorkingSet : !isViewCacheMessage(labelIds)) return null;
 
   const threadId = raw.threadId ?? stub.threadId;
   const { plain, html } = extractBodyParts(raw.payload ?? undefined);

@@ -15,7 +15,7 @@ import { renderExecutiveSummary, renderHumanSummary, renderImportantEmailsParagr
 import { renderJsonSummary, type JsonSummaryOutput } from "../summary/render-json.js";
 import { EXIT_CODES } from "../core/errors.js";
 import { newRuleGroupId, newRunId } from "../core/ids.js";
-import { ProcessLock } from "../core/lock.js";
+import { DEFAULT_LOCK_WAIT_MS, ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 import { DEFAULT_GMAIL_READ_CONCURRENCY } from "../config/schema.js";
 import { SETTING_KEYS, SettingsRepository } from "../state/repositories/settings.js";
@@ -292,7 +292,7 @@ export async function runWork(options: WorkOptions): Promise<number> {
   console.error(pc.dim(description));
 
   const lock = options.dryRun ? null : new ProcessLock(lockFilePath(account.accountHash));
-  lock?.acquire();
+  lock?.acquire({ waitMs: DEFAULT_LOCK_WAIT_MS });
 
   ctx.logger.info({ accountHash: account.accountHash, dryRun: options.dryRun }, "work_run_start");
   const diagnosticsLog = startRunDiagnostics(ctx.logger, "work", options.limit);
@@ -440,13 +440,18 @@ export async function runWork(options: WorkOptions): Promise<number> {
     const lastCacheRefreshAt = latestCacheRefreshAt(ctx.db, account.accountHash);
     const cacheAgeMs =
       lastCacheRefreshAt !== null ? Date.parse(ctx.clock.nowIso()) - Date.parse(lastCacheRefreshAt) : null;
-    const preferCache =
-      account.historyMarker !== null &&
-      cachedBacklogStubs.length > 0 &&
+    // Whether the local cache is recent enough to be trusted about which
+    // mail is newest. `--limit` needs exactly this question answered: when
+    // it is false, the run spends two bounded newest-first list calls
+    // finding the most recent messages instead of ranking by stale local
+    // dates (see the orchestrator's selectMostRecentStubs).
+    const cacheRecencyIsFresh =
       cacheAgeMs !== null &&
       Number.isFinite(cacheAgeMs) &&
       cacheAgeMs >= 0 &&
       cacheAgeMs < CACHE_FIRST_FRESHNESS_MS;
+    const preferCache =
+      account.historyMarker !== null && cachedBacklogStubs.length > 0 && cacheRecencyIsFresh;
     if (preferCache) {
       console.error(
         pc.dim(
@@ -488,6 +493,12 @@ export async function runWork(options: WorkOptions): Promise<number> {
       cachePolicyVersion,
       cachedAssessments,
       cachedBacklogStubs,
+      cachedInternalDates: new Map(
+        cachedRows
+          .filter((row): row is typeof row & { internalDate: string } => row.internalDate !== null)
+          .map((row) => [row.gmailMessageId, row.internalDate] as const)
+      ),
+      cacheRecencyIsFresh,
       preferCache,
       loadSentThreadIds,
       progress: createClassifierProgress({ interactive: !options.json }),

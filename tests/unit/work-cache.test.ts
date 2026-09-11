@@ -6,6 +6,7 @@ import { latestCacheRefreshAt, selectCachedBacklogStubs, type CurrentCacheVersio
 import { openDatabase, type GmailAgentDatabase } from "../../src/state/database.js";
 import { SETTING_KEYS, SettingsRepository } from "../../src/state/repositories/settings.js";
 import type { CachedMessageRecord } from "../../src/state/repositories/messages.js";
+import { selectStaleWorkingCacheIds } from "../../src/commands/cache.js";
 
 const versions: CurrentCacheVersions = {
   classifierVersion: "openai:test",
@@ -120,5 +121,18 @@ describe("latestCacheRefreshAt", () => {
     new SettingsRepository(db).set("acct", SETTING_KEYS.viewLastRefreshAt, "2026-09-09T02:00:00.000Z", "now");
     expect(latestCacheRefreshAt(db, "acct")).toBe("2026-09-09T02:00:00.000Z");
     db.close();
+  });
+});
+
+describe("gmail cache working-set cleanup", () => {
+  it("removes stale Inbox/Spam rows without erasing Archive/Trash rows owned by gmail view", () => {
+    const rows = [
+      row({ gmailMessageId: "inbox", labelSnapshot: ["INBOX"] }),
+      row({ gmailMessageId: "spam", labelSnapshot: ["SPAM"] }),
+      row({ gmailMessageId: "archive", labelSnapshot: [] }),
+      row({ gmailMessageId: "trash", labelSnapshot: ["TRASH"] })
+    ];
+
+    expect(selectStaleWorkingCacheIds(rows, new Set(["spam"]))).toEqual(["inbox"]);
   });
 });

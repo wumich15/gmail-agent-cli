@@ -1031,6 +1031,136 @@ describe("runWorkScan", () => {
     expect(result.scanNote).toContain("history baseline will be cleared");
   });
 
+  it("processes the most recent mail under --limit, not whatever the queue happened to list first", async () => {
+    // Regression: the capped queue was sliced in insertion order, which is
+    // local backlog first and then one Gmail history page — and history
+    // pages are chronological *oldest*-first. A capped run therefore kept
+    // stale backlog rows and discarded exactly the newly-arrived mail,
+    // which is what made its "most recent unread" wrong.
+    const messages: FakeMessage[] = [
+      // Newest first, the order Gmail's messages.list actually returns.
+      { id: "new-1", threadId: "t-new", labelIds: ["INBOX", "UNREAD"], internalDate: "5000", headers: [{ name: "From", value: "new@example.com" }] },
+      { id: "old-1", threadId: "t-1", labelIds: ["INBOX", "UNREAD"], internalDate: "1002", headers: [{ name: "From", value: "one@example.com" }] },
+      { id: "old-2", threadId: "t-2", labelIds: ["INBOX", "UNREAD"], internalDate: "1001", headers: [{ name: "From", value: "two@example.com" }] },
+      { id: "old-3", threadId: "t-3", labelIds: ["INBOX", "UNREAD"], internalDate: "1000", headers: [{ name: "From", value: "three@example.com" }] }
+    ];
+    const client = fakeClient(messages);
+    (client.users.history as unknown as { list: () => Promise<unknown> }).list = async () => ({
+      data: {
+        history: [{ id: "150", messagesAdded: [{ message: { id: "new-1", threadId: "t-new" } }] }],
+        historyId: "200"
+      }
+    });
+
+    const result = await runWorkScan(
+      baseDeps({
+        gmailClient: client,
+        historyMarker: "100",
+        limit: 2,
+        // The stale backlog is queued ahead of the history change.
+        cachedBacklogStubs: [
+          { id: "old-1", threadId: "t-1" },
+          { id: "old-2", threadId: "t-2" },
+          { id: "old-3", threadId: "t-3" }
+        ],
+        cacheRecencyIsFresh: false,
+        classifier: {
+          async assess(): Promise<AssessmentResult> {
+            return { ok: false, unavailable: { reason: "not_configured", detail: null } };
+          }
+        }
+      })
+    );
+
+    const processed = result.outcomes.map((outcome) => outcome.gmailMessageId).sort();
+    expect(processed).toEqual(["new-1", "old-1"]);
+    expect(result.newHistoryMarker).toBeNull();
+    expect(result.scanNote).toContain("most recent");
+  });
+
+  it("ranks a --limit queue from cached dates, with no extra listing, when the cache is fresh", async () => {
+    const messages: FakeMessage[] = [
+      { id: "older", threadId: "t-1", labelIds: ["INBOX", "UNREAD"], internalDate: "1000", headers: [{ name: "From", value: "a@example.com" }] },
+      { id: "newer", threadId: "t-2", labelIds: ["INBOX", "UNREAD"], internalDate: "9000", headers: [{ name: "From", value: "b@example.com" }] }
+    ];
+    const client = fakeClient(messages);
+    (client.users.history as unknown as { list: () => Promise<unknown> }).list = async () => ({
+      data: { history: [], historyId: "200" }
+    });
+    const listSpy = vi.fn(client.users.messages.list);
+    client.users.messages.list = listSpy as unknown as typeof client.users.messages.list;
+
+    const result = await runWorkScan(
+      baseDeps({
+        gmailClient: client,
+        historyMarker: "100",
+        limit: 1,
+        cachedBacklogStubs: [
+          { id: "older", threadId: "t-1" },
+          { id: "newer", threadId: "t-2" }
+        ],
+        cachedInternalDates: new Map([
+          ["older", "1000"],
+          ["newer", "9000"]
+        ]),
+        cacheRecencyIsFresh: true,
+        classifier: {
+          async assess(): Promise<AssessmentResult> {
+            return { ok: false, unavailable: { reason: "not_configured", detail: null } };
+          }
+        }
+      })
+    );
+
+    expect(result.outcomes.map((outcome) => outcome.gmailMessageId)).toEqual(["newer"]);
+    // A fresh cache already knows which mail is newest; asking Gmail again
+    // would spend quota to learn what it just recorded.
+    expect(listSpy).not.toHaveBeenCalled();
+  });
+
+  it("applies a label that already exists in Gmail even when every proposing message voted before", async () => {
+    // Regression: the per-message vote dedup (which exists only to stop one
+    // message inflating a category's cumulative count across runs) also
+    // removed the category from the run's group map, and therefore from the
+    // eligible set. A label the user already has in Gmail needs no threshold
+    // at all, but was silently never applied once its proposers had voted.
+    const messages: FakeMessage[] = [
+      { id: "m1", threadId: "t1", labelIds: ["INBOX"], headers: [{ name: "From", value: "shop@example.com" }] }
+    ];
+    const result = await runWorkScan(
+      baseDeps({
+        gmailClient: fakeClient(messages),
+        existingLabels: ["Shopping"],
+        priorLabelCandidateVotedMessageIds: new Map([["shopping", new Set(["m1"])]]),
+        classifier: new FixedClassifier({
+          ok: true,
+          assessment: {
+            kind: "promotion",
+            confidence: 0.1,
+            importanceScore: 0.1,
+            importanceConfidence: 0.1,
+            summary: "s",
+            reasonCodes: [],
+            category: "Shopping",
+            event: {
+              intent: "none", confidence: 0, title: null, start: null, end: null,
+              allDay: false, timeZone: null, location: null, sourceEvidence: null
+            },
+            classifierVersion: "c",
+            promptVersion: "p",
+            schemaVersion: "s"
+          }
+        })
+      })
+    );
+
+    expect(result.outcomes[0]!.decision.actions).toContainEqual({
+      type: "label",
+      reasonCode: "ai_category:Shopping",
+      labelName: "Shopping"
+    });
+  });
+
   it("excludes a changed message that is no longer in Inbox or Spam from an incremental scan", async () => {
     const client: GmailClient = {
       users: {

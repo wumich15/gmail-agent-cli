@@ -37,6 +37,23 @@ describe("withApiRetry", () => {
     expect(fn).toHaveBeenCalledTimes(1);
   });
 
+  it("cancels an in-progress retry backoff", async () => {
+    const controller = new AbortController();
+    const fn = vi.fn().mockRejectedValue(gaxiosLikeError(503));
+    const pending = withApiRetry(fn, {
+      maxAttempts: 7,
+      baseDelayMs: 60_000,
+      maxDelayMs: 60_000,
+      signal: controller.signal
+    });
+    await vi.waitFor(() => expect(fn).toHaveBeenCalledOnce());
+
+    controller.abort();
+
+    await expect(pending).rejects.toBe(controller.signal.reason);
+    expect(fn).toHaveBeenCalledOnce();
+  });
+
   it("retries on 429 and eventually succeeds", async () => {
     const fn = vi
       .fn()
@@ -171,6 +188,18 @@ describe("withApiRetry", () => {
 });
 
 describe("GoogleApiRateLimiter", () => {
+  it("cancels while waiting for limiter admission", async () => {
+    const limiter = new GoogleApiRateLimiter(1);
+    await limiter.acquire();
+    const controller = new AbortController();
+    const pending = limiter.acquire(1, controller.signal);
+    await Promise.resolve();
+
+    controller.abort();
+
+    await expect(pending).rejects.toBe(controller.signal.reason);
+  });
+
   it("paces successive acquire() calls to no faster than the configured rate", async () => {
     vi.useFakeTimers();
     try {

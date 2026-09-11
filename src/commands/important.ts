@@ -13,7 +13,7 @@ import { normalizeAddress, normalizeListId } from "../rules/matcher.js";
 import { newRuleGroupId } from "../core/ids.js";
 import { EXIT_CODES, RuleConflictError } from "../core/errors.js";
 import { applyGroupedLabelMutations, starAndImportantMutation } from "../gmail/executor.js";
-import { ProcessLock } from "../core/lock.js";
+import { DEFAULT_LOCK_WAIT_MS, ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
 import { listAllMessageIds } from "../gmail/scanner.js";
 import { withGoogleApiRetry } from "../core/api-retry.js";
@@ -83,7 +83,7 @@ export async function runImportant(category: string | undefined, options: Import
   const ctx = bootstrap();
   const { account, gmailClient } = await resolveAccount(ctx);
   const lock = new ProcessLock(lockFilePath(account.accountHash));
-  lock.acquire();
+  lock.acquire({ waitMs: DEFAULT_LOCK_WAIT_MS });
 
   try {
     return await runImportantLocked(category, options, ctx, account, gmailClient);
