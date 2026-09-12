@@ -3,6 +3,7 @@ import pc from "picocolors";
 import { bootstrap, reloadConfig } from "../core/bootstrap.js";
 import { connectGoogleAccount } from "../core/connect.js";
 import { disconnectAccount, getAiStatus, getConnectionStatus } from "../core/onboarding.js";
+import { hostedConsentIsStale } from "../core/ai-access.js";
 import { chooseAiAccessInteractively } from "./setup-ai.js";
 import { promptForGoogleClient } from "./setup-google-client.js";
 import { EXIT_CODES } from "../core/errors.js";
@@ -23,8 +24,10 @@ export async function runSetup(): Promise<number> {
   let connection = await getConnectionStatus(ctx);
 
   if (connection.oauthClientSource === "none") {
-    // Nothing else in setup can proceed without this, so ask for it here
-    // rather than failing with instructions the user has to go act on.
+    // A released build embeds the publisher's Google app, so this only
+    // happens in a source checkout or a build whose release configuration was
+    // stripped. Ask for a client here rather than failing with instructions
+    // the user has to go act on.
     if (!(await promptForGoogleClient())) {
       p.outro("No Google app saved yet, so there is nothing to sign in with. See docs/setup.md, then run `gmail setup` again.");
       return EXIT_CODES.invalidOrAuthRequired;
@@ -44,6 +47,14 @@ export async function runSetup(): Promise<number> {
 
   const ai = await getAiStatus(ctx, connection.accountHash);
   p.log.message(`AI: ${ai.detail}`);
+  if (hostedConsentIsStale(ctx.config)) {
+    // A substantively changed data policy is not something the earlier
+    // acceptance covers, so say so before offering any other action.
+    p.log.warn(
+      "The included AI service's data disclosure has changed since you accepted it. Choose \"Change how AI works\" " +
+        "to read the current one; until then, runs use rules only."
+    );
+  }
 
   const action = await p.select({
     message: "What would you like to do?",
@@ -85,7 +96,24 @@ export async function runSetup(): Promise<number> {
             "Related features (most likely Calendar) will fail until that is resolved."
         );
       }
-      await chooseAiAccessInteractively(ctx, result.accountHash);
+      reloadConfig(ctx);
+      if (result.hostedAiProblem) {
+        p.log.warn(
+          `Gmail is connected, but the included AI service could not be enabled: ${result.hostedAiProblem}\n` +
+            "This computer will use rules only. Run `gmail setup` again to retry, or choose your own API key."
+        );
+      } else if (result.aiMode === "hosted-ai") {
+        p.log.success("Included AI is on. Your Sent mail is never sampled under this option.");
+      } else if (result.aiMode === "rules-only") {
+        p.log.info(
+          "Connected without hosted AI: no message text leaves this computer. You can turn AI on later from " +
+            "`gmail setup`, with your own API key or the included service."
+        );
+      } else {
+        // No hosted disclosure page was part of this sign-in (a source build,
+        // or a user's own Cloud project), so the choice has not been made yet.
+        await chooseAiAccessInteractively(ctx, result.accountHash);
+      }
       p.outro(
         `Connected as ${result.emailDisplay}. Nothing in your mailbox was touched.\n` +
           "Run 'gmail --dry-run' to preview a cleanup before applying one."
@@ -129,6 +157,12 @@ export async function runSetup(): Promise<number> {
     p.log.warn(
       `Local credentials were removed, but Google could not be told to drop the grant: ${result.revokeProblem}\n` +
         "You can revoke it yourself at https://myaccount.google.com/permissions."
+    );
+  }
+  if (result.hostedRevokeProblem) {
+    p.log.warn(
+      `The included AI session was removed from this computer, but the service could not be told to drop it: ` +
+        `${result.hostedRevokeProblem}`
     );
   }
   p.outro("Disconnected.");

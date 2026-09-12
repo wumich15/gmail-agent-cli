@@ -358,7 +358,14 @@ function setupView() {
         if (!selected) return;
         var option = status.ai.options.find(function (candidate) { return candidate.id === selected.value; });
         if (option && option.sendsMailOffDevice) {
-          if (!confirm("Send selected message text (never attachments) to the OpenAI API, at your own cost?")) return;
+          /* The confirmation has to name what this particular option does:
+             the included service and the user's own key send mail text to
+             different places, under different terms, at different cost. */
+          var question =
+            option.id === "hosted"
+              ? "Messages processed by a run, and content used for drafts, will be processed by this app's publisher and the model service it uses. Continue?"
+              : "Send selected message text (never attachments) to the OpenAI API, at your own cost?";
+          if (!confirm(question)) return;
         }
         act("ai", "/api/ai", { choice: selected.value, apiKey: keyInput.value }, "Saved.");
       }

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Gmail Agent — Gmail Agent</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Gmail Agent</h1>
+      <p class="lede">
+        A terminal agent that cleans up your Gmail inbox and turns actionable mail into calendar
+        events. It runs on your computer, when you run it.
+      </p>
+
+      <h2>Install</h2>
+      <pre><code>npm install --global gmail-agent-cli
+gmail setup</code></pre>
+      <p>
+        Already installed? Run <code>gmail setup</code>. That opens a browser page, you approve
+        Google access once, and you are done — there is no Cloud project to create, no credentials
+        file to download, and no AI key to paste.
+      </p>
+
+      <h2>What it does</h2>
+      <ul>
+        <li>Moves spam, promotions, and confidently low-value automated mail to Trash — never a permanent delete.</li>
+        <li>Stars and marks important the mail you actually need to read.</li>
+        <li>Creates high-confidence calendar events from appointments, reservations, and deadlines.</li>
+        <li>Archives read mail when you ask it to, and prints exactly what it did.</li>
+        <li>Lets you read, reply to, and compose mail from the terminal, with a confirmation before anything sends.</li>
+      </ul>
+
+      <h2>Where your data goes</h2>
+      <p>
+        Your Google credentials stay in your operating system’s credential store and are never sent
+        to [Publisher]. With the included AI turned on, bounded message text is sent through
+        [Publisher] to an approved model service for classification and drafting, and for nothing
+        else — see the <a href="/privacy">Privacy Policy</a>. You can also run it with your own AI
+        key, or with no AI at all.
+      </p>
+      <footer>
+        <a href="/">Home</a> · <a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> ·
+        <a href="/data-deletion">Data deletion</a> · <a href="/security">Security</a> ·
+        <a href="/support">Support</a>
+      </footer>
+    </main>
+  </body>
+</html>

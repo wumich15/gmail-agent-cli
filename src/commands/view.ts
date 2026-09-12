@@ -233,6 +233,7 @@ export async function runView(options: ViewOptions): Promise<number> {
   const getStyleProfile = (credentials: ResolvedOpenAiCredentials, forceRefresh = false): Promise<string | null> =>
     getWritingStyleProfile(
       {
+        config: ctx.config,
         db: ctx.db,
         accountHash: account.accountHash,
         gmailClient,
@@ -533,6 +534,15 @@ export async function runView(options: ViewOptions): Promise<number> {
       );
       if (!credentials) {
         notice = "AI is not ready; check gmail setup.";
+        continue;
+      }
+      if (credentials.hosted) {
+        // The included AI service never receives Sent mail (see
+        // gmail/writing-style.ts). Say so plainly rather than running a
+        // refresh that would silently produce nothing.
+        notice =
+          "The included AI service never reads your Sent mail, so there is no style profile to refresh. " +
+          "Give drafting instructions when it asks, or switch to your own API key in `gmail setup`.";
         continue;
       }
       const spinner = p.spinner();

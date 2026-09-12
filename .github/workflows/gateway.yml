@@ -1,0 +1,66 @@
+# Build, check, and deploy the publisher AI gateway and setup site.
+#
+# Separate from the CLI's release workflow because they ship on different
+# cadences and to different places: the CLI goes to npm, this goes to a Firebase
+# project. CI already typechecks and unit-tests the gateway on every push; this
+# workflow is what actually deploys it, and only when asked.
+name: Gateway
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Which Firebase project to deploy to
+        type: choice
+        options: [staging, production]
+        default: staging
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy the gateway and setup site
+    runs-on: ubuntu-latest
+    # Production carries its own required reviewers and its own service-account
+    # credential, so promoting past staging is a deliberate, approved step.
+    environment: gateway-${{ inputs.target }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir gateway install --no-frozen-lockfile --ignore-workspace
+
+      - name: Typecheck and test
+        run: |
+          pnpm gateway:typecheck
+          pnpm test
+
+      # The pages disclose what this service does with people's mail. Deploying
+      # one that still says "[Publisher]" would attach an unusable disclosure to
+      # a real authorization, so this gate is not skippable for either target.
+      - name: Verify the setup and policy pages
+        run: pnpm verify:hosting
+
+      - run: pnpm --dir gateway run build
+
+      - name: Deploy
+        env:
+          # A short-lived credential from Workload Identity Federation is
+          # preferred; a long-lived service-account key is the fallback and
+          # should be rotated on the schedule in docs/operations/runbooks.md.
+          GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          FIREBASE_PROJECT: ${{ vars.FIREBASE_PROJECT_ID }}
+        run: |
+          printf '%s' "$GOOGLE_APPLICATION_CREDENTIALS_JSON" > "$RUNNER_TEMP/sa.json"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/sa.json"
+          npx --yes firebase-tools@latest deploy \
+            --project "$FIREBASE_PROJECT" \
+            --only hosting,functions,firestore:rules,firestore:indexes \
+            --non-interactive
+          rm -f "$RUNNER_TEMP/sa.json"

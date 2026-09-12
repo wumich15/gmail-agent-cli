@@ -1,11 +1,18 @@
 import { AccountsRepository } from "../state/repositories/accounts.js";
 import { CREDENTIAL_KEYS } from "../auth/credential-store.js";
 import {
+  hostedSetupPageFor,
+  MissingRefreshTokenError,
   oauthClientFromRefreshToken,
   resolveOAuthClientCredentials,
   runInstalledAppLogin,
-  OAUTH_SCOPES
+  OAUTH_SCOPES,
+  type ConnectMode,
+  type LoginResult
 } from "../auth/google-oauth.js";
+import { bootstrapHostedSession } from "../auth/hosted-session.js";
+import { HOSTED_AI_POLICY_VERSION, resolveHostedAiService } from "../auth/publisher-client.js";
+import { applyAiAccessChoice } from "./ai-access.js";
 import { createGmailClient } from "../gmail/client.js";
 import { fetchProfile } from "../gmail/scanner.js";
 import { accountHashFromEmail } from "./ids.js";
@@ -21,6 +28,21 @@ export interface ConnectResult {
   grantedScopes: string[];
   /** Scopes Google did not report granting — usually a Workspace admin restriction. */
   missingScopes: string[];
+  /**
+   * What the user chose on the hosted disclosure page, or null when there was
+   * no such page in this flow (a source build, or a user signing in through
+   * their own Cloud project). Null means the caller still has to ask how this
+   * install should get AI.
+   */
+  aiMode: ConnectMode | null;
+  /**
+   * Set when the hosted-AI choice could not be completed — the service was
+   * unreachable, or it declined the session. Gmail is connected either way;
+   * this install simply stays on rules only until setup is run again. Never a
+   * reason to fail the whole sign-in: the user's Google consent is done, and
+   * throwing it away because a separate service was down would be worse.
+   */
+  hostedAiProblem?: string;
 }
 
 export interface ConnectOptions {
@@ -47,7 +69,31 @@ export interface ConnectOptions {
  */
 export async function connectGoogleAccount(ctx: CliContext, options: ConnectOptions = {}): Promise<ConnectResult> {
   const credentials = resolveOAuthClientCredentials();
-  const result = await runInstalledAppLogin(credentials, (url) => options.onAuthorizeUrl?.(url));
+  const setupPageUrl = hostedSetupPageFor(credentials);
+  const hostedService = resolveHostedAiService();
+  // `openid` is requested only when there is a service for the resulting ID
+  // token to authenticate to. A fully local install asks for two scopes, as
+  // it always has.
+  const requestIdentityScope = setupPageUrl !== null && hostedService !== null;
+
+  const login = async (forceConsent: boolean): Promise<LoginResult> =>
+    runInstalledAppLogin(credentials, (url) => options.onAuthorizeUrl?.(url), {
+      requestIdentityScope,
+      setupPageUrl,
+      forceConsent
+    });
+
+  let result: LoginResult;
+  try {
+    result = await login(false);
+  } catch (error) {
+    // Google returns no refresh token when it considers the app already
+    // authorized. Re-asking with an explicit consent prompt is the documented
+    // recovery — once. A second failure means something another consent
+    // screen will not fix, so it propagates.
+    if (!(error instanceof MissingRefreshTokenError)) throw error;
+    result = await login(true);
+  }
 
   const oauthClient = oauthClientFromRefreshToken(credentials, result.refreshToken);
   const profile = await fetchProfile(createGmailClient(oauthClient));
@@ -91,6 +137,45 @@ export async function connectGoogleAccount(ctx: CliContext, options: ConnectOpti
 
     const config = loadOrCreateDefaultConfig(timezone);
     saveConfig({ ...config, timezone });
+
+    // The AI choice the user made on the disclosure page, applied here so it
+    // is recorded in the same operation as the sign-in it was part of. A
+    // failure to reach the service leaves this install on rules only and is
+    // reported, never retried silently and never fatal.
+    let hostedAiProblem: string | undefined;
+    if (result.mode === "hosted-ai" && hostedService && result.idToken) {
+      try {
+        await bootstrapHostedSession({
+          service: hostedService,
+          googleIdToken: result.idToken,
+          policyVersion: HOSTED_AI_POLICY_VERSION,
+          accountHash,
+          credentialStore: ctx.credentialStore
+        });
+        await applyAiAccessChoice({
+          config: { ...config, timezone },
+          choice: "hosted",
+          accountHash,
+          credentialStore: ctx.credentialStore,
+          consentedAt: now
+        });
+      } catch (error) {
+        hostedAiProblem = error instanceof Error ? error.message : String(error);
+      }
+    } else if (result.mode === "hosted-ai") {
+      hostedAiProblem =
+        "Google did not return the identity token the AI service needs, so hosted AI was not enabled.";
+    } else if (result.mode === "rules-only") {
+      // An explicit "connect without hosted AI" must actually leave AI off,
+      // not inherit whatever a previous install happened to configure.
+      await applyAiAccessChoice({
+        config: { ...config, timezone },
+        choice: "off",
+        accountHash,
+        credentialStore: ctx.credentialStore
+      });
+    }
+
     // The process cached its config at startup, before any of this
     // existed. Refresh it so the rest of this run sees what was written
     // rather than a pre-sign-in snapshot.
@@ -101,7 +186,9 @@ export async function connectGoogleAccount(ctx: CliContext, options: ConnectOpti
       emailDisplay: profile.emailAddress,
       timezone,
       grantedScopes: result.scopes,
-      missingScopes: OAUTH_SCOPES.filter((scope) => !result.scopes.includes(scope))
+      missingScopes: OAUTH_SCOPES.filter((scope) => !result.scopes.includes(scope)),
+      aiMode: result.mode,
+      ...(hostedAiProblem ? { hostedAiProblem } : {})
     };
   } finally {
     lock.release();

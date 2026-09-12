@@ -147,6 +147,20 @@ export async function runInstall(): Promise<number> {
       return EXIT_CODES.invalidOrAuthRequired;
     }
     connection = await getConnectionStatus(ctx);
+  } else if (connection.oauthClientSource === "publisher") {
+    // Nothing to do: a released build ships the app, which is the whole point
+    // of the one-consent path. Registering your own stays available for
+    // anyone who wants their mail reachable only by their own credentials and
+    // their own API quota, so it is offered — just not as the default.
+    p.log.success("Step 1 of 4 — this release already includes the Google app, so there is nothing to register.");
+    const own = await p.confirm({
+      message: "Advanced: sign in through a Google project you own instead?",
+      initialValue: false
+    });
+    if (!p.isCancel(own) && own && !(await registerGoogleApp())) {
+      p.outro("Kept the included Google app. Nothing was changed.");
+      return EXIT_CODES.ok;
+    }
   } else {
     p.log.success(
       connection.oauthClientSource === "environment"
@@ -159,6 +173,10 @@ export async function runInstall(): Promise<number> {
       return EXIT_CODES.ok;
     }
   }
+
+  // Set when the browser disclosure page already collected the AI choice as
+  // part of the same consent, which is the normal path in a released build.
+  let aiChoiceAlreadyMade = false;
 
   // ---- Step 2: sign in ---------------------------------------------------
   p.log.message(
@@ -204,6 +222,16 @@ export async function runInstall(): Promise<number> {
         );
       }
       p.log.success(`Connected as ${pc.bold(result.emailDisplay)} (timezone ${result.timezone}).`);
+      if (result.hostedAiProblem) {
+        p.log.warn(
+          `Gmail is connected, but the included AI service could not be enabled: ${result.hostedAiProblem}\n` +
+            "Step 3 can set AI up another way."
+        );
+      }
+      // A sign-in that went through the hosted disclosure page already asked
+      // how AI should work. Asking again in step 3 would be a second consent
+      // screen for a decision the user just made.
+      aiChoiceAlreadyMade = result.aiMode !== null && !result.hostedAiProblem;
       reloadConfig(ctx);
       connection = await getConnectionStatus(ctx);
     } catch (error) {
@@ -219,11 +247,14 @@ export async function runInstall(): Promise<number> {
   p.log.message(
     `${pc.bold("Step 3 of 4 — how much judgment do you want?")}\n\n` +
       "Rules-only already handles Gmail's own spam, your rules, and archiving read mail,\n" +
-      "and sends nothing anywhere. An OpenAI key adds the judgment calls: which mail is\n" +
-      "bulk, which needs you, and which describes a real appointment."
+      "and sends nothing anywhere. AI adds the judgment calls: which mail is bulk, which\n" +
+      "needs you, and which describes a real appointment — through the included service\n" +
+      "if this build has one, or through an OpenAI key of your own."
   );
   const ai = await getAiStatus(ctx, connection.accountHash);
-  if (ai.ready) {
+  if (aiChoiceAlreadyMade) {
+    p.log.success(`${ai.detail} (chosen on the sign-in page)`);
+  } else if (ai.ready) {
     p.log.success(ai.detail);
     const change = await p.confirm({ message: "Change how AI works?", initialValue: false });
     if (!p.isCancel(change) && change) {

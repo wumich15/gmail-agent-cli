@@ -167,7 +167,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, path: string
     }
     case "/api/ai": {
       const choice = body["choice"];
-      if (choice !== "api-key" && choice !== "off") {
+      if (choice !== "hosted" && choice !== "api-key" && choice !== "off") {
         throw new UiError("Unknown AI option.", 400);
       }
       const apiKey = typeof body["apiKey"] === "string" && body["apiKey"].trim() ? body["apiKey"].trim() : null;

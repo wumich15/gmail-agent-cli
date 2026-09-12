@@ -17,7 +17,11 @@
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "pnpm clean && tsc -p tsconfig.build.json && node scripts/make-executable.mjs",
-    "verify:package": "node scripts/verify-release-artifact.mjs",
+    "verify:package": "node scripts/verify-package.mjs",
+    "verify:hosting": "node scripts/verify-hosting.mjs",
+    "embed:release": "node scripts/embed-release-config.mjs",
+    "gateway:typecheck": "tsc -p gateway/tsconfig.json --noEmit",
+    "gateway:build": "tsc -p gateway/tsconfig.json",
     "sbom": "node scripts/generate-sbom.mjs",
     "dev": "tsx src/cli.ts",
     "lint": "eslint .",

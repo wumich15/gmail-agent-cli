@@ -1,0 +1,27 @@
+{
+  "name": "gmail-agent-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Authenticated AI gateway for Gmail Agent. Exposes two typed operations; never a general-purpose model relay.",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/gateway/src/index.js",
+  "engines": {
+    "node": "22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "serve": "pnpm build && firebase --config ../firebase.json emulators:start --only functions,firestore,hosting,auth",
+    "deploy": "pnpm build && firebase --config ../firebase.json deploy --only functions,firestore:rules,firestore:indexes",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.0.2",
+    "firebase-functions": "^6.2.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "@types/node": "^22.10.5"
+  }
+}

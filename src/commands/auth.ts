@@ -59,7 +59,12 @@ export async function authLogin(): Promise<number> {
       }
     });
 
-    await chooseAiAccessInteractively(ctx, result.accountHash);
+    // A sign-in that went through the hosted disclosure page already collected
+    // the AI choice as part of the same consent; asking again here would be a
+    // second screen for a decision just made.
+    if (result.aiMode === null) {
+      await chooseAiAccessInteractively(ctx, result.accountHash);
+    }
 
     // Report what Google actually granted, not merely what was requested —
     // a Workspace admin policy can restrict a scope (most plausibly
@@ -73,6 +78,11 @@ export async function authLogin(): Promise<number> {
         (result.missingScopes.length > 0
           ? pc.yellow(
               `Warning: Google did not report granting: ${result.missingScopes.join(", ")}. Related features (e.g. Calendar) will fail until this is resolved.\n`
+            )
+          : "") +
+        (result.hostedAiProblem
+          ? pc.yellow(
+              `Warning: the included AI service could not be enabled (${result.hostedAiProblem}). Runs will use rules only until \`gmail setup\` fixes it.\n`
             )
           : "") +
         "Signing in changed nothing in your mailbox. Run 'gmail --dry-run' to preview what it would do."

@@ -4,6 +4,7 @@ import { bootstrap } from "../core/bootstrap.js";
 import { resolveAccountSigningInIfNeeded } from "./shared.js";
 import { MIN_AUTOMATIC_SPAM_RULE_MESSAGES, runWorkScan } from "../core/orchestrator.js";
 import { resolveClassifier } from "../ai/resolve-classifier.js";
+import { HostedClassifier } from "../ai/hosted-classifier.js";
 import { RuleGroupsRepository } from "../state/repositories/rule-groups.js";
 import { findConflictingRuleGroup } from "../rules/resolver.js";
 import { AccountsRepository } from "../state/repositories/accounts.js";
@@ -530,6 +531,15 @@ export async function runWork(options: WorkOptions): Promise<number> {
           `total ${Math.round(diagnostics.totalMs)}ms.`
       )
     );
+    // A run-wide AI stop (allowance exhausted, session revoked, CLI too old)
+    // otherwise shows up only as a pile of "assessment_unavailable" review
+    // items, which says that something went wrong but not what, or what to do
+    // about it. The run itself is unaffected: rules and deterministic
+    // archiving already handled everything they could.
+    if (classifier instanceof HostedClassifier) {
+      const stopped = classifier.stoppedBecause();
+      if (stopped) console.error(pc.yellow(stopped));
+    }
     ctx.logger.info(
       { accountHash: account.accountHash, usedIncrementalSync, scannedCount: outcomes.length, scanNote, ...diagnostics },
       "work_scan_complete"

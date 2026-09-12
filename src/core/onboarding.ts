@@ -15,6 +15,8 @@ import {
   type AiAccessOption
 } from "./ai-access.js";
 import { resolveAiCredentials } from "../ai/resolve-classifier.js";
+import { disconnectHostedSession } from "../auth/hosted-session.js";
+import { resolveHostedAiService } from "../auth/publisher-client.js";
 import type { CliContext } from "./bootstrap.js";
 
 /**
@@ -128,6 +130,16 @@ export async function getAiStatus(ctx: CliContext, accountHash: string | null): 
       detail: "AI is selected but no usable API key was found, so runs fall back to rules only."
     };
   }
+  if (credentials.provider === "hosted") {
+    return {
+      ...base,
+      ready: true,
+      model: credentials.model,
+      detail:
+        "Using the included AI service — no API key, and the publisher's fair-use allowance applies. " +
+        "Your Sent mail is never sampled under this option."
+    };
+  }
   return {
     ...base,
     ready: true,
@@ -144,6 +156,8 @@ export interface DisconnectResult {
   /** Present when Google could not be told to drop the grant; local credentials are erased regardless. */
   revokeProblem?: string;
   historyRemoved: boolean;
+  /** Present when the hosted AI session could not be revoked server-side; it is erased locally regardless. */
+  hostedRevokeProblem?: string;
 }
 
 /**
@@ -181,9 +195,24 @@ export async function disconnectAccount(
     }
   }
 
+  // The hosted AI session is a separate grant with its own credential, so
+  // disconnecting Gmail has to drop it explicitly. Leaving a live gateway
+  // entitlement behind for an account this computer can no longer read mail
+  // for would be a grant the user believes they just revoked.
+  const hosted = await disconnectHostedSession({
+    service: resolveHostedAiService(),
+    accountHash,
+    credentialStore: ctx.credentialStore
+  });
+
   await ctx.credentialStore.deleteSecret(secretKey);
   if (options.removeHistory) {
     ctx.db.prepare("DELETE FROM accounts WHERE account_hash = ?").run(accountHash);
   }
-  return { revoked, historyRemoved: options.removeHistory, ...(revokeProblem ? { revokeProblem } : {}) };
+  return {
+    revoked,
+    historyRemoved: options.removeHistory,
+    ...(revokeProblem ? { revokeProblem } : {}),
+    ...(hosted.problem ? { hostedRevokeProblem: hosted.problem } : {})
+  };
 }

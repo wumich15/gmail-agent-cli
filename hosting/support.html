@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Support — Gmail Agent</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Support</h1>
+      <p class="lede">Where to get help, and what to try first.</p>
+
+      <h2>Check the install</h2>
+      <pre><code>gmail doctor</code></pre>
+      <p>
+        This checks the Node runtime, the local database, the OS credential store, the Google
+        sign-in, the Gmail API, the timezone, and whether AI is actually ready. It reads only; it
+        never changes mail.
+      </p>
+
+      <h2>Common situations</h2>
+      <ul>
+        <li><strong>“Run gmail setup to reconnect it.”</strong> The Google grant or the AI session expired or was revoked. <code>gmail setup</code> restores both.</li>
+        <li><strong>“The included AI allowance is used up.”</strong> The run continues with rules only. Try again later, or switch to your own API key in <code>gmail setup</code>.</li>
+        <li><strong>“Another gmail process is already running.”</strong> A <code>gmail view</code> session in another window holds the account lock while it loads. Let it finish, or close it.</li>
+        <li><strong>Something was trashed that should not have been.</strong> Nothing is ever permanently deleted. Use <code>gmail undo &lt;run-id&gt;</code>, or restore it from Gmail’s Trash.</li>
+        <li><strong>Wanting to see what a run would do.</strong> <code>gmail --dry-run --limit 25</code> changes nothing.</li>
+      </ul>
+
+      <h2>Contact</h2>
+      <p>
+        Bugs and feature requests: [Issue tracker URL]. Everything else, including privacy and
+        deletion requests: [Support contact address].
+      </p>
+      <footer>
+        <a href="/">Home</a> · <a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> ·
+        <a href="/data-deletion">Data deletion</a> · <a href="/security">Security</a> ·
+        <a href="/support">Support</a>
+      </footer>
+    </main>
+  </body>
+</html>

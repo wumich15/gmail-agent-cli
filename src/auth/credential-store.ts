@@ -92,6 +92,15 @@ export class InMemoryCredentialStore implements CredentialStore {
 
 export const CREDENTIAL_KEYS = {
   oauthRefreshToken: (accountHash: string) => `oauth-refresh-token:${accountHash}`,
+  /**
+   * The hosted AI service's own refresh token, kept deliberately separate
+   * from Google's. They authorize different things and are revoked
+   * independently: dropping the hosted session must never cost the user their
+   * Gmail authorization, and revoking Gmail access must not leave a usable
+   * gateway session behind. One shared slot would make both of those a
+   * guess. See `auth/hosted-session.ts`.
+   */
+  hostedSessionRefreshToken: (accountHash: string) => `hosted-session-refresh-token:${accountHash}`,
   aiApiKey: (accountHash: string) => `ai-api-key:${accountHash}`,
   calendarPayloadKey: (accountHash: string) => `calendar-payload-key:${accountHash}`
 } as const;

@@ -1,0 +1,111 @@
+<!doctype html>
+<!--
+  The one screen where a person decides what this app may do with their mail.
+
+  Every bracketed value below is a release placeholder. scripts/verify-hosting.mjs
+  fails the release build while any of them remains, because shipping a consent
+  screen that names "[Publisher]" would be worse than shipping none: it would be
+  a disclosure nobody could act on, attached to a real authorization.
+
+  Both choices are ordinary buttons with the same weight and legibility. The
+  hosted-AI button is gated on an explicit checkbox; the rules-only button is
+  not hidden, pre-deselected, or styled to look like the wrong answer.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Connect Gmail — Gmail Agent</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Gmail Agent</h1>
+      <p class="lede">Connect Gmail to use Gmail Agent in your terminal.</p>
+
+      <noscript>
+        <div class="status" role="status">
+          This page needs JavaScript to hand your choice back to Gmail Agent. With it off, close this
+          tab and run <code>gmail setup</code> again in a browser that allows scripts from this site.
+          Nothing has been connected.
+        </div>
+      </noscript>
+
+      <div id="no-session" hidden>
+        <div class="status" role="status">
+          This page was not opened by Gmail Agent, so it cannot connect anything on its own.
+        </div>
+        <p>Install it and start setup from your terminal:</p>
+        <pre><code>npm install --global gmail-agent-cli
+gmail setup</code></pre>
+        <p>That command opens this page again with a live session.</p>
+      </div>
+
+      <div id="ready" hidden>
+        <div class="panel">
+          <h2>What it can do with your Google account</h2>
+          <p>
+            Gmail Agent can read and organize your mail, move messages to Trash, archive them, add
+            stars and labels, and prepare replies for your review. It can also see, create, change,
+            and delete events on Google calendars you own, and it uses that only for the calendar
+            behavior described in its documentation.
+          </p>
+          <p>
+            It never permanently deletes mail, and it never sends a message without showing you the
+            exact recipient, subject, and body and asking first.
+          </p>
+        </div>
+
+        <div class="panel">
+          <h2>Included AI</h2>
+          <p>
+            During a preview or cleanup, unresolved messages may be classified automatically — not
+            only messages you pick one at a time. For each such message, Gmail Agent may send the
+            sender name and address, the subject, the date, your timezone, a bulk-mail signal, your
+            Gmail label names, and bounded plain text from the body or Gmail's preview snippet
+            through [Publisher] to [Model service and subprocessors].
+          </p>
+          <p>
+            Drafting sends the message you are replying to, or the recipient, subject, and purpose
+            you typed. This launch version does not send recent Sent mail to learn your writing
+            style. Attachments, inline images, and your Google credentials are never sent.
+          </p>
+          <p>
+            This data is used only for these visible features — never for generalized training,
+            ranking, categorization, or any other secondary purpose. Fair-use limits apply; when the
+            allowance runs out, Gmail Agent keeps working with rules only.
+          </p>
+        </div>
+
+        <label class="consent" for="consent">
+          <input type="checkbox" id="consent" />
+          <span>
+            I understand that messages processed by a run, and the content used for drafts, will be
+            processed by the services described above and in the
+            <a href="/privacy">Privacy Policy</a>.
+          </span>
+        </label>
+
+        <div class="choices">
+          <button type="button" id="connect-hosted" disabled>Connect Gmail with hosted AI</button>
+          <button type="button" id="connect-rules" class="secondary">
+            Connect Gmail without hosted AI
+          </button>
+        </div>
+        <p class="lede">
+          Without hosted AI, no message text leaves your computer. Gmail's own spam, your own
+          spam and important rules, and archiving still work; anything needing judgment is left for
+          you. You can turn AI on later, with the included service or your own API key.
+        </p>
+        <p class="status" id="status" role="status" aria-live="polite"></p>
+      </div>
+
+      <footer>
+        <a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> ·
+        <a href="/data-deletion">Data deletion</a> · <a href="/security">Security</a> ·
+        <a href="/support">Support</a>
+      </footer>
+    </main>
+    <script src="/connect.js"></script>
+  </body>
+</html>

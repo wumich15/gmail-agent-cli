@@ -283,14 +283,18 @@ Nothing in this command reads or changes mail.
 
 ### Choosing how AI works
 
-Two options, each shown with its cost and requirements before it is selectable:
+Each option is shown with its cost and requirements before it is selectable:
 
 | Option | What it needs | Where mail is processed |
 | --- | --- | --- |
 | Your own OpenAI API key | An OpenAI account and key that you create and pay for per use. | Selected message text (never attachments) goes from this computer directly to the OpenAI API. |
 | No AI — rules only | Nothing. | Nowhere. Native spam, your rules, and archiving of read mail still work. |
 
-There is no hosted option: this tool has no server of its own, so nothing is processed by anyone but the provider you chose. The key is typed without being echoed and stored in the operating system's credential store — never in `config.json`, a log line, a command-line flag, or shell history.
+Any option that sends mail text anywhere asks for explicit consent first, naming where it goes.
+
+A third provider — a publisher-funded hosted service — exists in the code but is listed only by a build that embeds publisher configuration. A build from this source does not, so setup does not offer it.
+
+The API key is typed without being echoed and stored in the operating system's credential store — never in `config.json`, a log line, a command-line flag, or shell history.
 
 ## Browser interface: `gmail ui`
 

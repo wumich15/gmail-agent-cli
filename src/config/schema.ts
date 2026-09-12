@@ -26,16 +26,22 @@ export const DEFAULT_GMAIL_READ_CONCURRENCY = 8;
 /**
  * How this install reaches a model.
  *
+ * - "hosted": the publisher-operated AI gateway, authenticated with the
+ *   Firebase session established during the same Google consent. The normal
+ *   path for an ordinary install: no AI account, no key, nothing to
+ *   configure. The gateway exposes only the two typed operations in
+ *   `ai/hosted-contract.ts` and never returns a provider credential.
  * - "openai": the standard OpenAI API, called directly from this computer
- *   with the user's own key. This is the normal path.
+ *   with the user's own key.
  * - "openai-compatible": any endpoint implementing the same Responses API +
  *   Structured Outputs shape, via `aiBaseUrl` — including a model the user
  *   runs themselves. Still key-authenticated.
  *
- * There is deliberately no hosted/publisher option: this tool has no server,
- * so nobody else's key, quota, or infrastructure is ever in the path.
+ * The last two remain first-class: someone who would rather not have a third
+ * party in the path of their mail, or who is running from a source checkout
+ * with no publisher configuration, keeps exactly the setup they had.
  */
-export const AI_PROVIDERS = ["openai", "openai-compatible"] as const;
+export const AI_PROVIDERS = ["hosted", "openai", "openai-compatible"] as const;
 export type AiProvider = (typeof AI_PROVIDERS)[number];
 
 /**
@@ -45,7 +51,7 @@ export type AiProvider = (typeof AI_PROVIDERS)[number];
  * migrates v1 by recording what those installs were actually doing
  * (`aiEnabled: true`), after which the field means exactly what it says.
  */
-export const CURRENT_CONFIG_SCHEMA_VERSION = 3;
+export const CURRENT_CONFIG_SCHEMA_VERSION = 4;
 
 /**
  * Rewrites a config naming a provider this version no longer supports.
@@ -83,7 +89,7 @@ export const ConfigSchema = z.preprocess(
   replaceRetiredProvider,
   z
     .object({
-    schemaVersion: z.union([z.literal(1), z.literal(2), z.literal(3)]),
+    schemaVersion: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
     timezone: z.string().min(1),
     automationEnabled: z.boolean().default(false),
     /**
@@ -95,6 +101,22 @@ export const ConfigSchema = z.preprocess(
     aiProvider: z.enum(AI_PROVIDERS).default("openai"),
     /** Required when aiProvider is "openai-compatible"; ignored otherwise. */
     aiBaseUrl: z.string().url().optional(),
+    /**
+     * Local record of the hosted-AI disclosure this user accepted.
+     *
+     * The authoritative receipt lives server-side, keyed to a pseudonymous
+     * user ID — this copy exists so the CLI can notice on its own that the
+     * published policy version has moved on and reopen the disclosure, rather
+     * than discovering it only when the gateway starts refusing message text
+     * mid-run. Written only by an affirmative choice; never defaulted on.
+     */
+    hostedAiConsent: z
+      .object({
+        policyVersion: z.string().min(1).max(100),
+        acceptedAt: z.string().min(1).max(40)
+      })
+      .strict()
+      .optional(),
     model: z.string().min(1).default(DEFAULT_MODEL),
     composeModel: z.string().min(1).default(DEFAULT_COMPOSE_MODEL),
     concurrency: z
@@ -123,6 +145,13 @@ export const ConfigSchema = z.preprocess(
       message: "aiBaseUrl is required when aiProvider is \"openai-compatible\"",
       path: ["aiBaseUrl"]
     })
+    // A hosted config without a recorded consent receipt would mean message
+    // text was about to be sent to a third party on the strength of a default
+    // value. Refuse to load it rather than guess that consent happened.
+    .refine((config) => config.aiProvider !== "hosted" || config.hostedAiConsent !== undefined, {
+      message: "hostedAiConsent is required when aiProvider is \"hosted\"",
+      path: ["hostedAiConsent"]
+    })
 );
 
 export type Config = z.infer<typeof ConfigSchema>;
@@ -144,6 +173,21 @@ export function migrateConfig(config: Config): Config | null {
     schemaVersion: CURRENT_CONFIG_SCHEMA_VERSION,
     aiEnabled: config.schemaVersion === 1 ? true : config.aiEnabled
   };
+}
+
+/**
+ * Whether this install may read a sample of the user's Sent mail to derive a
+ * writing-style profile (see `gmail/writing-style.ts`).
+ *
+ * Never under hosted AI. Style sampling reads up to a dozen recent Sent
+ * messages the user did not select and that have nothing to do with the draft
+ * in front of them; that is a materially different transfer from "help me
+ * reply to this message", and the hosted disclosure deliberately does not
+ * claim it. Under the user's own API key it stays available, because there
+ * the mail goes to the provider account they already control and pay for.
+ */
+export function sentMailStyleSamplingAllowed(config: Config | null): boolean {
+  return config?.aiProvider !== "hosted";
 }
 
 export function defaultConfig(timezone: string): Config {

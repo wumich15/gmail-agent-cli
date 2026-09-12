@@ -1,0 +1,39 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "outDir": "lib",
+    // The gateway renders the same prompt from the same typed facts as the
+    // CLI, using the CLI's own `src/ai` modules rather than a copy. Rooting
+    // the build at the repository means those files compile into `lib/`
+    // alongside the gateway's, so the two sides cannot drift into serving
+    // different instructions for the same contract version.
+    "rootDir": "..",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": false,
+    "sourceMap": false,
+    "verbatimModuleSyntax": true
+  },
+  // Named file by file rather than by glob: these four are a
+  // dependency-light island (zod and pure type declarations only), and a glob
+  // over `../src/ai` would drag the OpenAI SDK, the Gmail client, and SQLite
+  // into a service that must never be able to reach any of them.
+  "include": [
+    "src/**/*.ts",
+    "../src/ai/hosted-contract.ts",
+    "../src/ai/schema.ts",
+    "../src/ai/prompt.ts",
+    "../src/gmail/labels.ts",
+    "../src/core/models.ts"
+  ]
+}

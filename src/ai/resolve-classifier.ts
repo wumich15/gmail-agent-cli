@@ -5,6 +5,11 @@ import {
   type AiProvider,
   type Config
 } from "../config/schema.js";
+import { HostedSession, hostedSessionStored } from "../auth/hosted-session.js";
+import { resolveHostedAiService } from "../auth/publisher-client.js";
+import { HostedAiClient } from "./hosted-client.js";
+import { HostedClassifier } from "./hosted-classifier.js";
+import { HOSTED_CONTRACT_VERSION } from "./hosted-contract.js";
 import { NotConfiguredClassifier } from "./not-configured-classifier.js";
 import { OpenAiClassifier } from "./openai-classifier.js";
 import { SCHEMA_VERSION } from "./assessment-mapping.js";
@@ -39,10 +44,17 @@ export interface ResolvedClassifier {
 
 export interface ResolvedAiCredentials {
   provider: AiProvider;
-  /** The user's own provider key, from the OS credential store or the environment. */
+  /** The user's own provider key. Empty for "hosted", which holds no provider credential at all. */
   apiKey: string;
+  /**
+   * The model to ask for. For "hosted" this is a contract label rather than a
+   * model name: the gateway pins the real model server-side precisely so a
+   * client cannot choose one.
+   */
   model: string;
   baseURL: string | null;
+  /** Present only for provider "hosted": the typed two-operation gateway client. */
+  hosted?: HostedAiClient;
 }
 
 /** @deprecated Kept for older call sites; the resolution is no longer OpenAI-specific. */
@@ -93,6 +105,23 @@ export async function resolveAiCredentials(
 
   const provider: AiProvider = input.config?.aiProvider ?? "openai";
 
+  if (provider === "hosted") {
+    const service = resolveHostedAiService();
+    // A config naming the hosted service in a build that has none (a source
+    // checkout, or a release whose configuration was stripped) must degrade
+    // to rules-only, not fail the command.
+    if (!service) return null;
+    if (!(await hostedSessionStored(input.accountHash, input.credentialStore))) return null;
+    const session = new HostedSession(service, input.accountHash, input.credentialStore);
+    return {
+      provider,
+      apiKey: "",
+      model: `hosted-v${HOSTED_CONTRACT_VERSION}`,
+      baseURL: service.baseUrl,
+      hosted: new HostedAiClient(service, session)
+    };
+  }
+
   // The user's own key: checked in the OS credential store first, then the
   // OPENAI_API_KEY environment variable, matching how the OpenAI SDK
   // itself defaults. Nothing else can supply one — there is no service in
@@ -123,14 +152,32 @@ export async function resolveClassifier(input: ResolveClassifierInput): Promise<
 
   if (!credentials) {
     const off = input.config?.aiEnabled === false;
+    const hostedButDisconnected =
+      !off && input.config?.aiProvider === "hosted";
     return {
       classifier: new NotConfiguredClassifier(),
       description: off
         ? "AI classification is turned off — using rules-only mode."
-        : "AI classification is not configured (no OpenAI API key found) — using rules-only mode.",
+        : hostedButDisconnected
+          ? "The included AI service is not connected on this computer (run `gmail setup`) — using rules-only mode."
+          : "AI classification is not configured (no OpenAI API key found) — using rules-only mode.",
       classifierVersion: "not-configured",
       promptVersion: "not-configured",
       schemaVersion: "not-configured"
+    };
+  }
+
+  if (credentials.hosted) {
+    return {
+      classifier: new HostedClassifier(credentials.hosted, `hosted:v${HOSTED_CONTRACT_VERSION}`),
+      description: "Using the included AI service (no API key; the publisher's fair-use allowance applies).",
+      // The gateway pins one model snapshot per contract version, so the
+      // contract version is what a cached assessment must match. A publisher
+      // model change ships as a contract bump, which invalidates the cache
+      // exactly as a local model change does.
+      classifierVersion: `hosted:v${HOSTED_CONTRACT_VERSION}`,
+      promptVersion: PROMPT_VERSION,
+      schemaVersion: SCHEMA_VERSION
     };
   }
 

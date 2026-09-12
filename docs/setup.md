@@ -1,8 +1,8 @@
 # Setup: connecting the tool to your own Google account
 
-This tool runs entirely on your computer. There is no server, no hosted
-account, and nobody else's credentials in the path — which means you connect it
-to Google yourself, once, with a Google app that belongs to you.
+This tool runs on your computer, against your own Gmail account, with a Google
+app you register yourself — so you connect it to Google once, and nobody else's
+credentials are ever in the path.
 
 **The short version:** install the tool and run `gmail install`. It walks these
 same steps interactively, opening each Google page for you and collecting what
@@ -14,12 +14,10 @@ Budget about ten minutes. You do this once per computer.
 
 ## Why you have to do this at all
 
-Google requires an app to identify itself before it can touch a mailbox. An app
-distributed with one shared identity would route every user's consent and API
-quota through whoever registered it, and would make them the party responsible
-for everyone else's mail. This tool doesn't do that: **you** register the app,
-so your mail is only ever reachable with your own credentials, and your API
-usage is your own.
+Google requires an app to identify itself before it can touch a mailbox, and
+this build ships no shared identity. So **you** register the app, which means
+your mail is only ever reachable with your own credentials, and your API usage
+is your own.
 
 The values you create below are not passwords, and they give nobody access to
 anything on their own. Access comes from the Google sign-in you complete
@@ -127,6 +125,15 @@ work; anything needing judgment is simply left alone.
 You can change this later with `gmail setup` at any time. To use a
 non-OpenAI endpoint that implements the same Responses API, set
 `GMAIL_AGENT_AI_PROVIDER=openai-compatible` and `GMAIL_AGENT_AI_BASE_URL=...`.
+
+Every option that sends message text anywhere asks for explicit consent first
+and names where it goes.
+
+(There is a third provider in the code — a publisher-funded hosted service —
+but it only appears in a build that embeds publisher configuration. This one
+does not, so `gmail setup` does not list it. See
+[docs/production.md](production.md) if you ever want to run that service
+yourself.)
 
 ## 7. Preview before anything changes
 

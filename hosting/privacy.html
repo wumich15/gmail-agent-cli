@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Privacy Policy — Gmail Agent</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Privacy Policy</h1>
+      <p class="lede">
+        Gmail Agent, operated by [Publisher]. Last updated [Effective date].
+      </p>
+
+      <h2>Two different products, honestly described</h2>
+      <p>
+        Gmail Agent runs on your computer. Without the included AI, it has no server: it talks to
+        Google directly with your own credentials, stores everything locally, and sends nothing to
+        us. With the included AI turned on, that changes in one specific way, and this policy
+        describes exactly how. We do not claim that mail never leaves your computer when you have
+        chosen an option under which it does.
+      </p>
+
+      <h2>What stays on your computer, always</h2>
+      <ul>
+        <li>Your Google refresh and access tokens, held in your operating system’s credential store.</li>
+        <li>Every Gmail message body, attachment, inline image, and raw HTML.</li>
+        <li>The local database of what the tool did: runs, actions, rules, and cached message metadata.</li>
+        <li>Your local diagnostic logs, which are written without message content or credentials.</li>
+      </ul>
+      <p>
+        We never receive your Google credentials. Gmail API traffic goes from your computer to
+        Google and is not proxied through us.
+      </p>
+
+      <h2>What is sent to us, with the included AI on</h2>
+      <p>
+        During a preview or a cleanup, each unresolved message may be classified automatically —
+        not only messages you select individually. For each such message we receive:
+      </p>
+      <ul>
+        <li>the sender display name and address;</li>
+        <li>the subject and the date the message was sent;</li>
+        <li>your timezone, so relative dates in the message resolve correctly;</li>
+        <li>a derived yes/no bulk-mail signal (not the underlying headers);</li>
+        <li>the names of your custom Gmail labels, so the model reuses one instead of inventing a near-duplicate;</li>
+        <li>bounded plain text from the message body, or Gmail’s short preview snippet.</li>
+      </ul>
+      <p>When you ask for a draft, we receive:</p>
+      <ul>
+        <li>for a reply: the sender, subject, and bounded plain text of the message you are replying to, plus any guidance you typed;</li>
+        <li>for a new message: the recipient, subject, and the purpose you typed.</li>
+      </ul>
+      <p>
+        This launch version does <strong>not</strong> sample your Sent mail to learn your writing
+        style. If that feature returns, it will have its own separate disclosure and its own
+        explicit opt-in; it will not ride along on this one.
+      </p>
+
+      <h2>What is never sent</h2>
+      <ul>
+        <li>Attachments, inline images, raw HTML, and remote content.</li>
+        <li>Google OAuth tokens of any kind.</li>
+        <li>Gmail data unrelated to the specific operation you triggered.</li>
+        <li>Your local database, action history, or rules.</li>
+        <li>Browser cookies or storage.</li>
+      </ul>
+
+      <h2>What we store</h2>
+      <p>We store two things, both keyed to a pseudonymous identifier:</p>
+      <ul>
+        <li>
+          <strong>A consent receipt:</strong> the version of this disclosure you accepted, when you
+          accepted it, and whether it is active or revoked.
+        </li>
+        <li>
+          <strong>Usage counters:</strong> request counts per minute, day, and month, and token
+          totals, so fair-use limits can be enforced and costs monitored.
+        </li>
+      </ul>
+      <p>
+        The identifier is a keyed hash of the stable account identifier Google returns at sign-in.
+        We do not store your email address — the app does not even request the scope that would
+        give us one — and we cannot reverse the identifier without a key held in Google Secret
+        Manager.
+      </p>
+      <p>
+        <strong>We do not store message content.</strong> Message text passes through memory to
+        produce the classification or draft you asked for and is not written to a database, a log,
+        an error report, or a trace. Our request logs record the operation, the pseudonymous
+        identifier, a status, a duration, and a token count.
+      </p>
+
+      <h2>Subprocessors</h2>
+      <ul>
+        <li>Google Cloud / Firebase — hosting, compute, authentication, and database. Region: [Processing region].</li>
+        <li>[Model service] — processes the message text described above to produce the classification or draft.</li>
+      </ul>
+      <p>
+        The model service operates under terms that prohibit using your content to train or improve
+        a generalized model, and prohibit any secondary use beyond producing the result you asked
+        for. We do not route your content to a provider or route that does not meet that
+        requirement; if no compliant route is available, the request fails and Gmail Agent falls
+        back to rules only rather than quietly using a weaker one.
+      </p>
+
+      <h2>Retention</h2>
+      <ul>
+        <li>Message content: not retained by us.</li>
+        <li>Consent receipts: kept while your session exists, and for [Retention period] after revocation as a record that consent was given and withdrawn.</li>
+        <li>Usage counters: rolling windows, retained no longer than [Retention period].</li>
+        <li>Request logs: [Log retention], content-free.</li>
+      </ul>
+
+      <h2>Limited Use</h2>
+      <p>
+        Gmail Agent’s use of information received from Google APIs adheres to the
+        <a href="https://developers.google.com/terms/api-services-user-data-policy"
+          >Google API Services User Data Policy</a
+        >, including the Limited Use requirements. Google user data is used only to provide the
+        features described in the app and this policy, is not transferred except as described here,
+        is not used for advertising, and is not used to train or improve generalized models.
+      </p>
+
+      <h2>Your choices</h2>
+      <ul>
+        <li>Run with no AI at all, or with your own AI provider key, and nothing reaches us.</li>
+        <li>Turn the included AI off at any time with <code>gmail setup</code>.</li>
+        <li>Disconnect this computer entirely; that revokes the session and erases local credentials.</li>
+        <li>Revoke Google access at <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.</li>
+        <li>Request deletion of your consent receipt and counters — see <a href="/data-deletion">Data deletion</a>.</li>
+      </ul>
+
+      <h2>Changes</h2>
+      <p>
+        If this policy changes in substance, the disclosure version changes with it. The app will
+        stop sending message text and ask you to read and accept the new version before continuing.
+        An old acceptance is never carried forward across a substantive change.
+      </p>
+
+      <h2>Contact</h2>
+      <p>[Privacy contact address].</p>
+
+      <footer>
+        <a href="/">Home</a> · <a href="/terms">Terms</a> ·
+        <a href="/data-deletion">Data deletion</a> · <a href="/security">Security</a> ·
+        <a href="/support">Support</a>
+      </footer>
+    </main>
+  </body>
+</html>

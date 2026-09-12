@@ -9,12 +9,15 @@
 | `src/core/` | Orchestration, policy, action planning, locks, retries. |
 | `src/auth/`, `src/config/` | Google OAuth, credentials, configuration. |
 | `src/gmail/`, `src/calendar/` | Mail and Calendar service adapters and operations. |
-| `src/ai/`, `src/rules/` | Classification and drafting against the user's own provider, plus deterministic rules. |
+| `src/ai/`, `src/rules/` | Classification and drafting — against the user's own provider or the publisher's gateway — plus deterministic rules. |
 | `src/ui/`, `src/docs/` | The loopback browser front-end (`gmail ui`) and the shared command reference that terminal help and the web Commands view both render. |
 | `src/state/`, `src/summary/`, `src/logging/` | SQLite state, reporting, diagnostics. |
 | `src/unsubscribe/` | Unsubscribe support used by older handlers. |
 | `tests/` | Unit/integration checks and helpers. |
 | `evals/` | Placeholder evaluation runner, not a completed quality benchmark. |
+| `gateway/` | The publisher's AI gateway: two typed operations, consent and quota enforcement, and the only code that talks to a model provider. A separate deployable with its own `package.json`; it is not part of the published npm package. |
+| `hosting/` | The hosted setup and policy site (`/connect`, `/privacy`, …) served by Firebase Hosting. |
+| `firebase.json`, `firestore.rules` | Deployment configuration for the gateway and the site. |
 | `docs/` | Public documentation and archived design material. |
 | `dist/`, `node_modules/` | Generated output and dependencies; ignored. |
 
@@ -32,6 +35,19 @@ pnpm lint
 pnpm test
 ```
 
+The gateway is a separate TypeScript project with its own dependencies, so it
+is checked separately:
+
+```sh
+pnpm --dir gateway install --ignore-workspace
+pnpm gateway:typecheck
+node scripts/verify-hosting.mjs   # fails while the site still has release placeholders
+```
+
+Its unit tests live with everything else in `tests/unit/gateway.test.ts` and
+run under `pnpm test`; they cover the checks that happen before any Firebase or
+provider call, which is the part that must never start doing work first.
+
 With `OPENAI_API_KEY` set, `pnpm test:gpt` makes two `store:false` calls using synthetic mail only: one through the production classifier and one through the production drafting path. It uses `GMAIL_AGENT_MODEL` and `GMAIL_AGENT_COMPOSE_MODEL` when set, otherwise the app defaults. This is the opt-in live GPT check; the normal unit suite never spends API credits or sends content off-device.
 
 `pnpm test:integration` is reserved for a future integration suite; its configured `tests/integration/` directory is currently absent, so the command reports no tests. For source-mode help, run `pnpm dev --help`. Build before inspecting `node dist/cli.js --help` so it reflects current source. `src/cli.ts` defines which handlers are exposed to users.
@@ -42,24 +58,30 @@ Setup creates `config.json` in the platform data directory listed in the README.
 
 | Setting or environment variable | Behavior |
 | --- | --- |
-| `GMAIL_AGENT_OAUTH_CLIENT_ID`, `GMAIL_AGENT_OAUTH_CLIENT_SECRET` | Desktop OAuth client. Takes precedence over the client saved by `gmail setup` in `google-oauth-client.json`. |
+| `GMAIL_AGENT_OAUTH_CLIENT_ID`, `GMAIL_AGENT_OAUTH_CLIENT_SECRET` | Desktop OAuth client. Highest precedence: ahead of the client saved by `gmail setup` in `google-oauth-client.json`, which is itself ahead of the publisher client a release embeds. |
+| `GMAIL_AGENT_PUBLISHER_OAUTH_CLIENT_ID`, `GMAIL_AGENT_PUBLISHER_OAUTH_CLIENT_SECRET` | Stands in for the release-embedded publisher client, for exercising the one-consent flow against a staging project without rebuilding. |
+| `GMAIL_AGENT_SETUP_PAGE_URL` | Base URL of the hosted disclosure page. Only used when the resolved client is the publisher's. |
+| `GMAIL_AGENT_AI_GATEWAY_URL`, `GMAIL_AGENT_FIREBASE_API_KEY` | The included AI service. Both are required; either alone resolves to no hosted service at all. `http://127.0.0.1` is permitted here for local development, and `scripts/verify-package.mjs` rejects it in a release. The *option* is additionally only offered when the publisher client and setup page are configured too (`hostedOnboardingAvailable`), because the hosted session is minted from the ID token that consent produces — an install that already has a session keeps working on the gateway alone. |
 | `GMAIL_AGENT_DATA_DIR` | Relocates config, SQLite state, logs, and the saved OAuth client. Used by tests; also useful for keeping state on an encrypted volume. |
 | `OPENAI_API_KEY` | AI credential fallback after OS credential lookup, for headless use. |
 | `timezone` | IANA timezone confirmed during setup. |
 | `model`, `composeModel` | Separate models for classification and drafting. |
 | `GMAIL_AGENT_MODEL`, `GMAIL_AGENT_COMPOSE_MODEL` | Live overrides of saved model names. |
-| `aiProvider` | `openai` or `openai-compatible`. |
+| `aiProvider` | `hosted`, `openai`, or `openai-compatible`. |
+| `hostedAiConsent` | Written only by an affirmative acceptance: the exact disclosure version and when it was accepted. Required whenever `aiProvider` is `hosted` — a hosted config without one fails to load rather than sending message text on the strength of a default. A receipt naming an older version makes setup reopen the disclosure. |
 | `aiBaseUrl` | Required for `openai-compatible`; ignored for `openai`. |
 | `GMAIL_AGENT_AI_PROVIDER`, `GMAIL_AGENT_AI_BASE_URL` | Seed a newly created config; do not override an existing file on every run. |
 | `concurrency` | Defaults: `gmailReads: 8`, `aiCalls: 5`, `calendarWrites: 2`. Parallelism does not increase quota. |
 | `aiEnabled` | A real off switch: false means no classification or drafting call is made, whatever credentials exist. Set it through `gmail setup`. |
 | `automationEnabled` | Legacy field; not an operational off switch. |
-| `schemaVersion` | `3`. A `1` file records its effective legacy AI state; a file naming a retired provider (the former local runtime, or the former hosted gateway) moves to `openai` with `aiEnabled: false` and discards incompatible settings, so setup asks before anything bills the user's own account. Migrated files are rewritten in place. |
+| `schemaVersion` | `4`. A `1` file records its effective legacy AI state; a file naming a retired provider (the former local runtime, or the former hosted gateway) moves to `openai` with `aiEnabled: false` and discards incompatible settings, so setup asks before anything bills the user's own account. Migrated files are rewritten in place. |
 | `GMAIL_AGENT_RATE_LIMIT_RPS` | Advanced read-equivalent rate override for a verified quota. |
 
 Prefer `gmail setup` over editing the file: it writes the same fields and validates them. Hand-editing still works for advanced cases.
 
-Both providers require the user's own key and a Responses API endpoint with Structured Outputs; Chat Completions compatibility alone is insufficient. There is deliberately no hosted option: this tool has no server, so no third party's key, quota, or logs are ever in the path.
+`openai` and `openai-compatible` both require the user's own key and a Responses API endpoint with Structured Outputs; Chat Completions compatibility alone is insufficient. `hosted` requires no key at all: it authenticates with a Firebase session established during the same Google consent, and the gateway owns the model, the prompt, and the provider route.
+
+A source checkout has no publisher configuration embedded, so `hosted` is not offered there and `availableAiAccessOptions()` hides it. To exercise it locally, run the gateway against the Firebase emulators and set `GMAIL_AGENT_AI_GATEWAY_URL` plus `GMAIL_AGENT_FIREBASE_API_KEY` (and, for the full one-consent flow, `GMAIL_AGENT_PUBLISHER_OAUTH_CLIENT_*` and `GMAIL_AGENT_SETUP_PAGE_URL`). See [running and deploying the hosted service](production.md).
 
 Config written during sign-in is reloaded into the running process (`core/bootstrap.ts`'s `reloadConfig`), so a provider chosen during first-run setup takes effect in that same run rather than the next one.
 

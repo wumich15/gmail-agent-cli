@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Data deletion — Gmail Agent</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Data deletion</h1>
+      <p class="lede">How to remove everything, on your computer and on ours.</p>
+
+      <h2>On your computer</h2>
+      <p>Disconnect the account. This revokes the Google grant where possible, erases the stored refresh token and the included-AI session, and asks whether to keep local history:</p>
+      <pre><code>gmail setup   # then choose "Disconnect Gmail from this computer"</code></pre>
+      <p>To remove the local cache of message metadata as well:</p>
+      <pre><code>gmail uncache</code></pre>
+      <p>
+        Everything the CLI stores lives in one per-user directory
+        (<code>~/Library/Application Support/gmail-agent-cli</code> on macOS,
+        <code>%APPDATA%\\gmail-agent-cli</code> on Windows,
+        <code>$XDG_CONFIG_HOME/gmail-agent-cli</code> elsewhere). Deleting that directory removes
+        the configuration, the local database, and the diagnostic logs. Secrets live in your OS
+        credential store, not in that directory, which is why disconnecting is the step that erases
+        them.
+      </p>
+
+      <h2>On our side</h2>
+      <p>
+        We hold two things about you: a consent receipt and usage counters, both keyed to a
+        pseudonymous identifier and neither containing your email address or any message content.
+      </p>
+      <p>
+        Disconnecting revokes the session and marks the entitlement revoked. To have the records
+        themselves deleted, email [Privacy contact address] from the Google account you connected,
+        or quote the pseudonymous identifier the CLI shows in <code>gmail doctor</code>. We will
+        confirm and delete within [Deletion SLA].
+      </p>
+
+      <h2>Google’s own copy</h2>
+      <p>
+        Revoking access at
+        <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>
+        ends the app’s authorization independently of anything above. Mail in Gmail’s Trash is
+        deleted by Gmail on its own schedule; this app never deletes mail permanently.
+      </p>
+      <footer>
+        <a href="/">Home</a> · <a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> ·
+        <a href="/data-deletion">Data deletion</a> · <a href="/security">Security</a> ·
+        <a href="/support">Support</a>
+      </footer>
+    </main>
+  </body>
+</html>

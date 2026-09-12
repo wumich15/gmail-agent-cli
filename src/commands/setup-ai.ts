@@ -7,8 +7,11 @@ import {
   applyAiAccessChoice,
   availableAiAccessOptions,
   currentAiAccess,
+  hostedConsentIsStale,
   type AiAccessId
 } from "../core/ai-access.js";
+import { hostedSessionStored } from "../auth/hosted-session.js";
+import { HOSTED_AI_POLICY_VERSION } from "../auth/publisher-client.js";
 
 /**
  * The interactive half of the AI access choice. The decision itself, the
@@ -47,12 +50,33 @@ export async function chooseAiAccessInteractively(ctx: CliContext, accountHash: 
   let apiKey: string | null = null;
   if (aiAccessOption(choice).sendsMailOffDevice) {
     const consent = await p.confirm({
-      message: "Send selected message text (never attachments) to the OpenAI API, at your own cost?",
+      message:
+        choice === "hosted"
+          ? "Understood: messages processed by a run, and content used for drafts, will be processed by the " +
+            "publisher and the model service described above?"
+          : "Send selected message text (never attachments) to the OpenAI API, at your own cost?",
       initialValue: false
     });
     if (p.isCancel(consent) || !consent) {
-      p.log.info("Not enabling hosted AI. Nothing was changed.");
+      p.log.info("Not enabling AI. Nothing was changed.");
       return null;
+    }
+    if (choice === "hosted") {
+      // The gateway session is established from the Google ID token issued
+      // during consent, and that token is single-use and short-lived — there
+      // is no way to mint another without a fresh sign-in. So enabling hosted
+      // AI on a computer that has no session means signing in again, which
+      // also reopens the disclosure page and records a new receipt, exactly
+      // as the first-time flow does.
+      const connected = await hostedSessionStored(accountHash, ctx.credentialStore);
+      if (!connected || hostedConsentIsStale(ctx.config)) {
+        p.log.info(
+          "Turning on the included AI service needs one quick Google sign-in, so the service can issue this " +
+            "computer its own session. Choose \"Reconnect Gmail\" in `gmail setup` and pick \"Connect Gmail with " +
+            "hosted AI\" on the page that opens."
+        );
+        return null;
+      }
     }
     if (choice === "api-key") {
       // Typed, not echoed, and stored in the OS credential store — never in
@@ -72,12 +96,17 @@ export async function chooseAiAccessInteractively(ctx: CliContext, accountHash: 
     choice,
     apiKey,
     accountHash,
-    credentialStore: ctx.credentialStore
+    credentialStore: ctx.credentialStore,
+    consentedAt: new Date().toISOString()
   });
   reloadConfig(ctx);
 
   p.log.success(
-    choice === "off" ? "AI is off. Runs will use rules only." : "Using the OpenAI API with your key."
+    choice === "off"
+      ? "AI is off. Runs will use rules only."
+      : choice === "hosted"
+        ? `Using the included AI service (disclosure ${HOSTED_AI_POLICY_VERSION}). Your Sent mail is never sampled.`
+        : "Using the OpenAI API with your key."
   );
   return choice;
 }

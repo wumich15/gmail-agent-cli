@@ -7,8 +7,10 @@ import {
   aiAccessOption,
   applyAiAccessChoice,
   availableAiAccessOptions,
-  currentAiAccess
+  currentAiAccess,
+  hostedConsentIsStale
 } from "../../src/core/ai-access.js";
+import { HOSTED_AI_POLICY_VERSION } from "../../src/auth/publisher-client.js";
 import { loadConfig } from "../../src/config/load.js";
 import {
   defaultConfig,
@@ -35,20 +37,29 @@ function memoryStore(initial: Record<string, string> = {}): CredentialStore {
 
 describe("AI access options", () => {
   it("states cost and data-sharing consequences for every option before it can be chosen", () => {
-    expect(AI_ACCESS_OPTIONS.map((option) => option.id)).toEqual(["api-key", "off"]);
+    expect(AI_ACCESS_OPTIONS.map((option) => option.id)).toEqual(["hosted", "api-key", "off"]);
     for (const option of AI_ACCESS_OPTIONS) {
       expect(option.requirements.length).toBeGreaterThan(20);
       expect(option.summary.length).toBeGreaterThan(20);
     }
   });
 
-  it("keeps the one option that sends mail anywhere clearly marked as doing so", () => {
+  it("keeps every option that sends mail anywhere clearly marked as doing so", () => {
     // Nothing may send mail text off the device without the user having seen
     // that fact attached to the option they picked.
     const offDevice = AI_ACCESS_OPTIONS.filter((option) => option.sendsMailOffDevice);
-    expect(offDevice.map((option) => option.id)).toEqual(["api-key"]);
-    expect(offDevice[0]?.needsApiKey).toBe(true);
+    expect(offDevice.map((option) => option.id)).toEqual(["hosted", "api-key"]);
+    expect(aiAccessOption("api-key").needsApiKey).toBe(true);
+    // The whole point of the included service is that it needs no key.
+    expect(aiAccessOption("hosted").needsApiKey).toBe(false);
     expect(aiAccessOption("off").sendsMailOffDevice).toBe(false);
+  });
+
+  it("tells hosted users their Sent mail is not sampled, since that is the one thing it does differently", () => {
+    // The launch decision is that hosted AI never reads Sent mail for a
+    // writing-style profile. A user cannot consent to an exception they were
+    // never told about, so the option text itself has to carry it.
+    expect(aiAccessOption("hosted").requirements).toMatch(/Sent mail is never sampled/i);
   });
 });
 
@@ -87,8 +98,86 @@ describe("applyAiAccessChoice", () => {
     ).toMatchObject({ provider: "openai", apiKey: "sk-user-owned", baseURL: null });
   });
 
-  it("offers exactly two choices: the user's own key, or no AI at all", () => {
-    expect(availableAiAccessOptions().map((option) => option.id)).toEqual(["api-key", "off"]);
+  it("hides the included AI service in a build that has no gateway to call", () => {
+    // A source checkout has no publisher configuration. Offering a choice
+    // that could only fail on its first real call is worse than not offering
+    // it, so it disappears rather than erroring later.
+    expect(availableAiAccessOptions({}).map((option) => option.id)).toEqual(["api-key", "off"]);
+  });
+
+  it("offers the included AI service once a gateway is configured", () => {
+    // All three parts, because the option is only offered by a build that
+    // could actually finish connecting it.
+    const env = {
+      GMAIL_AGENT_PUBLISHER_OAUTH_CLIENT_ID: "publisher-123.apps.googleusercontent.com",
+      GMAIL_AGENT_PUBLISHER_OAUTH_CLIENT_SECRET: "GOCSPX-publisher",
+      GMAIL_AGENT_SETUP_PAGE_URL: "https://setup.example.test",
+      GMAIL_AGENT_AI_GATEWAY_URL: "https://ai.example.test",
+      GMAIL_AGENT_FIREBASE_API_KEY: "AIzaTestKeyValue"
+    } satisfies NodeJS.ProcessEnv;
+    expect(availableAiAccessOptions(env).map((option) => option.id)).toEqual(["hosted", "api-key", "off"]);
+  });
+
+  it("records the exact disclosure version accepted, and drops it when the user leaves hosted AI", async () => {
+    const store = memoryStore();
+    process.env["GMAIL_AGENT_PUBLISHER_OAUTH_CLIENT_ID"] = "publisher-123.apps.googleusercontent.com";
+    process.env["GMAIL_AGENT_PUBLISHER_OAUTH_CLIENT_SECRET"] = "GOCSPX-publisher";
+    process.env["GMAIL_AGENT_SETUP_PAGE_URL"] = "https://setup.example.test";
+    process.env["GMAIL_AGENT_AI_GATEWAY_URL"] = "https://ai.example.test";
+    process.env["GMAIL_AGENT_FIREBASE_API_KEY"] = "AIzaTestKeyValue";
+    try {
+      const hosted = await applyAiAccessChoice({
+        config: defaultConfig("UTC"),
+        choice: "hosted",
+        accountHash: "acct",
+        credentialStore: store,
+        configPath,
+        consentedAt: "2026-09-12T00:00:00.000Z"
+      });
+      expect(hosted).toMatchObject({ aiEnabled: true, aiProvider: "hosted" });
+      expect(hosted.hostedAiConsent).toEqual({
+        policyVersion: HOSTED_AI_POLICY_VERSION,
+        acceptedAt: "2026-09-12T00:00:00.000Z"
+      });
+      expect(currentAiAccess(hosted)).toBe("hosted");
+      expect(hostedConsentIsStale(hosted)).toBe(false);
+
+      // A receipt that outlived the choice it was taken for would misreport
+      // what this install is actually doing.
+      const own = await applyAiAccessChoice({
+        config: hosted,
+        choice: "api-key",
+        apiKey: "sk-user-owned",
+        accountHash: "acct",
+        credentialStore: store,
+        configPath
+      });
+      expect(own.hostedAiConsent).toBeUndefined();
+    } finally {
+      delete process.env["GMAIL_AGENT_PUBLISHER_OAUTH_CLIENT_ID"];
+      delete process.env["GMAIL_AGENT_PUBLISHER_OAUTH_CLIENT_SECRET"];
+      delete process.env["GMAIL_AGENT_SETUP_PAGE_URL"];
+      delete process.env["GMAIL_AGENT_AI_GATEWAY_URL"];
+      delete process.env["GMAIL_AGENT_FIREBASE_API_KEY"];
+    }
+  });
+
+  it("treats a consent receipt for an older disclosure as stale", () => {
+    const stale = parseConfig({
+      ...defaultConfig("UTC"),
+      aiEnabled: true,
+      aiProvider: "hosted",
+      hostedAiConsent: { policyVersion: "hosted-ai-1999-01-01", acceptedAt: "1999-01-01T00:00:00.000Z" }
+    });
+    expect(hostedConsentIsStale(stale)).toBe(true);
+  });
+
+  it("refuses to load a hosted config with no consent receipt at all", () => {
+    // Without a receipt, loading this config would start sending message text
+    // to a third party on the strength of a default value.
+    expect(() =>
+      parseConfig({ ...defaultConfig("UTC"), aiEnabled: true, aiProvider: "hosted" })
+    ).toThrow();
   });
 
   it("switching from a compatible endpoint back to OpenAI drops the custom base URL", async () => {

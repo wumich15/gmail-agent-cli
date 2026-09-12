@@ -9,6 +9,9 @@ import { MIGRATIONS } from "../state/migrations/index.js";
 import { EXIT_CODES } from "../core/errors.js";
 import { DateTime } from "luxon";
 import { getAiStatus, getConnectionStatus } from "../core/onboarding.js";
+import { hostedSessionStored } from "../auth/hosted-session.js";
+import { resolveHostedAiService } from "../auth/publisher-client.js";
+import { hostedConsentIsStale } from "../core/ai-access.js";
 
 type CheckStatus = "ok" | "warn" | "fail";
 interface CheckResult {
@@ -85,8 +88,15 @@ export async function runDoctor(): Promise<number> {
 
   let oauthCredentials: { clientId: string; clientSecret: string } | null = null;
   try {
-    oauthCredentials = resolveOAuthClientCredentials();
-    results.push({ name: "OAuth client configuration", status: "ok", detail: "development client configured" });
+    const resolved = resolveOAuthClientCredentials();
+    oauthCredentials = resolved;
+    const origin =
+      resolved.source === "publisher"
+        ? "this release's publisher Google app"
+        : resolved.source === "stored"
+          ? "the Google app saved on this computer"
+          : "GMAIL_AGENT_OAUTH_CLIENT_ID/SECRET from the environment";
+    results.push({ name: "OAuth client configuration", status: "ok", detail: `signing in with ${origin}` });
   } catch (error) {
     results.push({
       name: "OAuth client configuration",
@@ -142,9 +152,30 @@ export async function runDoctor(): Promise<number> {
   }
 
   if (ctx) {
+    const hostedService = resolveHostedAiService();
+    const connection = await getConnectionStatus(ctx).catch(() => null);
+    if (ctx.config?.aiProvider === "hosted" || hostedService) {
+      const sessionPresent =
+        connection?.accountHash != null && (await hostedSessionStored(connection.accountHash, ctx.credentialStore));
+      results.push({
+        name: "Included AI service",
+        status: !hostedService ? "warn" : sessionPresent ? "ok" : ctx.config?.aiProvider === "hosted" ? "fail" : "warn",
+        detail: !hostedService
+          ? "this build has no publisher AI service configured"
+          : sessionPresent
+            ? `session stored for ${hostedService.baseUrl} (${hostedService.source} configuration)`
+            : "no session on this computer; run `gmail setup` to connect one"
+      });
+      if (hostedConsentIsStale(ctx.config)) {
+        results.push({
+          name: "Included AI disclosure",
+          status: "warn",
+          detail: "the data disclosure changed since it was accepted; re-accept it in `gmail setup`"
+        });
+      }
+    }
     try {
-      const connection = await getConnectionStatus(ctx);
-      const ai = await getAiStatus(ctx, connection.accountHash);
+      const ai = await getAiStatus(ctx, connection?.accountHash ?? null);
       results.push({
         name: "AI classification",
         status: ai.ready ? "ok" : "warn",

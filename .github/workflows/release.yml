@@ -1,9 +1,14 @@
 # Publish a release of the CLI.
 #
-# There is nothing publisher-specific to embed: every user connects their own
-# Google project and their own AI provider key, so a release is just a clean,
-# verified build. The job still refuses to publish a package that contains a
-# credential or local development state.
+# A release optionally embeds the publisher configuration that makes one-consent
+# onboarding possible: the Desktop OAuth client, the setup page, the AI gateway,
+# and the Firebase project. None of those values is confidential (see
+# src/auth/publisher-client.ts), and a model-provider key is never among them.
+#
+# With the `release` environment's variables unset, this publishes a source-style
+# build with no publisher behind it, which the CLI reports honestly. Either way
+# the job refuses to publish a package containing a credential, a half-embedded
+# configuration, or local development state.
 name: Release
 
 on:
@@ -35,14 +40,36 @@ jobs:
           cache: pnpm
           registry-url: https://registry.npmjs.org
       - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir gateway install --no-frozen-lockfile --ignore-workspace
 
       - name: Re-run the full verification suite
         run: |
           pnpm lint
           pnpm typecheck
+          pnpm gateway:typecheck
           pnpm test
 
       - run: pnpm build
+
+      # Skipped when the publisher variables are unset, which produces a build
+      # with no publisher configuration rather than a half-embedded one.
+      - name: Embed publisher configuration
+        if: vars.PUBLISHER_OAUTH_CLIENT_ID != ''
+        env:
+          GMAIL_AGENT_PUBLISHER_OAUTH_CLIENT_ID: ${{ vars.PUBLISHER_OAUTH_CLIENT_ID }}
+          GMAIL_AGENT_PUBLISHER_OAUTH_CLIENT_SECRET: ${{ secrets.PUBLISHER_OAUTH_CLIENT_SECRET }}
+          GMAIL_AGENT_PUBLISHER_SETUP_PAGE_URL: ${{ vars.PUBLISHER_SETUP_PAGE_URL }}
+          GMAIL_AGENT_PUBLISHER_AI_GATEWAY_URL: ${{ vars.PUBLISHER_AI_GATEWAY_URL }}
+          GMAIL_AGENT_PUBLISHER_FIREBASE_API_KEY: ${{ vars.PUBLISHER_FIREBASE_API_KEY }}
+        run: pnpm embed:release
+
+      # Only meaningful for a build that embeds a publisher, since the pages
+      # disclose what that publisher's service does. A release without one is
+      # not shipping those pages.
+      - name: Verify the hosted setup and policy pages
+        if: vars.PUBLISHER_OAUTH_CLIENT_ID != ''
+        run: pnpm verify:hosting
+
       - name: Verify the package contains no credentials or local state
         run: pnpm verify:package
       - name: Software bill of materials

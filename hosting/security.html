@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Security — Gmail Agent</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Security</h1>
+      <p class="lede">How Gmail Agent is built to fail safe, and how to report a problem.</p>
+
+      <h2>Reporting a vulnerability</h2>
+      <p>
+        Email [Security contact address]. Please include enough detail to reproduce the issue. We
+        aim to acknowledge within [Acknowledgement SLA] and will keep you updated until it is
+        resolved. Please do not test against mailboxes you do not own.
+      </p>
+
+      <h2>Credentials</h2>
+      <ul>
+        <li>Google refresh tokens and the included-AI session token live in your OS credential store (Keychain, Credential Manager, or Secret Service), never in a config file, the database, a log, or a command-line flag.</li>
+        <li>Access tokens are held in memory only.</li>
+        <li>Sign-in uses the OAuth installed-app flow with PKCE S256, a random state, an OIDC nonce, and a loopback listener bound to 127.0.0.1 on a random port. There is no copy/paste flow and no embedded browser.</li>
+        <li>The service holds no Google credential of yours and cannot call Gmail on your behalf.</li>
+        <li>Any model-provider key exists only in Google Secret Manager, bound to the gateway runtime. It is never returned to a client.</li>
+      </ul>
+
+      <h2>Scopes</h2>
+      <p>
+        Gmail Agent requests <code>gmail.modify</code> and <code>calendar.events.owned</code>, plus
+        <code>openid</code> when the included AI is available so the service can authenticate you
+        without ever seeing your address. It does not request full mail access, Gmail settings,
+        Drive, or Contacts, and it never calls Gmail’s permanent-delete endpoints.
+      </p>
+
+      <h2>Untrusted content</h2>
+      <p>
+        Email is treated as data, never as instructions. The model has no tools, no network access,
+        no credentials, and no ability to act; it returns a typed assessment that deterministic code
+        on your computer turns into actions. Instructions and content are kept in separate parts of
+        every request, with an explicit direction to ignore anything in the content that reads as a
+        directive. A date the model claims is verified against the message text before any calendar
+        event is created, and a suspicious classification never produces an automated action.
+      </p>
+
+      <h2>The gateway</h2>
+      <ul>
+        <li>Two typed operations, with closed schemas and hard input bounds. No model name, tool, provider URL, or unknown field is accepted from a caller.</li>
+        <li>Every request requires a verified session and a current, non-revoked consent receipt.</li>
+        <li>Per-user quotas are reserved atomically before any paid call; instance counts and concurrency are capped; a global switch disables the service without a redeploy.</li>
+        <li>Logs record operation, pseudonymous identifier, status, duration, and token counts — never content, tokens, addresses, or raw provider errors.</li>
+      </ul>
+
+      <h2>What this design does not claim</h2>
+      <p>
+        The CLI is open source and its OAuth client configuration is necessarily public, so we
+        cannot prove a given request came from an unmodified build. That is why the real boundaries
+        are the narrow request schema, the consent gate, the quota, and Google’s own consent screen
+        — not client integrity.
+      </p>
+      <footer>
+        <a href="/">Home</a> · <a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> ·
+        <a href="/data-deletion">Data deletion</a> · <a href="/security">Security</a> ·
+        <a href="/support">Support</a>
+      </footer>
+    </main>
+  </body>
+</html>

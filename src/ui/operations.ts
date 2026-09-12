@@ -7,7 +7,8 @@ import {
   type AiStatus,
   type ConnectionStatus
 } from "../core/onboarding.js";
-import { applyAiAccessChoice, type AiAccessId } from "../core/ai-access.js";
+import { applyAiAccessChoice, hostedConsentIsStale, type AiAccessId } from "../core/ai-access.js";
+import { hostedSessionStored } from "../auth/hosted-session.js";
 import { validateOAuthClientInput, writeStoredOAuthClient } from "../auth/oauth-client-file.js";
 import { loadOrCreateDefaultConfig } from "../config/load.js";
 import { runWork } from "../commands/work.js";
@@ -127,8 +128,13 @@ export class UiSession {
           note:
             result.missingScopes.length > 0
               ? `Connected as ${result.emailDisplay}, but Google did not report granting: ${result.missingScopes.join(", ")}.`
-              : `Connected as ${result.emailDisplay}. Nothing in your mailbox was changed.`
+              : result.hostedAiProblem
+                ? `Connected as ${result.emailDisplay}, but the included AI service could not be enabled: ${result.hostedAiProblem}`
+                : `Connected as ${result.emailDisplay}. Nothing in your mailbox was changed.`
         };
+        // The sign-in may have changed the AI provider (the disclosure page
+        // asks), so the cached config this process started with is stale.
+        reloadConfig(this.ctx);
       })
       .catch((error: unknown) => {
         this.state = {
@@ -167,13 +173,31 @@ export class UiSession {
 
   async setAiAccess(choice: AiAccessId, apiKey: string | null): Promise<void> {
     const connection = await getConnectionStatus(this.ctx);
+    if (choice === "hosted") {
+      // The gateway session is minted from the Google ID token issued during
+      // consent, which is single-use and short-lived. Turning the included
+      // service on therefore means signing in again, which is also what
+      // reopens the disclosure and records a fresh receipt. Saying so is
+      // better than writing a config that would classify nothing.
+      const connected =
+        connection.accountHash !== null &&
+        (await hostedSessionStored(connection.accountHash, this.ctx.credentialStore));
+      if (!connected || hostedConsentIsStale(this.ctx.config)) {
+        throw new UiError(
+          "Turning on the included AI service needs one more Google sign-in, so the service can issue this " +
+            "computer its own session. Use Reconnect Gmail and choose \"Connect Gmail with hosted AI\".",
+          409
+        );
+      }
+    }
     const config = this.ctx.config ?? loadOrCreateDefaultConfig(Intl.DateTimeFormat().resolvedOptions().timeZone);
     await applyAiAccessChoice({
       config,
       choice,
       apiKey,
       accountHash: connection.accountHash ?? "",
-      credentialStore: this.ctx.credentialStore
+      credentialStore: this.ctx.credentialStore,
+      consentedAt: new Date().toISOString()
     });
     reloadConfig(this.ctx);
   }

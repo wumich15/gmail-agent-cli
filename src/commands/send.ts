@@ -48,6 +48,7 @@ export async function runSend(options: SendOptions): Promise<number> {
   ): Promise<string | null> =>
     getWritingStyleProfile(
       {
+        config: ctx.config,
         db: ctx.db,
         accountHash: account.accountHash,
         gmailClient,

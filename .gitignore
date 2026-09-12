@@ -9,6 +9,13 @@ dist/
 *.sqlite-wal
 *.sqlite-shm
 coverage/
+gateway/lib/
+
+# Firebase CLI local state (emulator data, deploy cache, project aliases).
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
 
 # Local project notes (case-insensitive spellings; keep on disk, out of Git).
 /[Cc][Ll][Aa][Uu][Dd][Ee].[Mm][Dd]

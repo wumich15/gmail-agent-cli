@@ -36,8 +36,14 @@ jobs:
       # --frozen-lockfile: a release must build the dependency set that was
       # reviewed, never one resolved fresh at build time.
       - run: pnpm install --frozen-lockfile
+      # The gateway is a separate deployable with its own dependency set. Its
+      # sources are linted with its own tsconfig, and the unit suite exercises
+      # the checks it performs before any Firebase or provider call, so both
+      # need its node_modules present.
+      - run: pnpm --dir gateway install --no-frozen-lockfile --ignore-workspace
       - run: pnpm lint
       - run: pnpm typecheck
+      - run: pnpm gateway:typecheck
       - run: pnpm test
       - run: pnpm build
 

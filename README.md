@@ -8,7 +8,9 @@ gmail             # do it
 gmail --archive   # ...and clear read mail out of the Inbox too
 ```
 
-Everything runs on your own computer. There is no server, no hosted account, and no service in the middle: you connect the tool to your own Google project and your own AI provider key, and your mail never passes through anyone else's infrastructure.
+Everything runs on your own computer. You build it from this repository, connect it to a Google app you register yourself, and point it at your own OpenAI key — or at no AI at all, which is a real mode rather than a preview. Nothing is relayed through anyone else, and your mail is never stored on a server.
+
+There is also an optional hosted path in the tree (`gateway/`, `hosting/`) for signing in through a shared Google app and a publisher-funded AI service. It is **not configured and not enabled here**, and a build from this source tree never offers it. See [docs/production.md](docs/production.md) if you ever want to stand it up.
 
 **[gmail-agent-cli](https://wumich15.github.io/gmail-agent-cli/)** · [Documentation](docs/README.md) · [Setup walkthrough](docs/setup.md) · [All commands and keyboard shortcuts](docs/commands.md) · [Development](docs/development.md)
 
@@ -35,11 +37,11 @@ Everything runs on your own computer. There is no server, no hosted account, and
 
 ## Where your mail goes
 
-Nowhere, unless you turn on AI. The tool talks to Google with an OAuth app you registered yourself, and — only if you choose it — to OpenAI with your own API key. Nothing is relayed through anyone else, because there is no one else.
+Nowhere, unless you turn on AI. Gmail API traffic always goes straight from your computer to Google; it is never proxied.
 
 - **Your sign-in** lives in your OS credential store (macOS Keychain, Windows Credential Manager, Linux Secret Service), never in a config file or log.
 - **Message bodies are never written to disk.** The local SQLite cache holds IDs, labels, dates, senders, content hashes and an action ledger; reading a message fetches it live.
-- **With AI on**, the sender, subject, date and a bounded plain-text excerpt of the message being classified are sent to OpenAI with `store: false`. Never attachments, never your Gmail tokens.
+- **With your own OpenAI key**, each unresolved message in a run — not only ones you pick — has its sender, subject, date, your timezone, a bulk-mail signal, your Gmail label names, and a bounded plain-text excerpt sent from this computer directly to OpenAI under your account, with `store: false`. Drafting sends the message you are replying to, or the recipient/subject/purpose you typed. Never attachments, and never your Gmail tokens.
 - **Rules-only mode is a real mode**, not a preview: Gmail's own spam handling, your rules, and archiving read mail all work with nothing leaving your computer.
 
 ## What it costs
@@ -75,7 +77,7 @@ Then, for the guided path, run `gmail install` and skip to step 5. Everything be
 
 ### 2. Connect it to your own Google project
 
-Google requires an app to identify itself before it can touch a mailbox, and this tool ships no shared identity on purpose — a shared one would put whoever registered it in the path of everyone else's mail and API quota. So you register a Google app of your own, once:
+A build from this source tree ships no shared Google identity, so you register a Google app of your own, once. Your mail is then only ever reachable with your own credentials, and the API quota it uses is your own:
 
 1. Create a project at [console.cloud.google.com](https://console.cloud.google.com/projectcreate) (any name).
 2. Enable the **Gmail API** and the **Google Calendar API** in it.
@@ -121,7 +123,7 @@ gmail view --previous
 
 ### 4. Choose how AI works
 
-`gmail setup` (or the Setup page in `gmail ui`) offers two options and shows what each one costs before you pick it:
+`gmail setup` (or the Setup page in `gmail ui`) offers two options here and shows what each one costs before you pick it:
 
 | Option | What it needs | Where your mail is processed |
 | --- | --- | --- |
@@ -130,13 +132,17 @@ gmail view --previous
 
 Choosing the key option asks for explicit consent before any message text leaves the device, and stores the key in your OS credential store — never in `config.json`, a log, or a shell command.
 
+(A third option, a publisher-funded hosted service, exists in the code but only appears in a build that embeds publisher configuration. This one does not, so it is not offered.)
+
 Rules-only mode is a real mode, not a preview: native-spam cleanup, your own rules, and archiving read mail all still work without any AI. Manual reading, composing, and replying never need AI.
 
-`aiEnabled` in `config.json` is a genuine off switch — with it off, no classification or drafting call is made even if a key is present. Configurations left behind by earlier versions that offered a local model runtime or a hosted gateway are migrated to the direct-OpenAI provider with AI switched off, so setup asks before anything starts billing your account.
+`aiEnabled` in `config.json` is a genuine off switch — with it off, no classification or drafting call is made even if a key is present. Configurations left behind by earlier versions that offered a local model runtime or a different hosted gateway are migrated to the direct-OpenAI provider with AI switched off, so setup asks before anything starts billing your account.
 
 Classification uses the saved `model`; drafting uses `composeModel`. `GMAIL_AGENT_MODEL` and `GMAIL_AGENT_COMPOSE_MODEL` override them on each run. For headless automation, `OPENAI_API_KEY` is read from the environment when no key is stored in the credential store. To use any other endpoint implementing the same Responses API — including a model you run yourself — set `aiProvider`/`aiBaseUrl` to `openai-compatible`; see [configuration details](docs/development.md#configuration).
 
-Sending mail text to OpenAI is still sending it to a third party. Calls use `store: false`, which is not a promise of zero provider retention — review OpenAI's data handling before choosing that option. Drafting can use recent Sent mail to build a saved writing-style description (only the description is stored, never the sampled mail).
+Sending mail text to OpenAI is still sending it to a third party. Calls use `store: false`, which is not a promise of zero provider retention — review OpenAI's data handling before choosing that option.
+
+Drafting can sample recent Sent mail to build a saved writing-style description (only the description is stored, never the sampled mail). That sampling is disabled under the hosted provider, which never receives Sent mail.
 
 ### 5. Run cleanup when ready
 
@@ -187,6 +193,7 @@ Tokens and stored AI keys use the OS credential store. SQLite contains mailbox m
 | --- | --- |
 | `gmail` is not found | Reopen the terminal after pnpm setup/linking, or run `node dist/cli.js`. |
 | No OAuth client configured | Run `gmail setup` and paste your Desktop OAuth client, or set both `GMAIL_AGENT_OAUTH_CLIENT_*` variables. See [setup](docs/setup.md). |
+| Asked to sign in again unexpectedly | The stored refresh token is gone from your OS credential store (a keychain reset, a logout, or an expired Testing-mode grant). `gmail setup` → **Reconnect Gmail** puts it back; local history and the message cache are untouched. |
 | Google rejects sign-in | Check the Desktop client, enabled APIs, test-user address, and Workspace administrator restrictions. |
 | Sign-in expires after a week | Check the OAuth app's Testing status and token expiration. |
 | Expired or revoked authorization | Run `gmail setup` and choose **Reconnect Gmail**, or press Connect on the `gmail ui` Setup page. The unusable token is erased automatically the next time it is found to be dead, and a normal run offers to sign in again. |
