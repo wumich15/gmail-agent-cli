@@ -51,5 +51,14 @@ export const SETTING_KEYS = {
    * message bodies; this value is deliberately designed (by its generating
    * prompt) to never reproduce them verbatim.
    */
-  writingStyleProfile: "gmail_writing_style_profile"
+  writingStyleProfile: "gmail_writing_style_profile",
+  /**
+   * When the last attempt to derive a writing-style profile produced
+   * nothing (no Sent mail yet, or the provider declined). Without this
+   * marker every AI draft on such an account re-listed Sent mail and made
+   * another summarization call, forever, to reach the same empty answer.
+   * It is a timestamp rather than a flag so a mailbox that later gains
+   * sent mail is retried on its own instead of needing ";s".
+   */
+  writingStyleProfileUnavailableAt: "gmail_writing_style_profile_unavailable_at"
 } as const;

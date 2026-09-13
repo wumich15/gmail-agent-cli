@@ -763,14 +763,26 @@ async function runFullScan(
  * made a capped run's "most recent unread" wrong.
  *
  * Ranking, newest first:
- *   1. messages Gmail just told us are the newest in Inbox/native Spam
- *      (listed newest-first, so list position *is* the ranking);
+ *   1. messages Gmail just listed among the newest but that we have never
+ *      cached at all — they are new mail by definition, and a capped run
+ *      missing exactly the newest mail is the bug this exists to fix.
+ *      Inbox before native Spam, then by position within that listing;
  *   2. messages with a locally cached `internalDate`, most recent first;
  *   3. anything still undated, in queue order.
  *
- * Step 1 is skipped when the local cache was refreshed recently enough to
- * rank recency by itself (`cacheRecencyIsFresh`), so the common warm case
- * still costs no extra Gmail calls.
+ * The Inbox and Spam listings are two independent newest-first sequences,
+ * so their positions are not comparable to each other: ranking tier 1 by
+ * position across both (which an earlier version did, merging on the lower
+ * index) made Spam position *i* tie with Inbox position *i*, so an old spam
+ * message could displace far more recent Inbox mail. Anything we hold a
+ * real timestamp for is therefore ranked by that timestamp instead, which
+ * is the only key that orders the two folders against each other; position
+ * is used only where there is no timestamp to use, and Inbox wins there
+ * because that is the folder the cap is meant to serve.
+ *
+ * The listing is skipped entirely when the local cache was refreshed
+ * recently enough to rank recency by itself (`cacheRecencyIsFresh`), so the
+ * common warm case still costs no extra Gmail calls.
  */
 async function selectMostRecentStubs(
   queued: readonly MessageStub[],
@@ -779,7 +791,7 @@ async function selectMostRecentStubs(
   diagnostics: ScanDiagnostics
 ): Promise<{ selected: MessageStub[]; consideredCount: number }> {
   const byId = new Map(queued.map((stub) => [stub.id, stub] as const));
-  const listedRank = new Map<string, number>();
+  const listedRank = new Map<string, { folder: number; index: number }>();
 
   if (deps.cacheRecencyIsFresh !== true) {
     const listingStartedAt = performance.now();
@@ -801,24 +813,28 @@ async function selectMostRecentStubs(
       }).catch(() => null)
     ]);
     diagnostics.listingMs += performance.now() - listingStartedAt;
-    for (const page of [inboxPage, spamPage]) {
-      if (!page) continue;
+    // Index 0 is Inbox, 1 is native Spam; a message cannot really be in
+    // both, but keep the lower position if Gmail ever reports it twice.
+    [inboxPage, spamPage].forEach((page, folder) => {
+      if (!page) return;
       page.messages.forEach((stub, index) => {
         if (!byId.has(stub.id)) byId.set(stub.id, stub);
         const existing = listedRank.get(stub.id);
-        if (existing === undefined || index < existing) listedRank.set(stub.id, index);
+        if (existing === undefined || index < existing.index) listedRank.set(stub.id, { folder, index });
       });
-    }
+    });
   }
 
   const candidates = [...byId.values()];
   const dates = deps.cachedInternalDates;
   const queueOrder = new Map(candidates.map((stub, index) => [stub.id, index] as const));
   const rankOf = (stub: MessageStub): [number, number, number] => {
-    const listed = listedRank.get(stub.id);
-    if (listed !== undefined) return [0, listed, 0];
     const internalDate = dates?.get(stub.id);
     const parsed = internalDate !== undefined && /^\d+$/.test(internalDate) ? Number(internalDate) : null;
+    const listed = listedRank.get(stub.id);
+    // Just listed among the newest and never seen locally: this is new
+    // mail, and no timestamp we hold can outrank it.
+    if (listed !== undefined && parsed === null) return [0, listed.folder, listed.index];
     if (parsed !== null) return [1, -parsed, 0];
     return [2, 0, queueOrder.get(stub.id) ?? 0];
   };

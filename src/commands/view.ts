@@ -65,6 +65,32 @@ const VIEW_STARTUP_WAIT_MS = 10_000;
  */
 const VIEW_NAVIGATION_WAIT_MS = 2_500;
 
+/**
+ * How much of a message body the read view renders.
+ *
+ * Deliberately far larger than the classifier's own cap: that one exists to
+ * bound what is sent to a model, and reusing it here meant a long message
+ * simply stopped mid-sentence on screen with nothing to say it had. This is
+ * still a bound — a terminal is not the place to dump an unbounded string —
+ * but one a real email essentially never reaches, and `renderMessage` says
+ * so explicitly when it does.
+ */
+const VIEW_READ_BODY_CHARS = 200_000;
+
+/**
+ * How many consecutive failed loop iterations end the session.
+ *
+ * A caught error keeps the viewer alive, which is the point; but if what is
+ * failing is the render or the prompt itself, retrying forever would spin
+ * invisibly instead of reporting anything. A handful of attempts
+ * distinguishes "that command did not work" from "this terminal is gone".
+ */
+const MAX_CONSECUTIVE_VIEW_FAILURES = 5;
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function viewFolderLabel(folder: ViewFolderId): string {
   return VIEW_FOLDERS.find((candidate) => candidate.id === folder)!.label;
 }
@@ -91,6 +117,8 @@ interface ListViewSnapshot {
   pageSize: number;
   selectedTags: Set<string>;
   search: string;
+  /** Restored with the rest of the view so "[" lands the cursor back where it was. */
+  selectedRow: number;
 }
 
 /** `gmail view` — an interactive four-folder terminal mail view with live incremental refresh. */
@@ -153,40 +181,51 @@ export async function runView(options: ViewOptions): Promise<number> {
   };
 
   let refresh: Awaited<ReturnType<typeof refreshViewCache>> | null = null;
+  let startupNotice: string | null = null;
   if (options.previous) {
     console.error(pc.dim("Using the previous Gmail cache without refreshing it."));
   } else {
-    // `gmail cache`'s own full-snapshot timestamp and gmail view's own
-    // incremental-refresh timestamp are tracked separately (see
-    // gmail/view-sync.ts), but whichever happened more recently is what
-    // actually answers "how stale is what I'm about to show" — showing
-    // only the `gmail cache`-specific one made a view session that had
-    // been refreshing itself the whole time (via "u" or on every launch)
-    // still claim to be looking at data from whenever `gmail cache` last
-    // ran, however long ago that was.
-    const lastSyncAt = latestCacheRefreshAt(ctx.db, account.accountHash);
-    console.error(pc.dim(lastSyncAt ? `Updating mail cached ${formatAge(lastSyncAt)}...` : "Updating cached mail..."));
+    try {
+      // `gmail cache`'s own full-snapshot timestamp and gmail view's own
+      // incremental-refresh timestamp are tracked separately (see
+      // gmail/view-sync.ts), but whichever happened more recently is what
+      // actually answers "how stale is what I'm about to show" — showing
+      // only the `gmail cache`-specific one made a view session that had
+      // been refreshing itself the whole time (via "u" or on every launch)
+      // still claim to be looking at data from whenever `gmail cache` last
+      // ran, however long ago that was.
+      const lastSyncAt = latestCacheRefreshAt(ctx.db, account.accountHash);
+      console.error(pc.dim(lastSyncAt ? `Updating mail cached ${formatAge(lastSyncAt)}...` : "Updating cached mail..."));
 
-    refresh = await operations.runExclusive(() => refreshViewCache(ctx.db, gmailClient, account, ctx.clock.nowIso()));
-    if (refresh.kind === "full_required") {
-      console.error(
-        pc.dim(
-          (initialCachedCount > 0
-            ? `The cache contains ${initialCachedCount} message(s), but the four-folder view has no usable history checkpoint. `
-            : "There is no four-folder view cache yet. ") +
-            `Loading only the first ${VIEW_INITIAL_PAGE_COUNT} Inbox pages before opening; the rest will continue in the background.`
-        )
-      );
-      await beginProgressiveCache("inbox");
-    } else if (refresh.added + refresh.updated + refresh.removed > 0 || refresh.failed > 0) {
-      console.error(
-        pc.dim(
-          `Mail updated: ${refresh.added} new, ${refresh.updated} changed, ${refresh.removed} removed` +
-            (refresh.failed > 0 ? `, ${refresh.failed} will retry later` : "") + "."
-        )
-      );
-    } else {
-      console.error(pc.dim("Mail is up to date."));
+      refresh = await operations.runExclusive(() => refreshViewCache(ctx.db, gmailClient, account, ctx.clock.nowIso()));
+      if (refresh.kind === "full_required") {
+        console.error(
+          pc.dim(
+            (initialCachedCount > 0
+              ? `The cache contains ${initialCachedCount} message(s), but the four-folder view has no usable history checkpoint. `
+              : "There is no four-folder view cache yet. ") +
+              `Loading only the first ${VIEW_INITIAL_PAGE_COUNT} Inbox pages before opening; the rest will continue in the background.`
+          )
+        );
+        await beginProgressiveCache("inbox");
+      } else if (refresh.added + refresh.updated + refresh.removed > 0 || refresh.failed > 0) {
+        console.error(
+          pc.dim(
+            `Mail updated: ${refresh.added} new, ${refresh.updated} changed, ${refresh.removed} removed` +
+              (refresh.failed > 0 ? `, ${refresh.failed} will retry later` : "") + "."
+          )
+        );
+      } else {
+        console.error(pc.dim("Mail is up to date."));
+      }
+    } catch (error) {
+      // A cache-first viewer that refuses to open because Gmail is
+      // unreachable has its failure mode backwards: the mail it was about
+      // to show is already on disk. Report the refresh failure and open
+      // anyway — the same place `--previous` deliberately starts from —
+      // instead of exiting to a stack trace. "u" retries.
+      startupNotice = `Could not refresh from Gmail: ${describeError(error)}. Showing the mail already cached; "u" retries.`;
+      console.error(pc.yellow(startupNotice));
     }
   }
 
@@ -212,19 +251,41 @@ export async function runView(options: ViewOptions): Promise<number> {
     page,
     pageSize,
     selectedTags: new Set(selectedTags),
-    search
+    search,
+    selectedRow
   });
   const restoreView = (snapshot: ListViewSnapshot): void => {
     activeFolder = snapshot.folder;
     page = snapshot.page;
-    pageSize = snapshot.pageSize;
+    if (snapshot.pageSize !== pageSize) {
+      pageSize = snapshot.pageSize;
+      progressiveCache.current?.setPageSize(pageSize);
+    }
     selectedTags = new Set(snapshot.selectedTags);
     search = snapshot.search;
+    selectedRow = snapshot.selectedRow;
   };
   const rememberView = (): void => {
     backStack.push(snapshotView());
     if (backStack.length > 50) backStack.shift();
     forwardStack.length = 0;
+  };
+  /** The one page-size change, shared by "+"/"-" and "l <n>" so they cannot drift. */
+  const applyPageSize = async (nextSize: number): Promise<void> => {
+    if (nextSize === pageSize) return;
+    // Keep the message that was at the top of the page in view.
+    const firstVisibleIndex = page * pageSize;
+    rememberView();
+    pageSize = nextSize;
+    page = Math.floor(firstVisibleIndex / pageSize);
+    selectedRow = 0;
+    // The loader's chunk is one UI page, so it has to learn the new size
+    // too; otherwise a widened page is filled by several short round trips,
+    // each taking and releasing the account lock.
+    progressiveCache.current?.setPageSize(pageSize);
+    await progressiveCache.current?.ensureFolder(activeFolder, (page + 1) * pageSize, {
+      timeoutMs: VIEW_NAVIGATION_WAIT_MS
+    });
   };
   // Saved once to SQLite (see gmail/writing-style.ts) instead of being
   // re-derived from a live Sent-mail fetch on every single AI draft/reply —
@@ -244,474 +305,475 @@ export async function runView(options: ViewOptions): Promise<number> {
       forceRefresh
     );
 
-  let notice: string | null = null;
+  let notice: string | null = startupNotice;
+  let consecutiveFailures = 0;
   try {
     for (;;) {
-    // Background hydration never writes to the active prompt. Refreshing the
-    // local snapshot at each redraw makes its newly committed rows appear on
-    // the next user interaction without racing terminal output.
-    all = messagesRepo.listForAccount(account.accountHash);
-    const folderMessages = all.filter((message) => messageIsInViewFolder(message.labelSnapshot, activeFolder));
-    const visible = filterMessages(folderMessages, selectedTags, viewFolderSupportsSearch(activeFolder) ? search : "");
-    const totalPages = Math.max(1, Math.ceil(visible.length / pageSize));
-    page = Math.min(page, totalPages - 1);
-    const pageItems = visible.slice(page * pageSize, (page + 1) * pageSize);
-    selectedRow = pageItems.length === 0 ? 0 : Math.min(selectedRow, pageItems.length - 1);
-    /** Opens one message, staying in the read view across prev/next until the user backs out. */
-    const openSelectedMessage = async (cached: CachedMessageRecord): Promise<{ notice: string | null }> => {
-      let messageIndex = visible.indexOf(cached);
-      if (messageIndex === -1) messageIndex = 0;
-      let openedNotice: string | null = null;
-      for (;;) {
-        const opened = await openMessage(
-          gmailClient,
-          account.accountHash,
-          account.emailDisplay ?? "",
-          visible[messageIndex]!,
-          ctx,
-          getStyleProfile,
-          messageIndex > 0,
-          messageIndex < visible.length - 1,
-          operations.runExclusive,
-          retainInProgressiveSnapshot
-        );
-        openedNotice = opened.notice;
-        if (opened.trashedRecord) lastTrashed = opened.trashedRecord;
-        if (opened.navigation === "previous") messageIndex -= 1;
-        else if (opened.navigation === "next") messageIndex += 1;
-        else break;
-      }
-      all = messagesRepo.listForAccount(account.accountHash);
-      return { notice: openedNotice };
-    };
-
-    renderList(pageItems, {
-      folder: activeFolder,
-      folderCounts: countViewFolders(all),
-      folderLoad: progressiveCache.current?.status(activeFolder) ?? null,
-      backgroundError: progressiveCache.current?.error !== null && progressiveCache.current?.error !== undefined,
-      waitingForAccountLock: progressiveCache.current?.waitingForAccountLock ?? false,
-      page,
-      totalPages,
-      pageSize,
-      total: visible.length,
-      selectedTags,
-      search: viewFolderSupportsSearch(activeFolder) ? search : "",
-      labelNames,
-      notice,
-      selectedRow
-    });
-    notice = null;
-    const input = await readCommandLine("> ", ["left", "right", "up", "down"]);
-    if (input.kind === "cancel") {
-      // Esc always goes "home" (default Inbox filter, no search, first
-      // page) instead of quitting — quitting is q/Ctrl-C only. Useful
-      // after a search or a deep filter/page-history dive.
-      if (activeFolder !== "inbox" || search || selectedTags.size > 0 || page !== 0) {
-        rememberView();
-        activeFolder = "inbox";
-        search = "";
-        selectedTags = new Set();
-        page = 0;
-        selectedRow = 0;
-        if (progressiveCache.current) {
-          await progressiveCache.current.ensureFolder("inbox", pageSize, {
-            timeoutMs: VIEW_NAVIGATION_WAIT_MS
-          });
-        }
-      }
-      continue;
-    }
-    if (input.kind === "key") {
-      if (input.name === "up" || input.name === "down") {
-        if (pageItems.length > 0) {
-          selectedRow =
-            input.name === "up"
-              ? (selectedRow - 1 + pageItems.length) % pageItems.length
-              : (selectedRow + 1) % pageItems.length;
-        }
-        continue;
-      }
-      if (input.name !== "left" && input.name !== "right") continue;
-      rememberView();
-      activeFolder = adjacentViewFolder(activeFolder, input.name);
-      page = 0;
-      selectedRow = 0;
-      selectedTags = new Set();
-      // Search is intentionally Inbox-only for now; changing folders clears
-      // it instead of pretending a partial local cache is a mailbox search.
-      search = "";
-      // One page is all a folder switch needs to draw; the rest of
-      // Archive/Trash/Spam keeps filling in behind the prompt.
-      if (progressiveCache.current) {
-        await progressiveCache.current.ensureFolder(activeFolder, pageSize, {
-          timeoutMs: VIEW_NAVIGATION_WAIT_MS
-        });
-      }
-      continue;
-    }
-    const cmd = input.value.trim();
-
-    if (cmd === "q") break;
-    if (cmd === "") {
-      // Enter on an empty command opens the highlighted row — the ↑/↓
-      // selection cursor's counterpart to typing a number and pressing Enter.
-      if (pageItems.length === 0) continue;
-      const opened = await openSelectedMessage(pageItems[selectedRow]!);
-      notice = opened.notice;
-      continue;
-    }
-    if (cmd === "n") {
-      if (progressiveCache.current) {
-        const status = progressiveCache.current.status(activeFolder);
-        const desired = search || selectedTags.size > 0
-          ? status.cached + pageSize
-          : (page + 2) * pageSize;
-        await progressiveCache.current.ensureFolder(activeFolder, desired, {
-          timeoutMs: VIEW_NAVIGATION_WAIT_MS
-        });
-        all = messagesRepo.listForAccount(account.accountHash);
-      }
-      const refreshedVisible = filterMessages(
-        all.filter((message) => messageIsInViewFolder(message.labelSnapshot, activeFolder)),
-        selectedTags,
-        viewFolderSupportsSearch(activeFolder) ? search : ""
-      );
-      const refreshedTotalPages = Math.max(1, Math.ceil(refreshedVisible.length / pageSize));
-      if (page < refreshedTotalPages - 1) {
-        rememberView();
-        page += 1;
-        selectedRow = 0;
-      } else {
-        notice = progressiveCache.current?.status(activeFolder).complete
-          ? "Already at the last page in this folder."
-          : "No additional cached messages are available yet.";
-      }
-      continue;
-    }
-    if (cmd === "p") {
-      if (page > 0) rememberView();
-      page = Math.max(page - 1, 0);
-      continue;
-    }
-    if (cmd === "[") {
-      const previous = backStack.pop();
-      if (previous) {
-        forwardStack.push(snapshotView());
-        restoreView(previous);
-        if (progressiveCache.current) {
-          await progressiveCache.current.ensureFolder(activeFolder, (page + 1) * pageSize, {
-            timeoutMs: VIEW_NAVIGATION_WAIT_MS
-          });
-        }
-      } else {
-        notice = "No earlier view.";
-      }
-      continue;
-    }
-    if (cmd === "]") {
-      const next = forwardStack.pop();
-      if (next) {
-        backStack.push(snapshotView());
-        restoreView(next);
-        if (progressiveCache.current) {
-          await progressiveCache.current.ensureFolder(activeFolder, (page + 1) * pageSize, {
-            timeoutMs: VIEW_NAVIGATION_WAIT_MS
-          });
-        }
-      } else {
-        notice = "No later view.";
-      }
-      continue;
-    }
-    if (cmd === "+" || cmd === "-") {
-      const nextSize = adjustPageSize(pageSize, cmd === "+" ? "larger" : "smaller");
-      if (nextSize !== pageSize) {
-        const firstVisibleIndex = page * pageSize;
-        rememberView();
-        pageSize = nextSize;
-        page = Math.floor(firstVisibleIndex / pageSize);
-        if (progressiveCache.current) {
-          await progressiveCache.current.ensureFolder(activeFolder, (page + 1) * pageSize, {
-            timeoutMs: VIEW_NAVIGATION_WAIT_MS
-          });
-        }
-      }
-      continue;
-    }
-    const limitMatch = /^l\s+(\d+)$/.exec(cmd);
-    if (limitMatch) {
-      const nextSize = Math.max(1, Number(limitMatch[1]));
-      if (nextSize !== pageSize) {
-        const firstVisibleIndex = page * pageSize;
-        rememberView();
-        pageSize = nextSize;
-        page = Math.floor(firstVisibleIndex / pageSize);
-        if (progressiveCache.current) {
-          await progressiveCache.current.ensureFolder(activeFolder, (page + 1) * pageSize, {
-            timeoutMs: VIEW_NAVIGATION_WAIT_MS
-          });
-        }
-      }
-      continue;
-    }
-    if (cmd === "f" || cmd === "t") {
-      const nextTags = await chooseTags(collectDistinctTags(folderMessages), selectedTags, labelNames);
-      if (!sameSet(nextTags, selectedTags)) {
-        rememberView();
-        selectedTags = nextTags;
-        page = 0;
-      }
-      continue;
-    }
-    if (cmd === "s") {
-      if (!viewFolderSupportsSearch(activeFolder)) {
-        notice = "Search is currently available only in Inbox.";
-        continue;
-      }
-      if (search) {
-        rememberView();
-        search = "";
-        page = 0;
-      }
-      continue;
-    }
-    const searchMatch = /^s\s+(.+)$/.exec(cmd);
-    if (searchMatch) {
-      if (!viewFolderSupportsSearch(activeFolder)) {
-        notice = "Search is currently available only in Inbox.";
-        continue;
-      }
-      const nextSearch = searchMatch[1]!.trim();
-      if (nextSearch !== search) {
-        rememberView();
-        search = nextSearch;
-        page = 0;
-      }
-      continue;
-    }
-    if (cmd === "u") {
-      if (progressiveCache.current) {
-        await progressiveCache.current.stop();
-        progressiveCache.current = null;
-      }
-      const latestAccount = new AccountsRepository(ctx.db).get(account.accountHash) ?? account;
-      refresh = await operations.runExclusive(() =>
-        refreshViewCache(ctx.db, gmailClient, latestAccount, ctx.clock.nowIso())
-      );
-      if (refresh.kind === "full_required") await beginProgressiveCache(activeFolder);
-      account = new AccountsRepository(ctx.db).get(account.accountHash) ?? account;
-      all = messagesRepo.listForAccount(account.accountHash);
-      labelNames = await loadLabelNames(gmailClient);
-      if (page !== 0) {
-        rememberView();
-        page = 0;
-      }
-      notice = "Mail updated.";
-      continue;
-    }
-    if (cmd === "c" || cmd === "a" || cmd === ";c") {
-      // "c" asks how to write it, exactly as `gmail send` does; "a"/";c"
-      // are the shortcut straight to an AI draft.
-      await handleCompose(
-        gmailClient,
-        account.accountHash,
-        cmd === "c" ? undefined : true,
-        ctx,
-        getStyleProfile,
-        {},
-        operations.runExclusive
-      );
-      // Hold the send confirmation on screen; the list redraw would wipe it.
-      console.log(pc.dim("\nPress any key to return to the list."));
-      await waitForKeypress();
-      continue;
-    }
-    if (cmd === ";s") {
-      const credentials = await resolveOpenAiCredentials(
-        { accountHash: account.accountHash, credentialStore: ctx.credentialStore, config: ctx.config },
-        "compose"
-      );
-      if (!credentials) {
-        notice = "AI is not ready; check gmail setup.";
-        continue;
-      }
-      if (credentials.hosted) {
-        // The included AI service never receives Sent mail (see
-        // gmail/writing-style.ts). Say so plainly rather than running a
-        // refresh that would silently produce nothing.
-        notice =
-          "The included AI service never reads your Sent mail, so there is no style profile to refresh. " +
-          "Give drafting instructions when it asks, or switch to your own API key in `gmail setup`.";
-        continue;
-      }
-      const spinner = p.spinner();
-      spinner.start("Refreshing your writing style from recent Sent mail");
-      const profile = await operations.runExclusive(() => getStyleProfile(credentials, true));
-      spinner.stop(profile ? "Writing style saved — future replies/drafts will reuse it." : "Could not derive a writing style from Sent mail.");
-      console.log(pc.dim("\nPress any key to return to the list."));
-      await waitForKeypress();
-      continue;
-    }
-    if (cmd === ";u") {
-      if (!lastTrashed) {
-        notice = "Nothing to undo.";
-        continue;
-      }
-      const toRestore = lastTrashed;
       try {
-        await operations.runExclusive(async () => {
-          await untrashMessage(gmailClient, toRestore.gmailMessageId, toRestore.labelSnapshot);
-          // Refresh the projection timestamp so a concurrent progressive
-          // snapshot that began before this undo cannot prune the restored
-          // row after its folder cursors have already passed it.
-          messagesRepo.upsert({ ...toRestore, processedAt: ctx.clock.nowIso() });
-        });
-        retainInProgressiveSnapshot(toRestore.gmailMessageId);
+        // Background hydration never writes to the active prompt. Refreshing the
+        // local snapshot at each redraw makes its newly committed rows appear on
+        // the next user interaction without racing terminal output.
         all = messagesRepo.listForAccount(account.accountHash);
-        lastTrashed = null;
-        notice = `Restored "${toRestore.subject || "(no subject)"}".`;
-      } catch (error) {
-        notice = `Could not undo: ${error instanceof Error ? error.message : String(error)}`;
-      }
-      continue;
-    }
-    if (cmd === "i") {
-      if (pageItems.length > 0) {
-        const target = pageItems[selectedRow]!;
-        const outcome = await operations.runExclusive(() =>
-          moveCachedToInbox(gmailClient, messagesRepo, target, ctx.clock.nowIso())
-        );
-        if (outcome.record) retainInProgressiveSnapshot(outcome.record.gmailMessageId);
-        notice = outcome.ok
-          ? `Moved "${outcome.record.subject || "(no subject)"}" to Inbox.`
-          : outcome.message;
-      }
-      continue;
-    }
-    if (cmd === "dd") {
-      // "dd" — the same delete as "d" on the highlighted row, with the
-      // confirmation skipped, for clearing a run of junk quickly. Deleting
-      // still means Gmail's Trash, never a permanent delete, and is still
-      // undoable both from Gmail and, for the last one this session, with
-      // ";u" — which is precisely what makes skipping the question
-      // acceptable here when skipping a *send* confirmation never is.
-      //
-      // No "press any key" pause either: the point is speed, so the result
-      // is carried as a notice and printed by the next render instead. The
-      // cursor stays on the same row number, which after the list shifts up
-      // is the following message — so repeating "dd" walks down the list.
-      if (pageItems.length > 0) {
-        const target = pageItems[selectedRow]!;
-        const outcome = await operations.runExclusive(() =>
-          trashCached(gmailClient, messagesRepo, target, ctx.clock.nowIso())
-        );
-        if (outcome.ok) {
-          retainInProgressiveSnapshot(outcome.record.gmailMessageId);
-          lastTrashed = outcome.record;
-          notice = `Moved "${outcome.record.subject || "(no subject)"}" to Trash. ";u" undoes it.`;
+        const folderMessages = all.filter((message) => messageIsInViewFolder(message.labelSnapshot, activeFolder));
+        const visible = filterMessages(folderMessages, selectedTags, viewFolderSupportsSearch(activeFolder) ? search : "");
+        const totalPages = Math.max(1, Math.ceil(visible.length / pageSize));
+        page = Math.min(page, totalPages - 1);
+        const pageItems = visible.slice(page * pageSize, (page + 1) * pageSize);
+        selectedRow = pageItems.length === 0 ? 0 : Math.min(selectedRow, pageItems.length - 1);
+        /** Opens one message, staying in the read view across prev/next until the user backs out. */
+        const openSelectedMessage = async (cached: CachedMessageRecord): Promise<{ notice: string | null }> => {
+          let messageIndex = visible.indexOf(cached);
+          if (messageIndex === -1) messageIndex = 0;
+          let openedNotice: string | null = null;
+          for (;;) {
+            const opened = await openMessage(
+              gmailClient,
+              account.accountHash,
+              account.emailDisplay ?? "",
+              visible[messageIndex]!,
+              ctx,
+              getStyleProfile,
+              messageIndex > 0,
+              messageIndex < visible.length - 1,
+              operations.runExclusive,
+              retainInProgressiveSnapshot
+            );
+            openedNotice = opened.notice;
+            if (opened.trashedRecord) lastTrashed = opened.trashedRecord;
+            if (opened.navigation === "previous") messageIndex -= 1;
+            else if (opened.navigation === "next") messageIndex += 1;
+            else break;
+          }
           all = messagesRepo.listForAccount(account.accountHash);
-        } else {
-          notice = outcome.message;
-        }
-      }
-      continue;
-    }
-    if (cmd === "d") {
-      // Bare "d" — the arrow-key highlight's counterpart to "<n> d": deletes
-      // whichever row is currently highlighted, without needing to type its
-      // number first. Same reversible Trash move, same defaulted-to-yes
-      // confirmation, same instant local folder move and ";u" undo.
-      if (pageItems.length > 0) {
-        if (activeFolder === "trash") {
-          notice = "Already in Trash; permanent deletion is never supported.";
+          return { notice: openedNotice };
+        };
+
+        renderList(pageItems, {
+          folder: activeFolder,
+          folderCounts: countViewFolders(all),
+          folderLoad: progressiveCache.current?.status(activeFolder) ?? null,
+          backgroundError: progressiveCache.current?.error !== null && progressiveCache.current?.error !== undefined,
+          waitingForAccountLock: progressiveCache.current?.waitingForAccountLock ?? false,
+          page,
+          totalPages,
+          pageSize,
+          total: visible.length,
+          selectedTags,
+          search: viewFolderSupportsSearch(activeFolder) ? search : "",
+          labelNames,
+          notice,
+          selectedRow
+        });
+        notice = null;
+        const input = await readCommandLine("> ", ["left", "right", "up", "down"]);
+        // Rendering and reading both worked, so whatever failed last time was
+        // the command, not the terminal. Only an unbroken run of failures
+        // ends the session.
+        consecutiveFailures = 0;
+        if (input.kind === "cancel") {
+          // Esc always goes "home" (default Inbox filter, no search, first
+          // page) instead of quitting — quitting is q/Ctrl-C only. Useful
+          // after a search or a deep filter/page-history dive.
+          if (activeFolder !== "inbox" || search || selectedTags.size > 0 || page !== 0) {
+            rememberView();
+            activeFolder = "inbox";
+            search = "";
+            selectedTags = new Set();
+            page = 0;
+            selectedRow = 0;
+            if (progressiveCache.current) {
+              await progressiveCache.current.ensureFolder("inbox", pageSize, {
+                timeoutMs: VIEW_NAVIGATION_WAIT_MS
+              });
+            }
+          }
           continue;
         }
-        const trashed = await handleQuickDelete(
-          gmailClient,
-          messagesRepo,
-          pageItems[selectedRow]!,
-          operations.runExclusive,
-          ctx.clock.nowIso()
-        );
-        if (trashed) {
-          retainInProgressiveSnapshot(trashed.gmailMessageId);
-          lastTrashed = trashed;
-        }
-        console.log(pc.dim("\nPress any key to return to the list."));
-        await waitForKeypress();
-        all = messagesRepo.listForAccount(account.accountHash);
-      }
-      continue;
-    }
-    // "<n> r" / "<n> ;r" / "<n> d" / "<n> i" — act directly from the
-    // list without the separate open-then-press-key steps. Reply/AI-reply
-    // still open the message first (real content is needed to draft
-    // against) and still show the full, unedited confirmation screen
-    // before anything sends — this is a navigation shortcut only, never a
-    // way to skip that confirmation (see CLAUDE.md's "Interactive reply").
-    const quickAction = parseQuickActionCommand(cmd);
-    if (quickAction) {
-      const { index, action } = quickAction;
-      if (index >= 1 && index <= pageItems.length) {
-        const messageIndex = page * pageSize + index - 1;
-        const target = visible[messageIndex]!;
-        if (action === "delete") {
-          if (folderForLabelSnapshot(target.labelSnapshot) === "trash") {
-            notice = "Already in Trash; permanent deletion is never supported.";
+        if (input.kind === "key") {
+          if (input.name === "up" || input.name === "down") {
+            if (pageItems.length > 0) {
+              selectedRow =
+                input.name === "up"
+                  ? (selectedRow - 1 + pageItems.length) % pageItems.length
+                  : (selectedRow + 1) % pageItems.length;
+            }
             continue;
           }
-          const trashed = await handleQuickDelete(
-            gmailClient,
-            messagesRepo,
-            target,
-            operations.runExclusive,
-            ctx.clock.nowIso()
-          );
-          if (trashed) {
-            retainInProgressiveSnapshot(trashed.gmailMessageId);
-            lastTrashed = trashed;
+          if (input.name !== "left" && input.name !== "right") continue;
+          rememberView();
+          activeFolder = adjacentViewFolder(activeFolder, input.name);
+          page = 0;
+          selectedRow = 0;
+          selectedTags = new Set();
+          // Search is intentionally Inbox-only for now; changing folders clears
+          // it instead of pretending a partial local cache is a mailbox search.
+          search = "";
+          // One page is all a folder switch needs to draw; the rest of
+          // Archive/Trash/Spam keeps filling in behind the prompt.
+          if (progressiveCache.current) {
+            await progressiveCache.current.ensureFolder(activeFolder, pageSize, {
+              timeoutMs: VIEW_NAVIGATION_WAIT_MS
+            });
           }
-          console.log(pc.dim("\nPress any key to return to the list."));
-          await waitForKeypress();
-          all = messagesRepo.listForAccount(account.accountHash);
-        } else if (action === "move_to_inbox") {
-          const outcome = await operations.runExclusive(() =>
-            moveCachedToInbox(gmailClient, messagesRepo, target, ctx.clock.nowIso())
+          continue;
+        }
+        const cmd = input.value.trim();
+
+        if (cmd === "q") break;
+        if (cmd === "") {
+          // Enter on an empty command opens the highlighted row — the ↑/↓
+          // selection cursor's counterpart to typing a number and pressing Enter.
+          if (pageItems.length === 0) continue;
+          const opened = await openSelectedMessage(pageItems[selectedRow]!);
+          notice = opened.notice;
+          continue;
+        }
+        if (cmd === "n") {
+          if (progressiveCache.current) {
+            const status = progressiveCache.current.status(activeFolder);
+            const desired = search || selectedTags.size > 0
+              ? status.cached + pageSize
+              : (page + 2) * pageSize;
+            await progressiveCache.current.ensureFolder(activeFolder, desired, {
+              timeoutMs: VIEW_NAVIGATION_WAIT_MS
+            });
+            all = messagesRepo.listForAccount(account.accountHash);
+          }
+          const refreshedVisible = filterMessages(
+            all.filter((message) => messageIsInViewFolder(message.labelSnapshot, activeFolder)),
+            selectedTags,
+            viewFolderSupportsSearch(activeFolder) ? search : ""
           );
-          if (outcome.record) retainInProgressiveSnapshot(outcome.record.gmailMessageId);
-          notice = outcome.ok
-            ? `Moved "${outcome.record.subject || "(no subject)"}" to Inbox.`
-            : outcome.message;
-        } else {
-          const opened = await openMessage(
+          const refreshedTotalPages = Math.max(1, Math.ceil(refreshedVisible.length / pageSize));
+          if (page < refreshedTotalPages - 1) {
+            rememberView();
+            page += 1;
+            selectedRow = 0;
+          } else {
+            notice = progressiveCache.current?.status(activeFolder).complete
+              ? "Already at the last page in this folder."
+              : "No additional cached messages are available yet.";
+          }
+          continue;
+        }
+        if (cmd === "p") {
+          if (page > 0) {
+            rememberView();
+            page -= 1;
+            // Same as "n": a new page starts at its first row rather than
+            // wherever the cursor happened to sit on the page just left.
+            selectedRow = 0;
+          } else {
+            notice = "Already at the first page in this folder.";
+          }
+          continue;
+        }
+        if (cmd === "[") {
+          const previous = backStack.pop();
+          if (previous) {
+            forwardStack.push(snapshotView());
+            restoreView(previous);
+            if (progressiveCache.current) {
+              await progressiveCache.current.ensureFolder(activeFolder, (page + 1) * pageSize, {
+                timeoutMs: VIEW_NAVIGATION_WAIT_MS
+              });
+            }
+          } else {
+            notice = "No earlier view.";
+          }
+          continue;
+        }
+        if (cmd === "]") {
+          const next = forwardStack.pop();
+          if (next) {
+            backStack.push(snapshotView());
+            restoreView(next);
+            if (progressiveCache.current) {
+              await progressiveCache.current.ensureFolder(activeFolder, (page + 1) * pageSize, {
+                timeoutMs: VIEW_NAVIGATION_WAIT_MS
+              });
+            }
+          } else {
+            notice = "No later view.";
+          }
+          continue;
+        }
+        if (cmd === "+" || cmd === "-") {
+          await applyPageSize(adjustPageSize(pageSize, cmd === "+" ? "larger" : "smaller"));
+          continue;
+        }
+        const limitMatch = /^l\s+(\d+)$/.exec(cmd);
+        if (limitMatch) {
+          await applyPageSize(Math.max(1, Number(limitMatch[1])));
+          continue;
+        }
+        if (cmd === "f" || cmd === "t") {
+          const nextTags = await chooseTags(collectDistinctTags(folderMessages), selectedTags, labelNames);
+          if (!sameSet(nextTags, selectedTags)) {
+            rememberView();
+            selectedTags = nextTags;
+            page = 0;
+          }
+          continue;
+        }
+        if (cmd === "s") {
+          if (!viewFolderSupportsSearch(activeFolder)) {
+            notice = "Search is currently available only in Inbox.";
+            continue;
+          }
+          if (search) {
+            rememberView();
+            search = "";
+            page = 0;
+          }
+          continue;
+        }
+        const searchMatch = /^s\s+(.+)$/.exec(cmd);
+        if (searchMatch) {
+          if (!viewFolderSupportsSearch(activeFolder)) {
+            notice = "Search is currently available only in Inbox.";
+            continue;
+          }
+          const nextSearch = searchMatch[1]!.trim();
+          if (nextSearch !== search) {
+            rememberView();
+            search = nextSearch;
+            page = 0;
+          }
+          continue;
+        }
+        if (cmd === "u") {
+          if (progressiveCache.current) {
+            await progressiveCache.current.stop();
+            progressiveCache.current = null;
+          }
+          const latestAccount = new AccountsRepository(ctx.db).get(account.accountHash) ?? account;
+          refresh = await operations.runExclusive(() =>
+            refreshViewCache(ctx.db, gmailClient, latestAccount, ctx.clock.nowIso())
+          );
+          if (refresh.kind === "full_required") await beginProgressiveCache(activeFolder);
+          account = new AccountsRepository(ctx.db).get(account.accountHash) ?? account;
+          all = messagesRepo.listForAccount(account.accountHash);
+          labelNames = await loadLabelNames(gmailClient);
+          if (page !== 0) {
+            rememberView();
+            page = 0;
+          }
+          notice = "Mail updated.";
+          continue;
+        }
+        if (cmd === "c" || cmd === "a" || cmd === ";c") {
+          // "c" asks how to write it, exactly as `gmail send` does; "a"/";c"
+          // are the shortcut straight to an AI draft.
+          await handleCompose(
             gmailClient,
             account.accountHash,
-            account.emailDisplay ?? "",
-            target,
+            cmd === "c" ? undefined : true,
             ctx,
             getStyleProfile,
-            false,
-            false,
-            operations.runExclusive,
-            retainInProgressiveSnapshot,
-            action
+            {},
+            operations.runExclusive
           );
-          notice = opened.notice;
-          if (opened.trashedRecord) lastTrashed = opened.trashedRecord;
-          all = messagesRepo.listForAccount(account.accountHash);
+          // Hold the send confirmation on screen; the list redraw would wipe it.
+          console.log(pc.dim("\nPress any key to return to the list."));
+          await waitForKeypress();
+          continue;
         }
-        continue;
+        if (cmd === ";s") {
+          const credentials = await resolveOpenAiCredentials(
+            { accountHash: account.accountHash, credentialStore: ctx.credentialStore, config: ctx.config },
+            "compose"
+          );
+          if (!credentials) {
+            notice = "AI is not ready; check gmail setup.";
+            continue;
+          }
+          if (credentials.hosted) {
+            // The included AI service never receives Sent mail (see
+            // gmail/writing-style.ts). Say so plainly rather than running a
+            // refresh that would silently produce nothing.
+            notice =
+              "The included AI service never reads your Sent mail, so there is no style profile to refresh. " +
+              "Give drafting instructions when it asks, or switch to your own API key in `gmail setup`.";
+            continue;
+          }
+          const spinner = p.spinner();
+          spinner.start("Refreshing your writing style from recent Sent mail");
+          const profile = await operations.runExclusive(() => getStyleProfile(credentials, true));
+          spinner.stop(profile ? "Writing style saved — future replies/drafts will reuse it." : "Could not derive a writing style from Sent mail.");
+          console.log(pc.dim("\nPress any key to return to the list."));
+          await waitForKeypress();
+          continue;
+        }
+        if (cmd === ";u") {
+          if (!lastTrashed) {
+            notice = "Nothing to undo.";
+            continue;
+          }
+          const toRestore = lastTrashed;
+          try {
+            await operations.runExclusive(async () => {
+              await untrashMessage(gmailClient, toRestore.gmailMessageId, toRestore.labelSnapshot);
+              // Refresh the projection timestamp so a concurrent progressive
+              // snapshot that began before this undo cannot prune the restored
+              // row after its folder cursors have already passed it.
+              messagesRepo.upsert({ ...toRestore, processedAt: ctx.clock.nowIso() });
+            });
+            retainInProgressiveSnapshot(toRestore.gmailMessageId);
+            all = messagesRepo.listForAccount(account.accountHash);
+            lastTrashed = null;
+            notice = `Restored "${toRestore.subject || "(no subject)"}".`;
+          } catch (error) {
+            notice = `Could not undo: ${error instanceof Error ? error.message : String(error)}`;
+          }
+          continue;
+        }
+        if (cmd === "i") {
+          if (pageItems.length > 0) {
+            const target = pageItems[selectedRow]!;
+            const outcome = await operations.runExclusive(() =>
+              moveCachedToInbox(gmailClient, messagesRepo, target, ctx.clock.nowIso())
+            );
+            if (outcome.record) retainInProgressiveSnapshot(outcome.record.gmailMessageId);
+            notice = outcome.ok
+              ? `Moved "${outcome.record.subject || "(no subject)"}" to Inbox.`
+              : outcome.message;
+          }
+          continue;
+        }
+        if (cmd === "dd") {
+          // "dd" — the same delete as "d" on the highlighted row, with the
+          // confirmation skipped, for clearing a run of junk quickly. Deleting
+          // still means Gmail's Trash, never a permanent delete, and is still
+          // undoable both from Gmail and, for the last one this session, with
+          // ";u" — which is precisely what makes skipping the question
+          // acceptable here when skipping a *send* confirmation never is.
+          //
+          // No "press any key" pause either: the point is speed, so the result
+          // is carried as a notice and printed by the next render instead. The
+          // cursor stays on the same row number, which after the list shifts up
+          // is the following message — so repeating "dd" walks down the list.
+          if (pageItems.length > 0) {
+            const target = pageItems[selectedRow]!;
+            const outcome = await operations.runExclusive(() =>
+              trashCached(gmailClient, messagesRepo, target, ctx.clock.nowIso())
+            );
+            if (outcome.ok) {
+              retainInProgressiveSnapshot(outcome.record.gmailMessageId);
+              lastTrashed = outcome.record;
+              notice = `Moved "${outcome.record.subject || "(no subject)"}" to Trash. ";u" undoes it.`;
+              all = messagesRepo.listForAccount(account.accountHash);
+            } else {
+              notice = outcome.message;
+            }
+          }
+          continue;
+        }
+        if (cmd === "d") {
+          // Bare "d" — the arrow-key highlight's counterpart to "<n> d": deletes
+          // whichever row is currently highlighted, without needing to type its
+          // number first. Same reversible Trash move, same defaulted-to-yes
+          // confirmation, same instant local folder move and ";u" undo.
+          if (pageItems.length > 0) {
+            if (activeFolder === "trash") {
+              notice = "Already in Trash; permanent deletion is never supported.";
+              continue;
+            }
+            const trashed = await handleQuickDelete(
+              gmailClient,
+              messagesRepo,
+              pageItems[selectedRow]!,
+              operations.runExclusive,
+              ctx.clock.nowIso()
+            );
+            if (trashed) {
+              retainInProgressiveSnapshot(trashed.gmailMessageId);
+              lastTrashed = trashed;
+            }
+            console.log(pc.dim("\nPress any key to return to the list."));
+            await waitForKeypress();
+            all = messagesRepo.listForAccount(account.accountHash);
+          }
+          continue;
+        }
+        // "<n> r" / "<n> ;r" / "<n> d" / "<n> i" — act directly from the
+        // list without the separate open-then-press-key steps. Reply/AI-reply
+        // still open the message first (real content is needed to draft
+        // against) and still show the full, unedited confirmation screen
+        // before anything sends — this is a navigation shortcut only, never a
+        // way to skip that confirmation (see CLAUDE.md's "Interactive reply").
+        const quickAction = parseQuickActionCommand(cmd);
+        if (quickAction) {
+          const { index, action } = quickAction;
+          if (index >= 1 && index <= pageItems.length) {
+            const messageIndex = page * pageSize + index - 1;
+            const target = visible[messageIndex]!;
+            if (action === "delete") {
+              if (folderForLabelSnapshot(target.labelSnapshot) === "trash") {
+                notice = "Already in Trash; permanent deletion is never supported.";
+                continue;
+              }
+              const trashed = await handleQuickDelete(
+                gmailClient,
+                messagesRepo,
+                target,
+                operations.runExclusive,
+                ctx.clock.nowIso()
+              );
+              if (trashed) {
+                retainInProgressiveSnapshot(trashed.gmailMessageId);
+                lastTrashed = trashed;
+              }
+              console.log(pc.dim("\nPress any key to return to the list."));
+              await waitForKeypress();
+              all = messagesRepo.listForAccount(account.accountHash);
+            } else if (action === "move_to_inbox") {
+              const outcome = await operations.runExclusive(() =>
+                moveCachedToInbox(gmailClient, messagesRepo, target, ctx.clock.nowIso())
+              );
+              if (outcome.record) retainInProgressiveSnapshot(outcome.record.gmailMessageId);
+              notice = outcome.ok
+                ? `Moved "${outcome.record.subject || "(no subject)"}" to Inbox.`
+                : outcome.message;
+            } else {
+              const opened = await openMessage(
+                gmailClient,
+                account.accountHash,
+                account.emailDisplay ?? "",
+                target,
+                ctx,
+                getStyleProfile,
+                false,
+                false,
+                operations.runExclusive,
+                retainInProgressiveSnapshot,
+                action
+              );
+              notice = opened.notice;
+              if (opened.trashedRecord) lastTrashed = opened.trashedRecord;
+              all = messagesRepo.listForAccount(account.accountHash);
+            }
+            continue;
+          }
+        }
+        const index = Number(cmd);
+        if (Number.isInteger(index) && index >= 1 && index <= pageItems.length) {
+          const opened = await openSelectedMessage(pageItems[index - 1]!);
+          notice = opened.notice;
+          continue;
+        }
+        notice = `Unrecognized command: "${cmd}"`;
+      } catch (error) {
+        // One failed command must not end the session. A Gmail hiccup behind
+        // "u", a compose, or a refresh is exactly the situation the local
+        // cache exists for: the mail on screen is still readable. Surface it
+        // where every other outcome is surfaced — as a notice on the next
+        // render — instead of unwinding to a stack trace.
+        notice = `Something went wrong: ${describeError(error)}`;
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= MAX_CONSECUTIVE_VIEW_FAILURES) throw error;
       }
     }
-    const index = Number(cmd);
-    if (Number.isInteger(index) && index >= 1 && index <= pageItems.length) {
-      const opened = await openSelectedMessage(pageItems[index - 1]!);
-      notice = opened.notice;
-      continue;
-    }
-    notice = `Unrecognized command: "${cmd}"`;
-  }
   } finally {
     await progressiveCache.current?.stop();
     await operations.whenIdle();
@@ -890,7 +952,10 @@ async function chooseTags(
   current: ReadonlySet<string>,
   labelNames: ReadonlyMap<string, string>
 ): Promise<Set<string>> {
-  if (allTags.length === 0) return new Set();
+  // Nothing to choose from (an empty folder) is not the same as choosing
+  // nothing: clearing the filter here would silently discard a selection the
+  // user set in a folder that does have mail.
+  if (allTags.length === 0) return new Set(current);
   const selected = await p.multiselect({
     message: "Show messages carrying any selected label (select none for all mail)",
     options: allTags.map((tag) => ({ value: tag, label: labelNames.get(tag) ?? tag })),
@@ -981,7 +1046,11 @@ async function openMessage(
     htmlBody: html,
     plainBody: plain,
     userEmail,
-    threadHasUserSentMessage: false
+    threadHasUserSentMessage: false,
+    // This normalization is for the screen, not for a model. The cache
+    // projection above was built separately at the default cap, so the
+    // persisted content hash is unaffected.
+    maxBodyChars: VIEW_READ_BODY_CHARS
   });
   let edge: string | null = null;
   let pendingAction: ViewerAction | undefined = initialAction;
@@ -1036,19 +1105,28 @@ async function openMessage(
         edge = "Already in Trash; permanent deletion is never supported.";
         continue;
       }
-      const trashed = await confirmAndTrash(
+      const outcome = await confirmAndTrash(
         gmailClient,
         messagesRepo,
         activeCached,
         runExclusive,
         ctx.clock.nowIso()
       );
+      // Only an actual delete leaves the message, so only an actual delete
+      // has a confirmation worth holding on screen. Declining used to ask
+      // the user to "press any key to return to the list" and then put them
+      // back on the message they never left; a failure was worse, since the
+      // reason scrolled away with it. Both now redraw straight away, with
+      // the failure carried into the redraw as an edge notice.
+      if (outcome.status === "declined") continue;
+      if (outcome.status === "failed") {
+        edge = outcome.message;
+        continue;
+      }
       console.log(pc.dim("\nPress any key to return to the list."));
       await waitForKeypress();
-      if (trashed) {
-        onCacheProjected(trashed.gmailMessageId);
-        return { navigation: "back", notice: "Moved to Trash. \";u\" undoes it.", trashedRecord: trashed };
-      }
+      onCacheProjected(outcome.record.gmailMessageId);
+      return { navigation: "back", notice: "Moved to Trash. \";u\" undoes it.", trashedRecord: outcome.record };
     }
     if (action === "move_to_inbox") {
       const outcome = await runExclusive(() =>
@@ -1102,26 +1180,32 @@ async function openMessage(
  * row moves to the Trash projection immediately, so it disappears from its
  * old folder and appears in the Trash tab without another Gmail sync.
  */
+export type ConfirmTrashOutcome =
+  | { status: "trashed"; record: CachedMessageRecord }
+  | { status: "declined" }
+  | { status: "failed"; message: string };
+
 async function confirmAndTrash(
   gmailClient: GmailClient,
   messagesRepo: MessagesRepository,
   cached: CachedMessageRecord,
   runExclusive: ViewExclusiveRunner,
   nowIso: string
-): Promise<CachedMessageRecord | null> {
+): Promise<ConfirmTrashOutcome> {
   console.log("");
   const confirmed = await p.confirm({ message: `Move "${cached.subject || "(no subject)"}" to Trash?`, initialValue: true });
   if (p.isCancel(confirmed) || !confirmed) {
     console.log(pc.dim("Not deleted."));
-    return null;
+    return { status: "declined" };
   }
   const outcome = await runExclusive(() => trashCached(gmailClient, messagesRepo, cached, nowIso));
-  if (!outcome.ok) {
-    console.error(pc.red(outcome.message));
-    return null;
-  }
+  // The failure text is returned rather than printed so each caller can put
+  // it where that caller's screen will still show it — a read view that
+  // redraws immediately needs it as a carried notice, not as a line about to
+  // be erased.
+  if (!outcome.ok) return { status: "failed", message: outcome.message };
   console.log(pc.green('Moved to Trash. Type ";u" to undo.'));
-  return outcome.record;
+  return { status: "trashed", record: outcome.record };
 }
 
 /**
@@ -1271,7 +1355,15 @@ export function invalidateCachedAssessment(
   };
 }
 
-/** List-view fast path ("<n> d"): trashes by ID without a live full-message fetch first, since deleting needs nothing from the body. */
+/**
+ * List-view fast path ("d" / "<n> d"): trashes by ID without a live
+ * full-message fetch first, since deleting needs nothing from the body.
+ *
+ * Unlike the read view this path keeps its "press any key" hold for every
+ * outcome (see CLAUDE.md, which contrasts it with "dd" precisely on that
+ * pause), so it prints the failure itself and hands the caller back only the
+ * record that makes ";u" work.
+ */
 async function handleQuickDelete(
   gmailClient: GmailClient,
   messagesRepo: MessagesRepository,
@@ -1279,7 +1371,9 @@ async function handleQuickDelete(
   runExclusive: ViewExclusiveRunner,
   nowIso: string
 ): Promise<CachedMessageRecord | null> {
-  return confirmAndTrash(gmailClient, messagesRepo, cached, runExclusive, nowIso);
+  const outcome = await confirmAndTrash(gmailClient, messagesRepo, cached, runExclusive, nowIso);
+  if (outcome.status === "failed") console.error(pc.red(outcome.message));
+  return outcome.status === "trashed" ? outcome.record : null;
 }
 
 export interface DisplayLink {
@@ -1360,6 +1454,12 @@ function renderMessage(message: NormalizedMessage, labelIds: readonly string[]):
   }
   const { text, links } = shortenLinksForDisplay(content);
   console.log(text);
+  if (message.bodyTruncated) {
+    // Silently stopping mid-message is the one thing a mail reader must not
+    // do: the reader cannot tell a cut-off message from a short one.
+    console.log("");
+    console.log(pc.yellow(`(message truncated at ${VIEW_READ_BODY_CHARS.toLocaleString()} characters)`));
+  }
   return links;
 }
 

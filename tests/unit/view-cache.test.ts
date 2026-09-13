@@ -432,6 +432,25 @@ describe("ProgressiveViewCache", () => {
     expect(new SettingsRepository(db).get("account", SETTING_KEYS.viewHistoryMarker)).toBeNull();
     expect(new AccountsRepository(db).get("account")?.historyMarker).toBeNull();
   });
+  it("resizes later chunks when the view's page size changes", async () => {
+    // Regression: chunkSize was fixed at construction from whatever page size
+    // the session started with. A chunk is one UI page *and* one account-lock
+    // acquisition, so widening the page ("l 100" from a default 20) was then
+    // served by five short round trips that took and released the lock five
+    // times instead of one.
+    const inbox = Array.from({ length: 8 }, (_, index) => ({ id: `inbox-${index}`, labels: ["INBOX"] }));
+    const { client, list } = loaderClient({ inbox, archive: [], trash: [], spam: [] });
+    const loader = createLoader(client);
+
+    await loader.ensureFolder("inbox", 2);
+    expect(list.mock.calls.every(([params]) => (params as { maxResults: number }).maxResults <= 2)).toBe(true);
+
+    list.mockClear();
+    loader.setPageSize(8);
+    await loader.ensureFolder("inbox", 8);
+    expect(list.mock.calls.some(([params]) => (params as { maxResults: number }).maxResults > 2)).toBe(true);
+    await loader.stop();
+  });
 });
 
 describe("ViewOperationCoordinator", () => {
@@ -441,15 +460,24 @@ describe("ViewOperationCoordinator", () => {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const events: string[] = [];
 
+    let started!: () => void;
+    // Waited on explicitly rather than by counting microtasks: taking the
+    // account lock is asynchronous (ProcessLock.acquireAsync), so how many
+    // turns pass before the operation body runs is an implementation
+    // detail. What this test is actually about is that the foreground
+    // operation does not run while the background one is in flight.
+    const backgroundStarted = new Promise<void>((resolve) => { started = resolve; });
+
     const background = coordinator.runExclusive(async () => {
       events.push("background-start");
+      started();
       await gate;
       events.push("background-commit");
     });
     const foreground = coordinator.runExclusive(async () => {
       events.push("foreground-mutation");
     });
-    await Promise.resolve();
+    await backgroundStarted;
     expect(events).toEqual(["background-start"]);
 
     release();

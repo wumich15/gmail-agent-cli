@@ -6,6 +6,16 @@ import { SettingsRepository, SETTING_KEYS } from "../state/repositories/settings
 import { loadSentStyleExamples } from "./sent-style.js";
 import { summarizeWritingStyle, type DraftReplyOptions } from "../ai/draft-reply.js";
 
+/**
+ * How long a failed derivation suppresses the next attempt.
+ *
+ * Long enough that an account with no Sent mail does not pay for a Gmail
+ * listing plus an AI call on every single draft, short enough that a
+ * mailbox which has since been used starts imitating the user's style
+ * without them having to know that ";s" exists.
+ */
+const UNAVAILABLE_RETRY_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+
 export interface WritingStyleDeps {
   /**
    * The active config, so this can refuse to sample Sent mail under the
@@ -30,6 +40,13 @@ export interface WritingStyleDeps {
  * raw sent-mail examples it was built from (CLAUDE.md forbids persisting
  * message bodies).
  *
+ * A derivation that produces nothing is remembered too, as a timestamp.
+ * Persisting only successes meant an account with no usable Sent sample
+ * repeated the whole Sent listing and summarization call before every
+ * draft, indefinitely, always to reach the same empty answer; the
+ * timestamp backs that off for a week and then lets the account try again
+ * on its own. An explicit ";s" ignores it entirely.
+ *
  * Under the hosted AI service this returns null without reading Sent mail at
  * all, and without handing back a profile derived under an earlier provider:
  * that sample is a dozen unrelated messages the user did not select for this
@@ -41,14 +58,30 @@ export interface WritingStyleDeps {
 export async function getWritingStyleProfile(deps: WritingStyleDeps, forceRefresh = false): Promise<string | null> {
   if (!sentMailStyleSamplingAllowed(deps.config ?? null)) return null;
   const settings = new SettingsRepository(deps.db);
+  const now = deps.nowIso();
   if (!forceRefresh) {
     const existing = settings.get(deps.accountHash, SETTING_KEYS.writingStyleProfile);
     if (existing) return existing;
+    if (recentlyFoundUnavailable(settings.get(deps.accountHash, SETTING_KEYS.writingStyleProfileUnavailableAt), now)) {
+      return null;
+    }
   }
   const examples = await loadSentStyleExamples(deps.gmailClient, deps.userEmail);
   const profile = await summarizeWritingStyle(examples, deps.credentials);
   if (profile) {
-    settings.set(deps.accountHash, SETTING_KEYS.writingStyleProfile, profile, deps.nowIso());
+    settings.set(deps.accountHash, SETTING_KEYS.writingStyleProfile, profile, now);
+    settings.delete(deps.accountHash, SETTING_KEYS.writingStyleProfileUnavailableAt);
+  } else {
+    settings.set(deps.accountHash, SETTING_KEYS.writingStyleProfileUnavailableAt, now, now);
   }
   return profile;
+}
+
+/** An unparseable or absent marker always means "try again now". */
+function recentlyFoundUnavailable(markedAt: string | null, nowIso: string): boolean {
+  if (!markedAt) return false;
+  const marked = Date.parse(markedAt);
+  const now = Date.parse(nowIso);
+  if (!Number.isFinite(marked) || !Number.isFinite(now)) return false;
+  return now - marked >= 0 && now - marked < UNAVAILABLE_RETRY_AFTER_MS;
 }

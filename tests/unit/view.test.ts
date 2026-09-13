@@ -139,6 +139,24 @@ describe("openUrlInBrowser", () => {
     expect(spawnMock).toHaveBeenCalledWith("open", ["https://example.com/a"], expect.any(Object));
   });
 
+  it("never routes a URL through cmd.exe on Windows", () => {
+    // Regression: the Windows path was `cmd /c start "" <url>`. Passing an
+    // argument array is not protection there — Node only sets
+    // windowsVerbatimArguments for shell:true, so libuv quotes each argument
+    // itself, and it quotes only arguments containing a space, tab, or double
+    // quote. Every other cmd.exe metacharacter, `&` included, reached the
+    // interpreter raw. That truncated ordinary URLs (a Google consent URL is
+    // nothing but &-joined parameters) and, since gmail view's "o" launches a
+    // URL taken from an untrusted email body, turned a crafted link into
+    // command execution.
+    Object.defineProperty(process, "platform", { value: "win32" });
+    openUrlInBrowser("https://example.com/?a=1&calc");
+    const [command, args] = spawnMock.mock.calls[0] as unknown as [string, string[]];
+    expect(command).not.toMatch(/cmd/i);
+    expect(args.join(" ")).not.toMatch(/\bstart\b/);
+    expect(args).toContain("https://example.com/?a=1&calc");
+  });
+
   it("refuses a non-http(s) scheme instead of ever reaching a shell launcher", () => {
     openUrlInBrowser("javascript:alert(1)");
     openUrlInBrowser("file:///etc/passwd");

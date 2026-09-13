@@ -88,7 +88,10 @@ export async function confirmAndSend(
       await runExclusive(() => sendReply(gmailClient, target, body));
     } else {
       const lock = new ProcessLock(lockFilePath(accountHash));
-      lock.acquire({ waitMs: DEFAULT_LOCK_WAIT_MS });
+      // Async wait: this runs inside a live interactive flow, so parking
+      // the event loop here would also freeze whatever else the process
+      // has in flight while it waits out another command's lock.
+      await lock.acquireAsync({ waitMs: DEFAULT_LOCK_WAIT_MS });
       try {
         await sendReply(gmailClient, target, body);
       } finally {

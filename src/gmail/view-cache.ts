@@ -62,9 +62,11 @@ const VIEW_LOCK_WAIT_BUDGET_MS = 20_000;
 
 /**
  * How long an interactive view action waits for another process's lock.
- * Deliberately shorter than DEFAULT_LOCK_WAIT_MS: this wait is synchronous,
- * so it also pauses the session's own background loading, and a keystroke
- * that appears to do nothing for ten seconds is its own kind of bug.
+ * Deliberately shorter than DEFAULT_LOCK_WAIT_MS: a keystroke that appears
+ * to do nothing for ten seconds is its own kind of bug. The wait itself is
+ * asynchronous (`ProcessLock.acquireAsync`), so unlike the blocking
+ * `acquire()` an ordinary command uses at startup, it leaves this session's
+ * own in-flight Gmail reads running while it waits.
  */
 const VIEW_FOREGROUND_LOCK_WAIT_MS = 3_000;
 
@@ -103,12 +105,12 @@ export class ViewOperationCoordinator {
       signal?.throwIfAborted();
       try {
         // Background work (which always passes a signal) fails fast and
-        // retries outside this queue, so it must never park the event loop
-        // and stall its own in-flight reads. A foreground action has
+        // retries outside this queue rather than holding the session's
+        // single operation slot while it waits. A foreground action has
         // nothing else to do but wait, and erroring out because another
         // gmail command happened to be mid-operation would be worse than
         // pausing briefly for it.
-        lock.acquire({ waitMs: signal ? 0 : VIEW_FOREGROUND_LOCK_WAIT_MS });
+        await lock.acquireAsync({ waitMs: signal ? 0 : VIEW_FOREGROUND_LOCK_WAIT_MS });
       } catch (error) {
         // Do not sleep while occupying the session queue. The progressive
         // loader catches this private scheduling error, waits outside the
@@ -187,7 +189,7 @@ export class ProgressiveViewCache {
   private readonly activeIds = new Set<string>();
   private readonly waiters = new Set<() => void>();
   private readonly abortController = new AbortController();
-  private readonly chunkSize: number;
+  private chunkSize: number;
   private snapshotStartedAt: string | null = null;
   private priorityFolder: ViewFolderId = "inbox";
   private roundRobinIndex = 0;
@@ -201,12 +203,7 @@ export class ProgressiveViewCache {
   private lockContended = false;
 
   constructor(private readonly options: ProgressiveViewCacheOptions) {
-    // Exactly one UI page of mail per Gmail round trip. A chunk is also
-    // one account-lock acquisition, so a larger chunk means a longer
-    // stretch during which neither another `gmail` command nor this
-    // session's own keystrokes can get in. A multi-page foreground
-    // request is satisfied by several small chunks instead of one big one.
-    this.chunkSize = Math.max(1, Math.min(500, options.pageSize));
+    this.chunkSize = boundedChunkSize(options.pageSize);
     for (const folder of VIEW_FOLDERS) {
       this.states.set(folder.id, {
         started: false,
@@ -297,6 +294,19 @@ export class ProgressiveViewCache {
         timer.unref?.();
       }
     });
+  }
+
+  /**
+   * Resizes later chunks after the user changes the view's page size.
+   *
+   * The chunk is deliberately one UI page, so a loader still sized from
+   * whatever `--limit` the session started with would serve a widened page
+   * ("l 100" from a default 20) with five short round trips instead of one,
+   * and would keep taking and releasing the account lock five times to do
+   * it. Only chunks that have not started yet are affected.
+   */
+  setPageSize(pageSize: number): void {
+    this.chunkSize = boundedChunkSize(pageSize);
   }
 
   /** Begins filling every folder, but deliberately does not return its completion promise. */
@@ -692,4 +702,15 @@ export class ProgressiveViewCache {
     this.waiters.clear();
     for (const resolve of waiters) resolve();
   }
+}
+
+/**
+ * Exactly one UI page of mail per Gmail round trip. A chunk is also one
+ * account-lock acquisition, so a larger chunk means a longer stretch during
+ * which neither another `gmail` command nor this session's own keystrokes
+ * can get in. A multi-page foreground request is satisfied by several small
+ * chunks instead of one big one.
+ */
+function boundedChunkSize(pageSize: number): number {
+  return Math.max(1, Math.min(500, Math.floor(pageSize) || 1));
 }
