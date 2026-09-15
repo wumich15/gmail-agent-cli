@@ -207,7 +207,7 @@ export async function disconnectAccount(
 
   await ctx.credentialStore.deleteSecret(secretKey);
   if (options.removeHistory) {
-    ctx.db.prepare("DELETE FROM accounts WHERE account_hash = ?").run(accountHash);
+    new AccountsRepository(ctx.db).delete(accountHash);
   }
   return {
     revoked,

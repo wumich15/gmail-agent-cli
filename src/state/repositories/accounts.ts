@@ -25,6 +25,27 @@ function fromRow(row: AccountRow): AccountRecord {
   };
 }
 
+interface AccountScopedTable {
+  table: string;
+  column: string;
+}
+
+/**
+ * Every table that points at `accounts`, read from the live schema rather
+ * than hardcoded here, so a future migration that adds an account-scoped
+ * table is covered without anyone having to remember to update this list.
+ */
+function accountScopedTables(db: GmailAgentDatabase): AccountScopedTable[] {
+  return db
+    .prepare(
+      `SELECT m.name AS "table", f."from" AS "column"
+         FROM sqlite_master m
+         JOIN pragma_foreign_key_list(m.name) f
+        WHERE m.type = 'table' AND f."table" = 'accounts'`
+    )
+    .all() as AccountScopedTable[];
+}
+
 export class AccountsRepository {
   constructor(private readonly db: GmailAgentDatabase) {}
 
@@ -86,4 +107,46 @@ export class AccountsRepository {
       )
       .run(historyMarker, updatedAt, accountHash);
   }
+
+  /**
+   * Deletes the account rows matching `predicate` together with every row
+   * scoped to them.
+   *
+   * The child tables carry a plain `REFERENCES accounts(account_hash)` with
+   * no `ON DELETE CASCADE`, so deleting an account row by itself raises
+   * "FOREIGN KEY constraint failed" as soon as that account has any local
+   * history at all — which is the state every real install is in. That is
+   * what made signing in as a second Google account fail outright: the
+   * single-account rule in `core/connect.ts` deletes the previous account,
+   * and the previous account had cached messages, runs, and actions.
+   *
+   * `defer_foreign_keys` holds enforcement until the transaction commits, so
+   * the child deletes need no dependency ordering among themselves (`actions`
+   * references `runs`, for instance); by commit time every referencing row is
+   * gone. It resets automatically at the end of the transaction.
+   */
+  private purge(predicate: string, accountHash: string): void {
+    const tables = accountScopedTables(this.db);
+    this.db.transaction(() => {
+      this.db.pragma("defer_foreign_keys = ON");
+      for (const { table, column } of tables) {
+        this.db.prepare(`DELETE FROM "${table}" WHERE "${column}" ${predicate}`).run(accountHash);
+      }
+      this.db.prepare(`DELETE FROM accounts WHERE account_hash ${predicate}`).run(accountHash);
+    })();
+  }
+
+  /** Forgets one account and all of its local history. `gmail auth logout` with history removal. */
+  delete(accountHash: string): void {
+    this.purge("= ?", accountHash);
+  }
+
+  /**
+   * Forgets every account other than this one, enforcing the v1 single-account
+   * rule when the user signs in as a different Google account.
+   */
+  deleteAllExcept(accountHash: string): void {
+    this.purge("!= ?", accountHash);
+  }
+
 }

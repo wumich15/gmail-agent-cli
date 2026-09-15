@@ -187,28 +187,31 @@ Type commands and press **Enter**, except for arrow keys and Escape, which act i
 | Input | Action |
 | --- | --- |
 | Up / Down | Move the highlighted row, wrapping within the page. |
+| `j` / `k` | Move the highlighted row down / up, vim style. Acts immediately, like the arrows. |
+| `<n>j` / `<n>k` | Jump `n` rows down / up, for example `5j`. Stops at the edge of the page instead of wrapping. |
+| Shift + Up / Down | Extend a selection of several rows from the highlighted one. Stops at the ends rather than wrapping. A terminal that does not distinguish shift+arrow from a plain arrow simply moves the cursor; type a selector such as `3-5` there instead. |
+| `3-5`, `1,4` | Select those rows without acting on them, ready for a bare row action. |
 | Enter on an empty prompt | Open the highlighted message. |
 | `<n>` | Open message `n`, for example `2`. |
-| `<n> r` | Start a manual reply to message `n`. |
-| `<n> ;r` | Start an AI reply to message `n`. |
-| `<n> d` | Confirm moving message `n` to Trash without fetching its body. Disabled in Trash. |
-| `<n> i` | Move message `n` to Inbox, including unarchiving or restoring it from Trash/Spam. |
-| `d` | Confirm moving the highlighted message to Trash. Disabled in Trash. |
-| `dd` | Move the highlighted message to Trash **with no confirmation**, and stay in the list. Disabled in Trash. The cursor keeps its row number, so it lands on the next message and repeating `dd` deletes down the list. |
-| `i` | Move the highlighted message to Inbox, including unarchiving or restoring it from Trash/Spam. |
+| `r` / `;r` | Start a manual / AI reply. One message at a time: `r` uses the highlighted row, `<n> r` and `2 ;r` name one. |
+| `d` | Confirm moving the selected rows to Trash. One question covers the whole selection. Disabled in Trash. |
+| `dd` | Move the selected rows to Trash **with no confirmation**, and stay in the list. Disabled in Trash. The cursor keeps its row number, so it lands on the next message and repeating `dd` deletes down the list. |
+| `i` | Move the selected rows to Inbox, including unarchiving or restoring them from Trash/Spam. |
+| `s` | Star the selected rows. Unstars them instead when every selected row is already starred. |
+| `<action> <rows>` | Give any row action explicit rows: `d 3-5`, `dd 3-5`, `s 1,4`, `i 2-6`. The rows may also come first (`3-5 dd`, `2 ;r`). With no rows, an action applies to the shift+arrow selection, or to the highlighted row when nothing is selected. |
 | Left / Right | Switch the top bar between Inbox, Archive, Trash, and Spam, wrapping at either end. Switching folders clears search and label filters. |
 | `p` / `n` | Previous / next page. |
 | `[` / `]` | Back / forward through previous folder, page, size, search, and filter views. |
-| Escape | Return to Inbox's first page, clearing search and label filters. Keeps the page size and never quits. |
+| Escape | Return to Inbox's first page, clearing search, label filters, and any row selection. Keeps the page size and never quits. |
 | `+` / `-` | Increase / decrease page size using 5, 10, 20, 50, and 100. Above 100, `+` doubles up to 500; below 5, `-` goes to 1. |
 | `l <n>` | Set an exact page size, for example `l 30`; this can exceed the `+` shortcut's 500-message ceiling. |
 | `f` (alias `t`) | Filter the current folder by Gmail label. Matching any selected label is sufficient; selecting none shows the whole current folder. |
-| `s <text>` | Search cached Inbox subjects and sender display text, case-insensitively. Search is currently Inbox-only; using it elsewhere explains that limitation. This is not Gmail query syntax or body search. |
-| `s` | Clear the Inbox search. |
+| `/<text>` | Search cached Inbox subjects and sender display text, case-insensitively. Search is currently Inbox-only; using it elsewhere explains that limitation. This is not Gmail query syntax or body search. |
+| `/` | Clear the Inbox search. |
 | `c` | Compose a new message; asks whether to write it yourself or have AI draft it, the same choice `gmail send` offers. AI is only offered when this account can actually run it. |
 | `a` (alias `;c`) | Compose a new message, going straight to an AI draft. |
 | `;s` | Refresh the saved writing-style description using recent Sent mail and AI. |
-| `;u` | Restore the last message moved to Trash during this session. One undo slot, cleared after restoring. |
+| `;u` | Restore the last delete from this session, including every message of a multi-row `dd 3-5`. One undo slot, cleared after restoring. |
 | `u` | Refresh from Gmail and return to page one, keeping search/filter choices. |
 | `q` | Quit. |
 | Ctrl+C | Exit immediately. |
@@ -225,6 +228,7 @@ These keys act without Enter.
 | `r` | Compose a manual reply. |
 | `;` followed by `r` within one second | Draft an AI reply. |
 | `d` | Confirm moving this message to Trash and return to the list. Disabled while reading Trash. |
+| `s` | Star or unstar this message, staying on it. |
 | `i` | Move this message to Inbox and return to the list, including unarchiving or restoring it from Trash/Spam. |
 | `l` | List full URLs found in the message. |
 | `o` | Choose a message link to open in the system browser. |

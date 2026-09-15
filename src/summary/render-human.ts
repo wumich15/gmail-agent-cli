@@ -1,9 +1,11 @@
+import { sanitizeTerminalLine } from "../core/terminal-text.js";
 import pc from "picocolors";
 import type { ActionDetail, RunSummary } from "./build-summary.js";
 
 function printDetails(lines: string[], details: readonly ActionDetail[]): void {
   for (const item of details) {
-    lines.push(`  · ${item.subject} — ${item.sender} (${item.reasonCode})`);
+    // Subject and sender are sender-controlled (core/terminal-text.ts).
+    lines.push(`  · ${sanitizeTerminalLine(item.subject)} — ${sanitizeTerminalLine(item.sender)} (${sanitizeTerminalLine(item.reasonCode)})`);
   }
 }
 
@@ -101,7 +103,7 @@ export function renderExecutiveSummary(summary: RunSummary): string {
       `${importantCount} important, ${summary.labeledCount} label, ${summary.calendarCreatedCount} calendar, ` +
       `${summary.reviewCount} review.`,
     importantCount > 0
-      ? `Important emails: ${summary.markedImportant.map((item) => `${item.subject} from ${item.sender}`).join("; ")}.`
+      ? `Important emails: ${summary.markedImportant.map((item) => `${sanitizeTerminalLine(item.subject)} from ${sanitizeTerminalLine(item.sender)}`).join("; ")}.`
       : "Important emails: none identified in this run."
   ].join(" ");
 }
@@ -112,6 +114,6 @@ export function renderImportantEmailsParagraph(summary: RunSummary): string {
     return "Important emails: none identified in this run.";
   }
   return `Important emails: ${summary.markedImportant
-    .map((item) => `${item.subject} from ${item.sender}`)
+    .map((item) => `${sanitizeTerminalLine(item.subject)} from ${sanitizeTerminalLine(item.sender)}`)
     .join("; ")}.`;
 }

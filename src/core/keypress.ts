@@ -14,7 +14,7 @@ export interface KeyEvent {
  */
 export type CommandInput =
   /** A key in `immediateKeys` was pressed on an empty line — no Enter needed. */
-  | { kind: "key"; name: string }
+  | { kind: "key"; name: string; shift: boolean }
   | { kind: "line"; value: string }
   | { kind: "cancel" };
 
@@ -75,7 +75,10 @@ export function readCommandLine(prompt: string, immediateKeys: readonly string[]
         return;
       }
       if (buffer.length === 0 && immediateKeys.includes(name)) {
-        finish({ kind: "key", name });
+        // Shift is reported rather than swallowed: `gmail view` uses
+        // shift+↑/↓ to extend a multi-row selection, which is the same
+        // arrow key with a different meaning.
+        finish({ kind: "key", name, shift: key?.shift ?? false });
         return;
       }
       // Printable characters only. Arrow keys arrive as multi-character

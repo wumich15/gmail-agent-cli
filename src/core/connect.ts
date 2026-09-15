@@ -118,7 +118,7 @@ export async function connectGoogleAccount(ctx: CliContext, options: ConnectOpti
     for (const { account_hash: staleHash } of staleRows) {
       await ctx.credentialStore.deleteSecret(CREDENTIAL_KEYS.oauthRefreshToken(staleHash));
     }
-    ctx.db.prepare("DELETE FROM accounts WHERE account_hash != ?").run(accountHash);
+    accountsRepo.deleteAllExcept(accountHash);
 
     const detectedTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     const timezone = (await options.resolveTimezone?.(detectedTimezone)) || detectedTimezone;

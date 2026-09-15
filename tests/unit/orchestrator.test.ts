@@ -1506,3 +1506,106 @@ describe("event-bearing assessments are never reconstructed from cache", () => {
     expect(assess).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * The 90-day cleanup of old low-value mail. It is the one Trash decision
+ * that is not made by the policy engine, which is exactly how it came to
+ * miss the protections every other Trash path goes through.
+ */
+describe("runWorkScan: 90-day cleanup of old low-value mail", () => {
+  const OLD_INTERNAL_DATE = String(Date.now() - 200 * 86_400_000);
+
+  function oldRoutineMessage(labelIds: string[] = ["INBOX", "UNREAD"]): FakeMessage {
+    return {
+      id: "m1",
+      threadId: "t1",
+      labelIds,
+      internalDate: OLD_INTERNAL_DATE,
+      headers: [
+        { name: "From", value: "friend@example.com" },
+        { name: "Subject", value: "Re: lunch" }
+      ]
+    };
+  }
+
+  const routineClassifier = new FixedClassifier({
+    ok: true,
+    assessment: {
+      kind: "personal_routine",
+      confidence: 0.95,
+      importanceScore: 0.1,
+      importanceConfidence: 0.9,
+      summary: "s",
+      reasonCodes: ["human_sender"],
+      event: {
+        intent: "none", confidence: 0, title: null, start: null, end: null,
+        allDay: false, timeZone: null, location: null, sourceEvidence: null
+      },
+      category: null,
+      classifierVersion: "c",
+      promptVersion: "p",
+      schemaVersion: "s"
+    }
+  });
+
+  it("trashes an old, unprotected routine message", async () => {
+    const { outcomes } = await runWorkScan(
+      baseDeps({
+        gmailClient: fakeClient([oldRoutineMessage()]),
+        classifier: routineClassifier,
+        sentThreadIds: new Set<string>()
+      })
+    );
+    expect(outcomes[0]!.decision.actions).toEqual([{ type: "trash", reasonCode: "old_low_value" }]);
+  });
+
+  // Regression: this cleanup was applied after the reply-protection gate had
+  // already run and found no Trash to protect, so an old message in a thread
+  // the user had replied to was trashed without the Sent index ever being
+  // consulted.
+  it("never trashes a message in a thread the user has replied to", async () => {
+    const { outcomes } = await runWorkScan(
+      baseDeps({
+        gmailClient: fakeClient([oldRoutineMessage()]),
+        classifier: routineClassifier,
+        sentThreadIds: new Set(["t1"])
+      })
+    );
+    expect(outcomes[0]!.decision.actions.some((a) => a.type === "trash")).toBe(false);
+  });
+
+  // Regression: an unavailable reply-protection index is supposed to hold
+  // every destructive action for review, and this path escaped that too.
+  it("holds the cleanup for review when the reply-protection index is unavailable", async () => {
+    const { outcomes } = await runWorkScan(
+      baseDeps({
+        gmailClient: fakeClient([oldRoutineMessage()]),
+        classifier: routineClassifier,
+        sentThreadIndexUnavailable: true
+      })
+    );
+    expect(outcomes[0]!.decision.actions.some((a) => a.type === "trash")).toBe(false);
+    expect(outcomes[0]!.decision.needsReview).toBe(true);
+  });
+
+  // Regression: --archive is additive, but the cleanup required a message to
+  // have no planned action at all, so a read message's pending archive
+  // silently switched the cleanup off for exactly the mail it most applies to.
+  it("still applies to read mail when --archive adds an archive action", async () => {
+    const deps = {
+      gmailClient: fakeClient([oldRoutineMessage(["INBOX"])]),
+      classifier: routineClassifier,
+      sentThreadIds: new Set<string>()
+    };
+    const withoutArchive = await runWorkScan(baseDeps(deps));
+    const withArchive = await runWorkScan(baseDeps({ ...deps, archiveReadMail: true }));
+    expect(withoutArchive.outcomes[0]!.decision.actions).toEqual([
+      { type: "trash", reasonCode: "old_low_value" }
+    ]);
+    // Trash is mutually exclusive with every other action, so it replaces
+    // the archive rather than joining it.
+    expect(withArchive.outcomes[0]!.decision.actions).toEqual([
+      { type: "trash", reasonCode: "old_low_value" }
+    ]);
+  });
+});

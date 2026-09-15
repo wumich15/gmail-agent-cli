@@ -3,6 +3,7 @@ import pc from "picocolors";
 import { createInterface } from "node:readline/promises";
 import type { CliContext } from "../core/bootstrap.js";
 import { buildComposeTarget, sendReply, SendFailedError, type ReplyTarget } from "./reply.js";
+import { sanitizeTerminalLine, sanitizeTerminalText } from "../core/terminal-text.js";
 import { draftNewEmail } from "../ai/draft-reply.js";
 import { resolveOpenAiCredentials } from "../ai/resolve-classifier.js";
 import type { ResolvedOpenAiCredentials } from "../ai/resolve-classifier.js";
@@ -44,7 +45,7 @@ export async function promptBody(message: string): Promise<string | null> {
 export async function reviewAiDraft(draft: string): Promise<string | null> {
   console.log("");
   console.log(pc.bold("AI draft"));
-  console.log(draft);
+  console.log(sanitizeTerminalText(draft));
   console.log("");
   const choice = await p.select({
     message: "What next?",
@@ -73,10 +74,14 @@ export async function confirmAndSend(
 ): Promise<boolean> {
   console.log("");
   console.log(pc.bold(target.threadId ? "Reply preview" : "Message preview"));
-  console.log(`To: ${target.to}`);
-  console.log(`Subject: ${target.subject}`);
+  // This is the screen the send decision is made from, so nothing reaches it
+  // that could repaint it (see core/terminal-text.ts). `sendReply` applies
+  // the same sanitization to what it actually transmits, so the preview and
+  // the sent message stay identical.
+  console.log(`To: ${sanitizeTerminalLine(target.to)}`);
+  console.log(`Subject: ${sanitizeTerminalLine(target.subject)}`);
   console.log("");
-  console.log(body);
+  console.log(sanitizeTerminalText(body));
   console.log("");
   const confirmed = await p.confirm({ message: "Send this exact message?", initialValue: false });
   if (p.isCancel(confirmed) || !confirmed) {

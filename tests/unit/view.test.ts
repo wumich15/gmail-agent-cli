@@ -7,7 +7,10 @@ vi.mock("node:child_process", () => ({ spawn: spawnMock }));
 const {
   adjustPageSize,
   filterMessages,
-  parseQuickActionCommand,
+  parseCleanupCommand,
+  summarizeBulk,
+  applyToTargets,
+  setCachedStar,
   shortenLinksForDisplay,
   terminalHyperlink,
   openUrlInBrowser,
@@ -46,35 +49,6 @@ describe("gmail view filtering", () => {
 
   it("uses an empty label selection as all cached mail", () => {
     expect(filterMessages(messages, new Set(), "sale").map((message) => message.gmailMessageId)).toEqual(["spam"]);
-  });
-});
-
-describe("gmail view quick-action shorthand", () => {
-  it("parses '<n> ;r' as an immediate AI-reply on message n", () => {
-    expect(parseQuickActionCommand("2 ;r")).toEqual({ index: 2, action: "ai_reply" });
-  });
-
-  it("parses '<n> r' as an immediate manual reply", () => {
-    expect(parseQuickActionCommand("3 r")).toEqual({ index: 3, action: "reply" });
-  });
-
-  it("parses '<n> d' as an immediate delete", () => {
-    expect(parseQuickActionCommand("1 d")).toEqual({ index: 1, action: "delete" });
-  });
-
-  it("parses '<n> i' as an immediate move to Inbox", () => {
-    expect(parseQuickActionCommand("4 i")).toEqual({ index: 4, action: "move_to_inbox" });
-  });
-
-  it("tolerates no space between the number and the action", () => {
-    expect(parseQuickActionCommand("2;r")).toEqual({ index: 2, action: "ai_reply" });
-  });
-
-  it("returns null for a bare index (still opens normally) and for garbage", () => {
-    expect(parseQuickActionCommand("2")).toBeNull();
-    expect(parseQuickActionCommand("2 x")).toBeNull();
-    expect(parseQuickActionCommand("r")).toBeNull();
-    expect(parseQuickActionCommand("0 d")).toBeNull();
   });
 });
 
@@ -123,6 +97,42 @@ describe("shortenLinksForDisplay", () => {
     const { text, links } = shortenLinksForDisplay("Just plain text, no links here.");
     expect(text).toBe("Just plain text, no links here.");
     expect(links).toEqual([]);
+  });
+
+  it("stops the address at the delimiters around it instead of opening a broken link", () => {
+    // Regression: a Discord invite written as "<https://discord.gg/abc>*"
+    // captured the closing bracket and the stray emphasis character, so both
+    // the OSC 8 hyperlink and "o" handed the browser an address that does
+    // not exist. Angle brackets reach the reader both from plain-text mail
+    // and from decoded &lt;/&gt; in HTML mail.
+    process.stdout.isTTY = false;
+    expect(shortenLinksForDisplay("Join <https://discord.gg/abc>*").links).toEqual([
+      { label: "[1]", url: "https://discord.gg/abc" }
+    ]);
+    expect(shortenLinksForDisplay("Join https://discord.gg/abc.").links).toEqual([
+      { label: "[1]", url: "https://discord.gg/abc" }
+    ]);
+    expect(shortenLinksForDisplay("See https://example.com/a, then https://example.com/b!").links).toEqual([
+      { label: "[1]", url: "https://example.com/a" },
+      { label: "[2]", url: "https://example.com/b" }
+    ]);
+  });
+
+  it("keeps the trailing punctuation in the sentence rather than deleting it with the link", () => {
+    process.stdout.isTTY = false;
+    expect(shortenLinksForDisplay("Join <https://discord.gg/abc>* now").text).toBe("Join <[1]>* now");
+  });
+
+  it("does not trim characters that carry meaning inside a URL", () => {
+    process.stdout.isTTY = false;
+    for (const url of [
+      "https://example.com/path_to/x",
+      "https://example.com/?q=a*b&n=1",
+      "https://example.com/wiki/Foo_(bar)#s1"
+    ]) {
+      const { links } = shortenLinksForDisplay(`Open ${url} here`);
+      expect(links[0]?.url, url).toBe(url);
+    }
   });
 });
 
@@ -289,6 +299,104 @@ function expectInvalidated(record: CachedMessageRecord, labelSnapshot: readonly 
   }));
 }
 
+describe("star (\"s\")", () => {
+  function harness(modifyImpl: () => Promise<unknown> = () => Promise.resolve({})) {
+    const modify = vi.fn(modifyImpl);
+    const client = { users: { messages: { modify } } };
+    const repo = { upsert: vi.fn(), delete: vi.fn() };
+    return { client, repo, modify };
+  }
+
+  it("adds STARRED and invalidates the cached assessment, since the label snapshot is a policy input", async () => {
+    const { client, repo, modify } = harness();
+
+    const result = await setCachedStar(client as never, repo as never, assessedRow("m1", ["INBOX"]), true, "after");
+
+    expect(result.ok).toBe(true);
+    expect(modify).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: "me", id: "m1", requestBody: { addLabelIds: ["STARRED"] } }),
+      expect.anything()
+    );
+    expectInvalidated(repo.upsert.mock.calls[0]![0] as CachedMessageRecord, ["INBOX", "STARRED"]);
+  });
+
+  it("removes STARRED when unstarring", async () => {
+    const { client, repo, modify } = harness();
+
+    await setCachedStar(client as never, repo as never, assessedRow("m1", ["INBOX", "STARRED"]), false, "after");
+
+    expect(modify).toHaveBeenCalledWith(
+      expect.objectContaining({ requestBody: { removeLabelIds: ["STARRED"] } }),
+      expect.anything()
+    );
+    expectInvalidated(repo.upsert.mock.calls[0]![0] as CachedMessageRecord, ["INBOX"]);
+  });
+
+  it("never adds IMPORTANT: a user starring a row asked for a star, not a classification", async () => {
+    const { client, repo } = harness();
+    await setCachedStar(client as never, repo as never, row("m1", ["INBOX"], "Subject", "Sender"), true, "after");
+    const record = repo.upsert.mock.calls[0]![0] as CachedMessageRecord;
+    expect(record.labelSnapshot).not.toContain("IMPORTANT");
+  });
+
+  it("calls Gmail at all only when the label would actually change", async () => {
+    const { client, repo, modify } = harness();
+    const starred = row("m1", ["INBOX", "STARRED"], "Subject", "Sender");
+
+    const result = await setCachedStar(client as never, repo as never, starred, true, "after");
+
+    expect(result).toEqual({ ok: true, record: starred });
+    expect(modify).not.toHaveBeenCalled();
+    expect(repo.upsert).not.toHaveBeenCalled();
+  });
+
+  it("leaves the cached row untouched when Gmail rejects the change", async () => {
+    const { client, repo } = harness(() => Promise.reject(new Error("permission denied")));
+
+    const result = await setCachedStar(client as never, repo as never, row("m1", ["INBOX"], "S", "X"), true, "after");
+
+    expect(result.ok).toBe(false);
+    expect(result.ok ? "" : result.message).toContain("permission denied");
+    expect(repo.upsert).not.toHaveBeenCalled();
+  });
+});
+
+describe("applying a row action across a selection", () => {
+  const first = row("m1", ["INBOX"], "First", "A");
+  const second = row("m2", ["INBOX"], "Second", "B");
+  const third = row("m3", ["INBOX"], "Third", "C");
+
+  it("keeps going after an isolated failure and reports both sides", async () => {
+    const outcome = await applyToTargets([first, second, third], async (target) =>
+      target.gmailMessageId === "m2"
+        ? { ok: false, message: "Could not star: quota exceeded" }
+        : { ok: true, record: target }
+    );
+
+    expect(outcome.done).toEqual([first, third]);
+    expect(outcome.failures).toEqual(["Could not star: quota exceeded"]);
+  });
+
+  it("names a single message but counts several, and never hides a failure", () => {
+    const one = (record: CachedMessageRecord): string => `Moved "${record.subject}" to Trash.`;
+    const many = (count: number): string => `Moved ${count} messages to Trash.`;
+
+    expect(summarizeBulk({ done: [first], failures: [] }, one, many)).toBe('Moved "First" to Trash.');
+    expect(summarizeBulk({ done: [first, second], failures: [] }, one, many)).toBe("Moved 2 messages to Trash.");
+    expect(summarizeBulk({ done: [first], failures: ["Could not move to Trash: nope"] }, one, many)).toBe(
+      'Moved "First" to Trash. Could not move to Trash: nope'
+    );
+    expect(summarizeBulk({ done: [], failures: ["a", "b"] }, one, many)).toBe("2 failed; first: a");
+    expect(summarizeBulk({ done: [], failures: [] }, one, many)).toBeNull();
+  });
+
+  it("appends the caller's extra note, such as rows that were already in Trash", () => {
+    expect(
+      summarizeBulk({ done: [first], failures: [] }, () => "Moved it.", (count) => `Moved ${count}.`, "1 already in Trash.")
+    ).toBe("Moved it. 1 already in Trash.");
+  });
+});
+
 describe("move cached message to Inbox", () => {
   function harness(overrides: {
     modify?: (() => Promise<unknown>) | undefined;
@@ -389,5 +497,35 @@ describe("move cached message to Inbox", () => {
     expect(outcome.ok ? "" : outcome.message).toContain("permission denied");
     expect(repo.upsert).not.toHaveBeenCalled();
     expect(cached).toEqual(before);
+  });
+});
+
+describe("parseCleanupCommand", () => {
+  it("accepts the same command line the user would type at a shell prompt", () => {
+    expect(parseCleanupCommand("gmail --limit 20")).toEqual({ limit: 20, dryRun: false, archive: false });
+    expect(parseCleanupCommand("gmail --limit=20")).toEqual({ limit: 20, dryRun: false, archive: false });
+    expect(parseCleanupCommand("  gmail   --limit   20 ")).toEqual({ limit: 20, dryRun: false, archive: false });
+  });
+
+  it("accepts the bare command and the flag-only shorthand", () => {
+    expect(parseCleanupCommand("gmail")).toEqual({ dryRun: false, archive: false });
+    expect(parseCleanupCommand("work")).toEqual({ dryRun: false, archive: false });
+    expect(parseCleanupCommand("--limit 5")).toEqual({ limit: 5, dryRun: false, archive: false });
+  });
+
+  it("carries the other run flags through", () => {
+    expect(parseCleanupCommand("gmail --archive --dry-run --limit 3")).toEqual({
+      limit: 3,
+      dryRun: true,
+      archive: true
+    });
+  });
+
+  // Anything unrecognized has to fall through to the list's own handling
+  // rather than being treated as a mailbox-mutating run.
+  it("rejects anything that is not this command", () => {
+    for (const input of ["", "q", "u", "2 d", "l 40", "gmail --json", "gmail --limit", "gmail --limit 0", "gmail --limit -3", "gmail --limit abc", "gmailx"]) {
+      expect(parseCleanupCommand(input)).toBeNull();
+    }
   });
 });

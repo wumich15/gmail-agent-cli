@@ -2,6 +2,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { NormalizedMessage } from "../core/models.js";
 import type { GmailClient } from "./client.js";
 import { apiErrorStatus, isGoogleQuotaError, isRetryableNetworkError, withGoogleApiRetry } from "../core/api-retry.js";
+import { sanitizeTerminalLine, sanitizeTerminalText } from "../core/terminal-text.js";
 
 export interface ReplyTarget {
   to: string;
@@ -14,9 +15,19 @@ export interface ReplyTarget {
 /** A header value must never carry a raw CR/LF: RFC 5322 header lines are folded, and an unfolded literal CR/LF is exactly how a malicious sender would splice extra headers into an outbound message. */
 const CONTAINS_CRLF = /[\r\n]/;
 
-/** Collapses any embedded CR/LF (and surrounding whitespace) into a single space — never lets one become a header-line break. */
+/**
+ * Collapses any embedded CR/LF (and surrounding whitespace) into a single
+ * space — never lets one become a header-line break — and drops every other
+ * control character.
+ *
+ * A reply's subject is derived from the original message's, so it is
+ * sender-controlled text. An escape byte surviving into the header would go
+ * out on the real message *and* would be printed verbatim by the send
+ * confirmation preview, which is the one screen whose job is to show the
+ * user exactly what they are about to send (see core/terminal-text.ts).
+ */
 function sanitizeSingleLineHeader(value: string): string {
-  return value.replace(/[\r\n]+/g, " ").replace(/[ \t]+/g, " ").trim();
+  return sanitizeTerminalLine(value).replace(/[ \t]+/g, " ").trim();
 }
 
 /**
@@ -81,7 +92,11 @@ function wrapBase64(base64: string): string {
   return (base64.match(/.{1,76}/g) ?? []).join("\r\n");
 }
 
-function buildRawMessage(target: ReplyTarget, body: string): string {
+function buildRawMessage(target: ReplyTarget, rawBody: string): string {
+  // Sanitized here as well as at the preview, so "the exact message you were
+  // shown" and "the message Gmail receives" cannot differ by an invisible
+  // control byte.
+  const body = sanitizeTerminalText(rawBody);
   const bodyIsAscii = /^[\x00-\x7F]*$/.test(body);
   const encodedBody = bodyIsAscii ? body : wrapBase64(Buffer.from(body, "utf-8").toString("base64"));
   const headers = [
