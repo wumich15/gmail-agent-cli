@@ -1078,6 +1078,83 @@ describe("runWorkScan", () => {
     expect(result.scanNote).toContain("most recent");
   });
 
+  it("does not let old native Spam outrank newer Inbox mail under --limit", async () => {
+    // Regression: the Inbox and native-Spam listings are two independent
+    // newest-first sequences, and the ranking merged them on list *position*.
+    // Spam position i therefore tied with Inbox position i, so the top of the
+    // Spam list displaced far more recent Inbox mail. A real timestamp is the
+    // only key that orders the two folders against each other.
+    const messages: FakeMessage[] = [
+      { id: "inbox-new", threadId: "t-a", labelIds: ["INBOX", "UNREAD"], internalDate: "9000", headers: [{ name: "From", value: "a@example.com" }] },
+      { id: "inbox-mid", threadId: "t-b", labelIds: ["INBOX", "UNREAD"], internalDate: "8000", headers: [{ name: "From", value: "b@example.com" }] },
+      { id: "spam-ancient", threadId: "t-c", labelIds: ["SPAM"], internalDate: "10", headers: [{ name: "From", value: "c@example.com" }] }
+    ];
+    const client = fakeClient(messages);
+    (client.users.history as unknown as { list: () => Promise<unknown> }).list = async () => ({
+      data: { history: [], historyId: "200" }
+    });
+
+    const result = await runWorkScan(
+      baseDeps({
+        gmailClient: client,
+        historyMarker: "100",
+        limit: 2,
+        cachedBacklogStubs: [
+          { id: "inbox-new", threadId: "t-a" },
+          { id: "inbox-mid", threadId: "t-b" },
+          { id: "spam-ancient", threadId: "t-c" }
+        ],
+        // Known dates for all three: the cap must be spent on the two newest
+        // messages overall, not one per folder.
+        cachedInternalDates: new Map([
+          ["inbox-new", "9000"],
+          ["inbox-mid", "8000"],
+          ["spam-ancient", "10"]
+        ]),
+        cacheRecencyIsFresh: false,
+        classifier: {
+          async assess(): Promise<AssessmentResult> {
+            return { ok: false, unavailable: { reason: "not_configured", detail: null } };
+          }
+        }
+      })
+    );
+
+    expect(result.outcomes.map((outcome) => outcome.gmailMessageId).sort()).toEqual(["inbox-mid", "inbox-new"]);
+  });
+
+  it("still prefers brand-new listed mail over anything it already has a date for", async () => {
+    // The other half of the same ranking: a message Gmail lists among the
+    // newest that is not in the local cache at all is new mail by
+    // definition, so no cached timestamp may outrank it.
+    const messages: FakeMessage[] = [
+      { id: "just-arrived", threadId: "t-new", labelIds: ["INBOX", "UNREAD"], internalDate: "9999", headers: [{ name: "From", value: "new@example.com" }] },
+      { id: "known", threadId: "t-k", labelIds: ["INBOX", "UNREAD"], internalDate: "9000", headers: [{ name: "From", value: "k@example.com" }] }
+    ];
+    const client = fakeClient(messages);
+    (client.users.history as unknown as { list: () => Promise<unknown> }).list = async () => ({
+      data: { history: [], historyId: "200" }
+    });
+
+    const result = await runWorkScan(
+      baseDeps({
+        gmailClient: client,
+        historyMarker: "100",
+        limit: 1,
+        cachedBacklogStubs: [{ id: "known", threadId: "t-k" }],
+        cachedInternalDates: new Map([["known", "9000"]]),
+        cacheRecencyIsFresh: false,
+        classifier: {
+          async assess(): Promise<AssessmentResult> {
+            return { ok: false, unavailable: { reason: "not_configured", detail: null } };
+          }
+        }
+      })
+    );
+
+    expect(result.outcomes.map((outcome) => outcome.gmailMessageId)).toEqual(["just-arrived"]);
+  });
+
   it("ranks a --limit queue from cached dates, with no extra listing, when the cache is fresh", async () => {
     const messages: FakeMessage[] = [
       { id: "older", threadId: "t-1", labelIds: ["INBOX", "UNREAD"], internalDate: "1000", headers: [{ name: "From", value: "a@example.com" }] },
@@ -1427,5 +1504,108 @@ describe("event-bearing assessments are never reconstructed from cache", () => {
     });
 
     expect(assess).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The 90-day cleanup of old low-value mail. It is the one Trash decision
+ * that is not made by the policy engine, which is exactly how it came to
+ * miss the protections every other Trash path goes through.
+ */
+describe("runWorkScan: 90-day cleanup of old low-value mail", () => {
+  const OLD_INTERNAL_DATE = String(Date.now() - 200 * 86_400_000);
+
+  function oldRoutineMessage(labelIds: string[] = ["INBOX", "UNREAD"]): FakeMessage {
+    return {
+      id: "m1",
+      threadId: "t1",
+      labelIds,
+      internalDate: OLD_INTERNAL_DATE,
+      headers: [
+        { name: "From", value: "friend@example.com" },
+        { name: "Subject", value: "Re: lunch" }
+      ]
+    };
+  }
+
+  const routineClassifier = new FixedClassifier({
+    ok: true,
+    assessment: {
+      kind: "personal_routine",
+      confidence: 0.95,
+      importanceScore: 0.1,
+      importanceConfidence: 0.9,
+      summary: "s",
+      reasonCodes: ["human_sender"],
+      event: {
+        intent: "none", confidence: 0, title: null, start: null, end: null,
+        allDay: false, timeZone: null, location: null, sourceEvidence: null
+      },
+      category: null,
+      classifierVersion: "c",
+      promptVersion: "p",
+      schemaVersion: "s"
+    }
+  });
+
+  it("trashes an old, unprotected routine message", async () => {
+    const { outcomes } = await runWorkScan(
+      baseDeps({
+        gmailClient: fakeClient([oldRoutineMessage()]),
+        classifier: routineClassifier,
+        sentThreadIds: new Set<string>()
+      })
+    );
+    expect(outcomes[0]!.decision.actions).toEqual([{ type: "trash", reasonCode: "old_low_value" }]);
+  });
+
+  // Regression: this cleanup was applied after the reply-protection gate had
+  // already run and found no Trash to protect, so an old message in a thread
+  // the user had replied to was trashed without the Sent index ever being
+  // consulted.
+  it("never trashes a message in a thread the user has replied to", async () => {
+    const { outcomes } = await runWorkScan(
+      baseDeps({
+        gmailClient: fakeClient([oldRoutineMessage()]),
+        classifier: routineClassifier,
+        sentThreadIds: new Set(["t1"])
+      })
+    );
+    expect(outcomes[0]!.decision.actions.some((a) => a.type === "trash")).toBe(false);
+  });
+
+  // Regression: an unavailable reply-protection index is supposed to hold
+  // every destructive action for review, and this path escaped that too.
+  it("holds the cleanup for review when the reply-protection index is unavailable", async () => {
+    const { outcomes } = await runWorkScan(
+      baseDeps({
+        gmailClient: fakeClient([oldRoutineMessage()]),
+        classifier: routineClassifier,
+        sentThreadIndexUnavailable: true
+      })
+    );
+    expect(outcomes[0]!.decision.actions.some((a) => a.type === "trash")).toBe(false);
+    expect(outcomes[0]!.decision.needsReview).toBe(true);
+  });
+
+  // Regression: --archive is additive, but the cleanup required a message to
+  // have no planned action at all, so a read message's pending archive
+  // silently switched the cleanup off for exactly the mail it most applies to.
+  it("still applies to read mail when --archive adds an archive action", async () => {
+    const deps = {
+      gmailClient: fakeClient([oldRoutineMessage(["INBOX"])]),
+      classifier: routineClassifier,
+      sentThreadIds: new Set<string>()
+    };
+    const withoutArchive = await runWorkScan(baseDeps(deps));
+    const withArchive = await runWorkScan(baseDeps({ ...deps, archiveReadMail: true }));
+    expect(withoutArchive.outcomes[0]!.decision.actions).toEqual([
+      { type: "trash", reasonCode: "old_low_value" }
+    ]);
+    // Trash is mutually exclusive with every other action, so it replaces
+    // the archive rather than joining it.
+    expect(withArchive.outcomes[0]!.decision.actions).toEqual([
+      { type: "trash", reasonCode: "old_low_value" }
+    ]);
   });
 });

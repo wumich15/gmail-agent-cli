@@ -1,6 +1,6 @@
 import { startRunDiagnostics } from "../logging/run-diagnostics.js";
 import pc from "picocolors";
-import { bootstrap } from "../core/bootstrap.js";
+import { bootstrap, type CliContext } from "../core/bootstrap.js";
 import { resolveAccountSigningInIfNeeded } from "./shared.js";
 import { MIN_AUTOMATIC_SPAM_RULE_MESSAGES, runWorkScan } from "../core/orchestrator.js";
 import { resolveClassifier } from "../ai/resolve-classifier.js";
@@ -18,6 +18,7 @@ import { EXIT_CODES } from "../core/errors.js";
 import { newRuleGroupId, newRunId } from "../core/ids.js";
 import { DEFAULT_LOCK_WAIT_MS, ProcessLock } from "../core/lock.js";
 import { lockFilePath } from "../config/paths.js";
+import { GMAIL_LABELS } from "../gmail/labels.js";
 import { DEFAULT_GMAIL_READ_CONCURRENCY } from "../config/schema.js";
 import { SETTING_KEYS, SettingsRepository } from "../state/repositories/settings.js";
 import {
@@ -58,6 +59,32 @@ export interface WorkOptions {
    * terminal formatting.
    */
   onJsonSummary?: (summary: JsonSummaryOutput & { runId: string | null }) => void;
+  /**
+   * Runs this command inside an already-open `gmail view` session rather
+   * than as a command of its own.
+   *
+   * Two things have to change in that mode. The session's SQLite handle is
+   * reused, so the rows this run commits are the rows the viewer redraws
+   * from. And the account lock is *not* taken here: the viewer owns it
+   * through its own operation queue, which serializes this run against the
+   * background cache loader and any keystroke action, and takes it with the
+   * timer-based `acquireAsync` — the blocking `acquire()` used below would
+   * park the event loop and freeze the session's own in-flight Gmail reads
+   * while they tick toward their timeouts. The caller is therefore required
+   * to wrap this call in `runExclusive`.
+   */
+  session?: {
+    ctx: CliContext;
+    /** Progress for the viewer to show while the run is applying changes. */
+    onAppliedBatch?: (batch: WorkAppliedBatch) => void;
+  };
+}
+
+/** One group of Gmail writes a run has finished applying — see `WorkOptions.session`. */
+export interface WorkAppliedBatch {
+  kind: "trash" | "labels";
+  applied: number;
+  failed: number;
 }
 
 /**
@@ -279,7 +306,7 @@ function mutationForActions(actions: readonly PolicyActionIntent[], labelIdByNam
 }
 
 export async function runWork(options: WorkOptions): Promise<number> {
-  const ctx = bootstrap();
+  const ctx = options.session?.ctx ?? bootstrap();
   const { account, gmailClient, calendarClient } = await resolveAccountSigningInIfNeeded(ctx);
 
   const { classifier, description, classifierVersion, promptVersion, schemaVersion } = await resolveClassifier({
@@ -292,7 +319,9 @@ export async function runWork(options: WorkOptions): Promise<number> {
   // enough to not hide from a human who happens to be running --json.
   console.error(pc.dim(description));
 
-  const lock = options.dryRun ? null : new ProcessLock(lockFilePath(account.accountHash));
+  // A dry run mutates nothing, and an in-session run is already inside the
+  // viewer's `runExclusive`, which holds this same lock for the duration.
+  const lock = options.dryRun || options.session ? null : new ProcessLock(lockFilePath(account.accountHash));
   lock?.acquire({ waitMs: DEFAULT_LOCK_WAIT_MS });
 
   ctx.logger.info({ accountHash: account.accountHash, dryRun: options.dryRun }, "work_run_start");
@@ -702,6 +731,11 @@ export async function runWork(options: WorkOptions): Promise<number> {
       if (reconciliationTotal > 0) {
         readProgress.onProgress(survivingTrash.length, reconciliationTotal, trashResult.failedMessageIds.length);
       }
+      options.session?.onAppliedBatch?.({
+        kind: "trash",
+        applied: trashResult.succeededMessageIds.length,
+        failed: trashResult.failedMessageIds.length
+      });
 
       diagnosticsLog.phase("calendar_writes");
       // Calendar creation: only for outcomes whose event candidate already
@@ -814,6 +848,11 @@ export async function runWork(options: WorkOptions): Promise<number> {
         markActions(messageId, ["star", "mark_important", "archive", "label"], "failed_retryable", "gmail_api_error");
         failureCount += 1;
       }
+      options.session?.onAppliedBatch?.({
+        kind: "labels",
+        applied: labelResult.succeededMessageIds.length,
+        failed: labelResult.failedMessageIds.length
+      });
       if (reconciliationTotal > 0) {
         readProgress.onProgress(
           reconciliationTotal,
@@ -850,7 +889,10 @@ export async function runWork(options: WorkOptions): Promise<number> {
 
       const finishedAt = ctx.clock.nowIso();
       const runCounters = {
-        trashed: survivingTrash.length,
+        // What Gmail actually accepted, not what was planned: a batch that
+        // failed is already counted in `failures`, and recording it as
+        // trashed too made the durable run record contradict itself.
+        trashed: successfullyTrashed.size,
         labelMutations: labelResult.succeededMessageIds.length,
         calendarCreated,
         failures: failureCount
@@ -931,12 +973,33 @@ export async function runWork(options: WorkOptions): Promise<number> {
         // This also prevents a cache-only backlog row that was archived,
         // trashed, or deleted from being hydrated again forever merely
         // because its old local label snapshot still said INBOX/SPAM.
-        for (const messageId of new Set([
-          ...cacheEvictionMessageIds,
-          ...successfullyTrashed,
-          ...successfullyArchived
-        ])) {
+        for (const messageId of cacheEvictionMessageIds) {
           messagesRepo.delete(account.accountHash, messageId);
+        }
+
+        // Mail this run moved is recorded where it moved to, rather than
+        // forgotten. Dropping the row did keep it out of the work backlog —
+        // which a label snapshot with no INBOX/SPAM does just as well — but
+        // `gmail view` browses these same rows across all four folders, so
+        // deleting them made every message a run had just trashed or
+        // archived vanish from the viewer's Trash and Archive tabs until a
+        // whole four-folder reload rediscovered it. That is most visible
+        // when the run is started from inside a live session (see
+        // `WorkOptions.session`), where the folder the mail moved to is one
+        // keystroke away.
+        for (const messageId of new Set([...successfullyTrashed, ...successfullyArchived])) {
+          const cached = messagesRepo.get(account.accountHash, messageId);
+          if (!cached) continue;
+          const trashed = successfullyTrashed.has(messageId);
+          const labels = cached.labelSnapshot.filter(
+            (label) =>
+              label !== GMAIL_LABELS.inbox && !(trashed && (label === GMAIL_LABELS.spam || label === GMAIL_LABELS.trash))
+          );
+          messagesRepo.upsert({
+            ...cached,
+            labelSnapshot: trashed ? [...labels, GMAIL_LABELS.trash] : labels,
+            processedAt: finishedAt
+          });
         }
 
         // Advance only after every other part of the checkpoint above is

@@ -1,13 +1,25 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { SafetyPreconditionError } from "./errors.js";
 
+/**
+ * Whether `pid` is still running.
+ *
+ * Only `ESRCH` ("no such process") is conclusive evidence that the holder
+ * is gone. `process.kill(pid, 0)` also throws `EPERM` when the process
+ * exists but belongs to another user, and reading that as "dead" would let
+ * `acquire()` delete a live holder's lock file and hand the same account to
+ * two commands at once — the single failure this lock exists to prevent.
+ * Anything unrecognized is likewise treated as "still alive", because
+ * refusing to start is recoverable and double-mutating a mailbox is not.
+ */
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return (error as { code?: unknown } | null)?.code !== "ESRCH";
   }
 }
 
@@ -36,11 +48,15 @@ export const DEFAULT_LOCK_WAIT_MS = 10_000;
 const LOCK_POLL_INTERVAL_MS = 100;
 
 /**
- * Blocks this thread for `ms`. `acquire()` is synchronous and is called at
- * command startup, before any async work is in flight, so parking the
- * event loop here costs nothing; the interactive viewer deliberately never
- * waits (it passes `waitMs: 0`) precisely because it must not stall its
- * own in-flight work.
+ * Blocks this thread for `ms`.
+ *
+ * Only `acquire()` uses this, and only for a command that has nothing else
+ * in flight: it runs at startup, before any async work exists, so parking
+ * the event loop costs nothing. Anything already running concurrently —
+ * the interactive viewer's foreground actions, an outbound send inside a
+ * live session — must use `acquireAsync()` instead, because freezing the
+ * loop there also freezes that process's own in-flight Gmail reads and
+ * their abort signals while they tick towards their timeouts.
  */
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -54,38 +70,100 @@ function sleepSync(ms: number): void {
  */
 export class ProcessLock {
   private acquired = false;
+  private blockingPid: number | null = null;
 
   constructor(private readonly path: string) {}
 
   /**
+   * Blocking acquire, for a command that has no other work in flight.
+   *
+   * `waitMs` bounds how long to keep retrying while a *live* process holds
+   * the lock; it defaults to 0 (fail immediately). Prefer `acquireAsync()`
+   * whenever the caller already has asynchronous work running.
+   */
+  acquire(options: { waitMs?: number } = {}): void {
+    this.prepareDirectory();
+    const deadline = Date.now() + Math.max(0, options.waitMs ?? 0);
+    for (;;) {
+      if (this.attempt()) return;
+      if (Date.now() >= deadline) throw this.heldError();
+      sleepSync(LOCK_POLL_INTERVAL_MS);
+    }
+  }
+
+  /**
+   * The same acquire, waiting on a timer instead of on the event loop.
+   *
+   * Identical semantics to `acquire()`, including `waitMs: 0` making
+   * exactly one attempt and never yielding. Used everywhere the process is
+   * already doing something — `gmail view`'s per-operation lock and the
+   * outbound send path — where a synchronous wait would stall the caller's
+   * own in-flight requests for the length of the wait.
+   */
+  async acquireAsync(options: { waitMs?: number } = {}): Promise<void> {
+    this.prepareDirectory();
+    const deadline = Date.now() + Math.max(0, options.waitMs ?? 0);
+    for (;;) {
+      if (this.attempt()) return;
+      if (Date.now() >= deadline) throw this.heldError();
+      await delay(LOCK_POLL_INTERVAL_MS);
+    }
+  }
+
+  /**
+   * Removes the lock file, but only while it still names this process.
+   *
+   * The unconditional unlink this replaced could delete a *different*
+   * process's lock: if our file were ever reclaimed as stale (a recycled
+   * PID, or the `EPERM` misreading fixed above), the new holder's file sits
+   * at the same path, and releasing would silently free an account another
+   * command believes it owns.
+   */
+  release(): void {
+    if (!this.acquired) return;
+    this.acquired = false;
+    let holder: string;
+    try {
+      holder = readFileSync(this.path, "utf-8").trim();
+    } catch {
+      // Already gone; nothing of ours left to remove.
+      return;
+    }
+    if (holder !== String(process.pid)) return;
+    try {
+      unlinkSync(this.path);
+    } catch {
+      // Raced with an external cleanup; the file is gone either way.
+    }
+  }
+
+  private prepareDirectory(): void {
+    const dir = dirname(this.path);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
+  }
+
+  /**
+   * One non-blocking acquisition attempt.
+   *
    * Uses an atomic exclusive-create write (`flag: "wx"`) rather than a
    * separate existence check followed by a write — the two-step version
    * has a TOCTOU race where two processes launched close together can
    * both observe "no lock file" and both proceed to write one, defeating
    * the whole point of an exclusive lock. On EEXIST, checks whether the
    * PID that holds the file is still alive; a stale lock from a crashed
-   * process is removed and the atomic create retried.
-   *
-   * `waitMs` bounds how long to keep retrying while a *live* process holds
-   * the lock. It defaults to 0 (fail immediately) so callers that must not
-   * block — the interactive viewer's per-operation lock — keep the old
-   * behavior; ordinary commands pass `DEFAULT_LOCK_WAIT_MS` so they ride
-   * out a view session's brief background cache chunks instead of
-   * refusing to start.
+   * process is removed and the atomic create retried. Returns false only
+   * when a genuinely live process holds it.
    */
-  acquire(options: { waitMs?: number } = {}): void {
-    const dir = dirname(this.path);
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true, mode: 0o700 });
-    }
+  private attempt(): boolean {
     const pidContent = String(process.pid);
-    const deadline = Date.now() + Math.max(0, options.waitMs ?? 0);
-
     for (;;) {
       try {
         writeFileSync(this.path, pidContent, { mode: 0o600, flag: "wx" });
         this.acquired = true;
-        return;
+        this.blockingPid = null;
+        return true;
       } catch (error) {
         if (!isEexist(error)) {
           throw error;
@@ -98,19 +176,15 @@ export class ProcessLock {
           // retry the atomic create immediately.
           continue;
         }
-        if (Number.isFinite(existingPid) && isProcessAlive(existingPid)) {
-          // Held by something that really is running. Retry until the
-          // caller's wait budget runs out; a holder that releases in the
-          // meantime (a view session between cache chunks) lets us through.
-          if (Date.now() < deadline) {
-            sleepSync(LOCK_POLL_INTERVAL_MS);
-            continue;
-          }
-          throw new SafetyPreconditionError(
-            `Another gmail process (pid ${existingPid}) is already running for this account. ` +
-              "Wait for it to finish, or if it crashed, remove the lock file manually: " +
-              this.path
-          );
+        // A positive integer only. An empty or corrupt lock file parses to
+        // 0 or NaN, and 0 is not a harmless value to pass to
+        // `process.kill`: on POSIX it addresses the caller's whole process
+        // group, so it would report "alive" (now that EPERM means alive)
+        // and wedge the account behind a lock file that names nobody.
+        // Garbage is stale by definition; reclaim it.
+        if (Number.isInteger(existingPid) && (existingPid as number) > 0 && isProcessAlive(existingPid)) {
+          this.blockingPid = existingPid;
+          return false;
         }
         // Stale lock from a crashed process; remove it and retry the
         // atomic create. If another process wins this same race, its
@@ -125,10 +199,11 @@ export class ProcessLock {
     }
   }
 
-  release(): void {
-    if (this.acquired && existsSync(this.path)) {
-      unlinkSync(this.path);
-    }
-    this.acquired = false;
+  private heldError(): SafetyPreconditionError {
+    return new SafetyPreconditionError(
+      `Another gmail process (pid ${this.blockingPid ?? "unknown"}) is already running for this account. ` +
+        "Wait for it to finish, or if it crashed, remove the lock file manually: " +
+        this.path
+    );
   }
 }

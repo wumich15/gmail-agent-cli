@@ -276,6 +276,19 @@ export interface BuildNormalizedMessageInput {
   plainBody: string | null;
   userEmail: string;
   threadHasUserSentMessage: boolean;
+  /**
+   * Overrides the default body cap. The default exists to bound what is
+   * sent to the classifier; `gmail view`'s read view passes a much larger
+   * one because it is showing the mail to a person, and silently stopping
+   * a long message at the model's budget is not reading it.
+   *
+   * Anything whose `contentHash` is persisted must leave this alone: the
+   * hash covers `bodyText`/`bodyTruncated`, so two different caps describe
+   * the same message with two different hashes. The read view is safe
+   * because its cache projection is built separately, by
+   * `projectHydratedCacheMessage`, at the default cap.
+   */
+  maxBodyChars?: number;
 }
 
 export function buildNormalizedMessage(input: BuildNormalizedMessageInput): NormalizedMessage {
@@ -284,14 +297,15 @@ export function buildNormalizedMessage(input: BuildNormalizedMessageInput): Norm
     address: null,
     displayName: null
   };
+  const maxBodyChars = input.maxBodyChars ?? MAX_BODY_CHARS;
   let bodyText: string | null = null;
   let bodyTruncated = false;
   if (input.plainBody !== null) {
-    const { text, truncated } = boundPlainText(input.plainBody);
+    const { text, truncated } = boundPlainText(input.plainBody, maxBodyChars);
     bodyText = text;
     bodyTruncated = truncated;
   } else if (input.htmlBody !== null) {
-    const { text, truncated } = htmlToBoundedPlainText(input.htmlBody);
+    const { text, truncated } = htmlToBoundedPlainText(input.htmlBody, maxBodyChars);
     bodyText = text;
     bodyTruncated = truncated;
   }

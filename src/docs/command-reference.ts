@@ -207,15 +207,22 @@ export const COMMANDS: readonly CommandDoc[] = [
 
 export const VIEW_CONTROLS: readonly ViewControlDoc[] = [
   { keys: "up / down", description: "move the highlighted row (no Enter needed)", context: "list" },
+  { keys: "j / k", description: "move the highlighted row down / up, vim style (no Enter needed)", context: "list" },
+  { keys: "<n>j / <n>k", description: 'jump n rows down / up (e.g. "5j"), stopping at the edge of the page', context: "list" },
+  { keys: "shift+up / down", description: "extend a selection of several rows from the highlighted one", context: "list" },
   { keys: "enter", description: "open the highlighted row", context: "list" },
   { keys: "number", description: "type email number to open", context: "list" },
-  { keys: "<n> r", description: "reply to message n immediately, without opening it first", context: "list" },
-  { keys: "<n> ;r", description: 'AI-draft a reply to message n immediately (e.g. "2 ;r")', context: "list" },
-  { keys: "<n> d", description: "confirm moving message n to Trash without opening it (disabled in Trash)", context: "list" },
-  { keys: "<n> i", description: "move message n to Inbox, including from Archive, Trash, or Spam", context: "list" },
-  { keys: "d", description: "confirm moving the highlighted row to Trash without opening it (disabled in Trash)", context: "list" },
-  { keys: "dd", description: "move the highlighted row to Trash without confirmation (disabled in Trash)", context: "list" },
-  { keys: "i", description: "move the highlighted row to Inbox, including unarchiving/restoring it", context: "list" },
+  { keys: "3-5 or 1,4", description: "select those rows, ready for a row action typed on its own", context: "list" },
+  { keys: "r / ;r", description: "reply / AI-draft a reply to the highlighted row (one message at a time)", context: "list" },
+  { keys: "d", description: "confirm moving the selected rows to Trash without opening them (disabled in Trash)", context: "list" },
+  { keys: "dd", description: "move the selected rows to Trash without confirmation (disabled in Trash)", context: "list" },
+  { keys: "i", description: "move the selected rows to Inbox, including unarchiving/restoring them", context: "list" },
+  { keys: "s", description: "star the selected rows (unstars them when they are all starred already)", context: "list" },
+  {
+    keys: "<action> <rows>",
+    description: 'give any row action explicit rows: "d 3-5", "s 1,4", "i 2-6", "3-5 dd", "2 ;r"',
+    context: "list"
+  },
   { keys: "left / right", description: "switch the top bar between Inbox, Archive, Trash, and Spam", context: "list" },
   { keys: "n / p", description: "next or previous page", context: "list" },
   { keys: "[ / ]", description: "back or forward through prior list views", context: "list" },
@@ -223,16 +230,23 @@ export const VIEW_CONTROLS: readonly ViewControlDoc[] = [
   { keys: "+ / -", description: "increase or decrease page size", context: "list" },
   { keys: "l <number>", description: "set an exact page size", context: "list" },
   { keys: "f", description: "filter the current folder by Gmail label", context: "list" },
-  { keys: "s <text>", description: "search Inbox subjects/senders (s clears; switching folders clears it)", context: "list" },
+  { keys: "/<text>", description: "search Inbox subjects/senders (bare / clears; switching folders clears it)", context: "list" },
   { keys: "c", description: "compose a new message (asks whether to write it or have AI draft it)", context: "list" },
   { keys: "a", description: "compose a new message, going straight to an AI draft", context: "list" },
   { keys: ";s", description: "refresh your saved writing style from recent Sent mail", context: "list" },
   { keys: ";u", description: "undo the last delete from this session", context: "list" },
   { keys: "u", description: 'refresh Gmail (also updates the "cached ... ago" timestamp)', context: "list" },
+  {
+    keys: "gmail [--limit n]",
+    description:
+      "run the cleanup here and update the list as it applies changes (also accepts --archive and --dry-run)",
+    context: "list"
+  },
   { keys: "q", description: "quit", context: "list" },
   { keys: "left / right", description: "previous or next message while reading one", context: "read" },
   { keys: "r / ;r", description: "reply manually or with AI while reading", context: "read" },
   { keys: "d", description: "move to Trash while reading — default answer is yes (disabled in Trash)", context: "read" },
+  { keys: "s", description: "star or unstar the message you are reading", context: "read" },
   { keys: "i", description: "move to Inbox while reading, including unarchiving/restoring it", context: "read" },
   {
     keys: "l",
@@ -244,6 +258,11 @@ export const VIEW_CONTROLS: readonly ViewControlDoc[] = [
 ] as const;
 
 export const VIEW_CONTROLS_NOTE =
+  'Every row action takes rows the same three ways: with a selector after it\n' +
+  '("d 3-5"), with one before it ("3-5 d", "2 ;r"), or on its own, which acts\n' +
+  'on the shift+arrow selection or, with nothing selected, the highlighted row.\n' +
+  'Reply and AI reply are the exception: they take exactly one message, because\n' +
+  'every outbound message is confirmed on its own.\n' +
   'The "<n> r"/"<n> ;r" shortcuts only jump straight to composing — the same\n' +
   "exact-message confirmation screen still appears before anything sends;\n" +
   'there is no way to skip it. "Delete" always means Gmail\'s Trash and is\n' +

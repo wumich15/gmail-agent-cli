@@ -763,14 +763,26 @@ async function runFullScan(
  * made a capped run's "most recent unread" wrong.
  *
  * Ranking, newest first:
- *   1. messages Gmail just told us are the newest in Inbox/native Spam
- *      (listed newest-first, so list position *is* the ranking);
+ *   1. messages Gmail just listed among the newest but that we have never
+ *      cached at all — they are new mail by definition, and a capped run
+ *      missing exactly the newest mail is the bug this exists to fix.
+ *      Inbox before native Spam, then by position within that listing;
  *   2. messages with a locally cached `internalDate`, most recent first;
  *   3. anything still undated, in queue order.
  *
- * Step 1 is skipped when the local cache was refreshed recently enough to
- * rank recency by itself (`cacheRecencyIsFresh`), so the common warm case
- * still costs no extra Gmail calls.
+ * The Inbox and Spam listings are two independent newest-first sequences,
+ * so their positions are not comparable to each other: ranking tier 1 by
+ * position across both (which an earlier version did, merging on the lower
+ * index) made Spam position *i* tie with Inbox position *i*, so an old spam
+ * message could displace far more recent Inbox mail. Anything we hold a
+ * real timestamp for is therefore ranked by that timestamp instead, which
+ * is the only key that orders the two folders against each other; position
+ * is used only where there is no timestamp to use, and Inbox wins there
+ * because that is the folder the cap is meant to serve.
+ *
+ * The listing is skipped entirely when the local cache was refreshed
+ * recently enough to rank recency by itself (`cacheRecencyIsFresh`), so the
+ * common warm case still costs no extra Gmail calls.
  */
 async function selectMostRecentStubs(
   queued: readonly MessageStub[],
@@ -779,7 +791,7 @@ async function selectMostRecentStubs(
   diagnostics: ScanDiagnostics
 ): Promise<{ selected: MessageStub[]; consideredCount: number }> {
   const byId = new Map(queued.map((stub) => [stub.id, stub] as const));
-  const listedRank = new Map<string, number>();
+  const listedRank = new Map<string, { folder: number; index: number }>();
 
   if (deps.cacheRecencyIsFresh !== true) {
     const listingStartedAt = performance.now();
@@ -801,24 +813,28 @@ async function selectMostRecentStubs(
       }).catch(() => null)
     ]);
     diagnostics.listingMs += performance.now() - listingStartedAt;
-    for (const page of [inboxPage, spamPage]) {
-      if (!page) continue;
+    // Index 0 is Inbox, 1 is native Spam; a message cannot really be in
+    // both, but keep the lower position if Gmail ever reports it twice.
+    [inboxPage, spamPage].forEach((page, folder) => {
+      if (!page) return;
       page.messages.forEach((stub, index) => {
         if (!byId.has(stub.id)) byId.set(stub.id, stub);
         const existing = listedRank.get(stub.id);
-        if (existing === undefined || index < existing) listedRank.set(stub.id, index);
+        if (existing === undefined || index < existing.index) listedRank.set(stub.id, { folder, index });
       });
-    }
+    });
   }
 
   const candidates = [...byId.values()];
   const dates = deps.cachedInternalDates;
   const queueOrder = new Map(candidates.map((stub, index) => [stub.id, index] as const));
   const rankOf = (stub: MessageStub): [number, number, number] => {
-    const listed = listedRank.get(stub.id);
-    if (listed !== undefined) return [0, listed, 0];
     const internalDate = dates?.get(stub.id);
     const parsed = internalDate !== undefined && /^\d+$/.test(internalDate) ? Number(internalDate) : null;
+    const listed = listedRank.get(stub.id);
+    // Just listed among the newest and never seen locally: this is new
+    // mail, and no timestamp we hold can outrank it.
+    if (listed !== undefined && parsed === null) return [0, listed.folder, listed.index];
     if (parsed !== null) return [1, -parsed, 0];
     return [2, 0, queueOrder.get(stub.id) ?? 0];
   };
@@ -1162,7 +1178,50 @@ async function finalizeOutcome(
   };
   let rawDecision = evaluateMessagePolicy(policyInput, deps.policyThresholds);
 
-  if (explicitRule?.action !== "spam" && !protectedForPolicy && rawDecision.actions.some((a) => a.type === "trash")) {
+  // Reduce the long tail of low-value mail without weakening the existing
+  // protection rules: only after a full usable assessment, a 90-day
+  // retention window, and no critical signal/event. It deliberately catches
+  // both read and unread mail that would otherwise remain unchanged.
+  //
+  // Decided here, before the reply-protection gate below, rather than after
+  // it. Evaluating it further down meant the gate had already run and found
+  // no Trash to protect, so a 90-day-old message in a thread the user had
+  // replied to was trashed without the Sent index ever being consulted —
+  // and was trashed even when that index was known to be unavailable, which
+  // is supposed to hold every destructive action for review.
+  //
+  // A lone `archive` action does not disqualify it either. Archiving is
+  // additive (`gmail --archive`), so treating "has any action at all" as
+  // "already handled" meant asking for archiving silently switched this
+  // cleanup off for exactly the read mail it most applies to.
+  const ageMs = Number(normalized.internalDate) > 0
+    ? Math.max(0, deps.clock.now().getTime() - Number(normalized.internalDate))
+    : 0;
+  const ageDays = ageMs / 86_400_000;
+  const oldLowValueEligible =
+    rawDecision.actions.every((action) => action.type === "archive") &&
+    !rawDecision.needsReview &&
+    !authFailedImportantRule &&
+    !protectedForPolicy &&
+    !nativeSpam &&
+    explicitRule === null &&
+    ageDays >= OLD_LOW_VALUE_DAYS &&
+    assessment !== null &&
+    (assessment.kind === "personal_routine" || assessment.kind === "automated_low_value") &&
+    assessment.confidence >= 0.8 &&
+    !hasAuthenticatedHighRiskSignal(normalized) &&
+    assessment.event.intent === "none" &&
+    !assessment.reasonCodes.some((reason) =>
+      ["security", "financial", "reservation", "receipt", "deadline", "user_action_required", "direct_question"].includes(reason)
+    );
+
+  let threadProtected = false;
+  let threadProtectionCheckFailed = false;
+  if (
+    explicitRule?.action !== "spam" &&
+    !protectedForPolicy &&
+    (rawDecision.actions.some((a) => a.type === "trash") || oldLowValueEligible)
+  ) {
     let threadHasUserSentMessagePromise: Promise<boolean>;
     if (deps.sentThreadIndexUnavailable) {
       // An incomplete protection index is not evidence that the thread is
@@ -1205,11 +1264,13 @@ async function finalizeOutcome(
       threadCheckFailed = true;
       threadHasUserSentMessage = true;
     }
+    threadProtectionCheckFailed = threadCheckFailed;
     if (threadHasUserSentMessage) {
-      // The user has replied in this thread — never trash it, regardless
-      // of what triggered the trash decision above (native spam, an
-      // explicit spam rule, or a high-confidence AI verdict all reuse this
-      // one re-evaluation instead of three separate checks).
+      // The user has replied in this thread — never trash it, regardless of
+      // what triggered the trash decision (native spam, a high-confidence AI
+      // verdict, or the 90-day cleanup above all reuse this one
+      // re-evaluation instead of three separate checks).
+      threadProtected = true;
       rawDecision = evaluateMessagePolicy({ ...policyInput, isProtected: true }, deps.policyThresholds);
       if (threadCheckFailed) {
         rawDecision = { ...rawDecision, needsReview: true, reviewReason: "thread_reply_check_failed" };
@@ -1274,32 +1335,24 @@ async function finalizeOutcome(
     decision = { ...decision, needsReview: true, reviewReason: "important_rule_auth_failed" };
   }
 
-  // Reduce the long tail of low-value mail without weakening the existing
-  // protection rules. This only applies after a full usable assessment, a
-  // 90-day retention window, and no critical signal/event. It deliberately
-  // catches both read and unread messages that would otherwise remain
-  // unchanged forever.
-  const ageMs = Number(normalized.internalDate) > 0
-    ? Math.max(0, deps.clock.now().getTime() - Number(normalized.internalDate))
-    : 0;
-  const ageDays = ageMs / 86_400_000;
-  const oldLowValue =
-    decision.actions.length === 0 &&
+  // The 90-day cleanup decided further up, applied only once the
+  // reply-protection gate has had its say. `decision` may have gained a
+  // Calendar label/archive since then; eligibility required an event-free
+  // assessment, so anything of that kind means this no longer applies.
+  if (
+    oldLowValueEligible &&
+    !threadProtected &&
     !decision.needsReview &&
-    !protectedForPolicy &&
-    !nativeSpam &&
-    explicitRule === null &&
-    ageDays >= OLD_LOW_VALUE_DAYS &&
-    assessment !== null &&
-    (assessment.kind === "personal_routine" || assessment.kind === "automated_low_value") &&
-    assessment.confidence >= 0.8 &&
-    !hasAuthenticatedHighRiskSignal(normalized) &&
-    assessment.event.intent === "none" &&
-    !assessment.reasonCodes.some((reason) =>
-      ["security", "financial", "reservation", "receipt", "deadline", "user_action_required", "direct_question"].includes(reason)
-    );
-  if (oldLowValue) {
+    decision.actions.every((action) => action.type === "archive")
+  ) {
+    // Trash is mutually exclusive with every other action, so it replaces a
+    // pending archive rather than joining it.
     decision = { actions: [{ type: "trash", reasonCode: "old_low_value" }], needsReview: false, reviewReason: null };
+  } else if (oldLowValueEligible && threadProtectionCheckFailed) {
+    // Could not tell whether the user replied in this thread, so the
+    // cleanup was withheld; say so rather than leaving the message silently
+    // unchanged.
+    decision = { ...decision, needsReview: true, reviewReason: decision.reviewReason ?? "thread_reply_check_failed" };
   }
 
   let automaticSpamRuleCandidate: AutomaticSpamRuleCandidate | null = null;

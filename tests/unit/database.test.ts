@@ -399,3 +399,121 @@ describe("history marker advancement", () => {
     db.close();
   });
 });
+
+describe("AccountsRepository deletion", () => {
+  /** One row in every table that references `accounts`, for one account. */
+  function seedAccountWithHistory(db: ReturnType<typeof openDatabase>, hash: string): void {
+    new AccountsRepository(db).upsert({
+      accountHash: hash,
+      emailDisplay: `${hash}@example.com`,
+      timezone: "UTC",
+      historyMarker: "1",
+      setupComplete: true,
+      automationEnabled: true,
+      createdAt: "now",
+      updatedAt: "now"
+    });
+    db.prepare(
+      `INSERT INTO messages (account_hash, gmail_message_id, gmail_thread_id, content_hash, label_snapshot, processed_at)
+       VALUES (?, 'm1', 't1', 'h', '[]', 'now')`
+    ).run(hash);
+    db.prepare(
+      `INSERT INTO rule_groups (id, account_hash, category_name, action, created_at, updated_at)
+       VALUES (?, ?, 'LinkedIn', 'spam', 'now', 'now')`
+    ).run(`rg-${hash}`, hash);
+    db.prepare(
+      `INSERT INTO rule_matchers (rule_group_id, kind, normalized_value, provenance)
+       VALUES (?, 'from_address', 'x@example.com', 'user')`
+    ).run(`rg-${hash}`);
+    db.prepare(
+      `INSERT INTO runs (run_id, account_hash, mode, policy_version, started_at, status)
+       VALUES (?, ?, 'work', 'v1', 'now', 'completed')`
+    ).run(`run-${hash}`, hash);
+    db.prepare(
+      `INSERT INTO actions (action_key, run_id, account_hash, type, reason_code, payload_hash, status, created_at, updated_at)
+       VALUES (?, ?, ?, 'trash', 'promotion', 'h', 'applied', 'now', 'now')`
+    ).run(`act-${hash}`, `run-${hash}`, hash);
+    db.prepare(
+      `INSERT INTO unsubscribe_attempts (subscription_key, account_hash, method, endpoint_hash, status, last_attempt_at)
+       VALUES (?, ?, 'https', 'h', 'applied', 'now')`
+    ).run(`sub-${hash}`, hash);
+    db.prepare(
+      `INSERT INTO calendar_links (account_hash, gmail_message_id, calendar_event_id, payload_hash, status, created_at)
+       VALUES (?, 'm1', 'ev1', 'h', 'applied', 'now')`
+    ).run(hash);
+    db.prepare("INSERT INTO settings (account_hash, key, value, updated_at) VALUES (?, 'k', 'v', 'now')").run(hash);
+    db.prepare(
+      `INSERT INTO label_candidates (account_hash, normalized_name, display_name, updated_at)
+       VALUES (?, 'shopping', 'Shopping', 'now')`
+    ).run(hash);
+    db.prepare(
+      `INSERT INTO label_candidate_votes (account_hash, normalized_name, gmail_message_id)
+       VALUES (?, 'shopping', 'm1')`
+    ).run(hash);
+    db.prepare("INSERT INTO sent_threads (account_hash, thread_id) VALUES (?, 't1')").run(hash);
+  }
+
+  function accountScopedRowCount(db: ReturnType<typeof openDatabase>, hash: string): number {
+    const tables = db
+      .prepare(
+        `SELECT m.name AS "table", f."from" AS "column"
+           FROM sqlite_master m
+           JOIN pragma_foreign_key_list(m.name) f
+          WHERE m.type = 'table' AND f."table" = 'accounts'`
+      )
+      .all() as { table: string; column: string }[];
+    return tables.reduce((total, { table, column }) => {
+      const row = db.prepare(`SELECT COUNT(*) AS n FROM "${table}" WHERE "${column}" = ?`).get(hash) as {
+        n: number;
+      };
+      return total + row.n;
+    }, 0);
+  }
+
+  // The bug this covers: signing in as a different Google account ran a bare
+  // `DELETE FROM accounts`, which every child table's foreign key rejected as
+  // soon as the previous account had any local history — so sign-in failed
+  // outright with "FOREIGN KEY constraint failed".
+  it("deleteAllExcept removes the other account's history instead of failing on a foreign key", () => {
+    const db = openDatabase(freshDbPath());
+    seedAccountWithHistory(db, "old");
+    seedAccountWithHistory(db, "new");
+
+    expect(() => new AccountsRepository(db).deleteAllExcept("new")).not.toThrow();
+
+    expect(new AccountsRepository(db).get("old")).toBeNull();
+    expect(accountScopedRowCount(db, "old")).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM rule_matchers").get()).toEqual({ n: 1 });
+
+    expect(new AccountsRepository(db).get("new")?.emailDisplay).toBe("new@example.com");
+    expect(accountScopedRowCount(db, "new")).toBeGreaterThan(0);
+    db.close();
+  });
+
+  it("delete removes one account and everything scoped to it", () => {
+    const db = openDatabase(freshDbPath());
+    seedAccountWithHistory(db, "only");
+
+    expect(() => new AccountsRepository(db).delete("only")).not.toThrow();
+
+    expect(new AccountsRepository(db).get("only")).toBeNull();
+    expect(accountScopedRowCount(db, "only")).toBe(0);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM rule_matchers").get()).toEqual({ n: 0 });
+    db.close();
+  });
+
+  it("leaves foreign keys enforced after the purge transaction", () => {
+    const db = openDatabase(freshDbPath());
+    seedAccountWithHistory(db, "old");
+    seedAccountWithHistory(db, "new");
+    new AccountsRepository(db).deleteAllExcept("new");
+
+    expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
+    expect(() =>
+      db
+        .prepare("INSERT INTO settings (account_hash, key, value, updated_at) VALUES ('ghost', 'k', 'v', 'now')")
+        .run()
+    ).toThrow(/FOREIGN KEY/);
+    db.close();
+  });
+});

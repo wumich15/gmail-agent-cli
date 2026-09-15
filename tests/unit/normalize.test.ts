@@ -262,3 +262,37 @@ describe("buildNormalizedMessage", () => {
     ]);
   });
 });
+
+describe("buildNormalizedMessage body cap", () => {
+  const base = {
+    gmailMessageId: "m1",
+    gmailThreadId: "t1",
+    historyId: "1",
+    internalDate: "1000",
+    labelIds: ["INBOX"],
+    snippet: "snip",
+    headers: headerMapFromList([
+      { name: "From", value: "alice@example.com" },
+      { name: "Subject", value: "Hi" }
+    ]),
+    htmlBody: null,
+    plainBody: "x".repeat(20_000),
+    userEmail: "me@example.com",
+    threadHasUserSentMessage: false
+  };
+
+  it("bounds a body at the classifier budget by default and reports the truncation", () => {
+    const message = buildNormalizedMessage(base);
+    expect(message.bodyText).toHaveLength(6000);
+    expect(message.bodyTruncated).toBe(true);
+  });
+
+  it("honours a larger cap so a reader is not cut off at the model's budget", () => {
+    // gmail view's read view is showing the message to a person; stopping at
+    // the classifier's 6,000 characters meant a long email simply ended
+    // mid-sentence with nothing on screen to say it had.
+    const message = buildNormalizedMessage({ ...base, maxBodyChars: 200_000 });
+    expect(message.bodyText).toHaveLength(20_000);
+    expect(message.bodyTruncated).toBe(false);
+  });
+});
